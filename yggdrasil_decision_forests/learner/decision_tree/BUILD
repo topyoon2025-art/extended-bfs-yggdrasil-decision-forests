@@ -27,6 +27,10 @@ cuda_library(
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/types:span",
         "//yggdrasil_decision_forests/dataset:vertical_dataset",
+        "//yggdrasil_decision_forests/dataset:types",
+        "//yggdrasil_decision_forests/learner/random_forest:random_forest_cc_proto",
+        "//yggdrasil_decision_forests/model/decision_tree",
+        "//yggdrasil_decision_forests/model/decision_tree:decision_tree_cc_proto",
     ],
    copts = [
         "-std=c++17",
@@ -51,14 +55,12 @@ cc_library_ydf(
     srcs = [
         "oblique.cc",
         "oblique_cpu_depthwise_1pass.cc",
-        "oblique_cpu_symmetric_depthwise_ap.cc",
         "training.cc",
         "vector_sequence.cc",
     ],
     hdrs = [
         "oblique.h",
         "oblique_cpu_depthwise_1pass.h",
-        "oblique_cpu_symmetric_depthwise_ap.h",
         "oblique_types.h",
         "training.h",
         "vector_sequence.h",
@@ -94,6 +96,7 @@ cc_library_ydf(
         "//yggdrasil_decision_forests/utils:parallel_chrono",
         "//yggdrasil_decision_forests/utils:random",
         "//yggdrasil_decision_forests/utils:status_macros",
+        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:btree",
         "@com_google_absl//absl/log",

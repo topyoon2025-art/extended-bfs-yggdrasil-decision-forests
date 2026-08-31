@@ -31,8 +31,8 @@ ABSL_FLAG(std::string, label_col, "target",
           "Name of label column (used in all modes).");
 
 ABSL_FLAG(int, num_threads, 1, "Number of threads to use.");
-ABSL_FLAG(int, num_trees, 1, "Number of trees in the random forest.");
-ABSL_FLAG(int, tree_depth, 7, "Maximum depth of trees (-1 for unlimited).");
+ABSL_FLAG(int, num_trees, 100, "Number of trees in the random forest.");
+ABSL_FLAG(int, tree_depth, 16, "Maximum depth of trees (-1 for unlimited).");
 
 ABSL_FLAG(std::string, feature_split_type, "Oblique",
           "Type of feature splits in decision trees: 'Axis Aligned' or 'Oblique'.");
@@ -62,7 +62,7 @@ ABSL_FLAG(uint32_t, seed, 1,
           "PRNG seed (for deterministic synthetic mode and model training).");
 
 // Histogram-based splits - Updated to match Yggdrasil implementation
-ABSL_FLAG(std::string, numerical_split_type, "Equal Width",
+ABSL_FLAG(std::string, numerical_split_type, "Random",
           "Type of numerical splitting: 'Exact', 'Random', or 'Equal Width'.");
 ABSL_FLAG(int, histogram_num_bins, 256,
           "Number of bins for histogram splitting.");
@@ -70,6 +70,8 @@ ABSL_FLAG(int, histogram_num_bins, 256,
 ABSL_FLAG(std::string, model_out_dir, "",
           "Path to output trained model directory (optional)."
           " If empty, model is not saved.");
+
+ABSL_DECLARE_FLAG(bool, combined);
 
 template<class DataSet>
 void runExperiment(const DataSet& dataset, const Utils::ExperimentParams& params, int exp_id)

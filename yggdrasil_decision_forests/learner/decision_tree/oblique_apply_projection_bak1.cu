@@ -15,7 +15,7 @@
 
 static double s_sad_malloc = 0, s_sad_flags = 0, s_sad_prefix = 0,
               s_sad_scatter = 0, s_sad_d2h_scatter = 0, s_sad_d2h_counts = 0,
-              s_sad_d2d_copy = 0, s_sad_free = 0;
+              s_sad_free = 0;
 
 #include "oblique_apply_projection.cuh"
 #include "yggdrasil_decision_forests/learner/random_forest/random_forest.pb.h"
@@ -136,8 +136,7 @@ absl::Status SampleTrainingExamplesKernel_wrap(
     const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config,
     std::optional<double> bootstrap_size_ratio_factor,
     int* d_selected_examples,
-    std::vector<yggdrasil_decision_forests::dataset::UnsignedExampleIdx>* selected_examples,
-    unsigned long long seed)
+    std::vector<yggdrasil_decision_forests::dataset::UnsignedExampleIdx>* selected_examples)
 {
     const int num_samples = std::max(
         int64_t{1},
@@ -147,6 +146,9 @@ absl::Status SampleTrainingExamplesKernel_wrap(
 
     constexpr int BLOCK = 256;
     const int blocks = (num_samples + BLOCK - 1) / BLOCK;
+
+    unsigned long long seed = std::chrono::high_resolution_clock::now()
+        .time_since_epoch().count();
 
     SampleTrainingExamplesKernel<<<blocks, BLOCK>>>(
         d_selected_examples, num_samples, num_rows, seed);
@@ -161,36 +163,6 @@ absl::Status SampleTrainingExamplesKernel_wrap(
         num_samples * sizeof(int), cudaMemcpyDeviceToHost));
 
     CUDA_CHECK(cudaFree(d_selected_examples));
-    return absl::OkStatus();
-}
-
-absl::Status SampleTrainingExamplesKernel_No_D2H_wrap(
-    const int num_rows,
-    const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config,
-    std::optional<double> bootstrap_size_ratio_factor,
-    int*& d_selected_examples,
-    int& num_samples_out,
-    unsigned long long seed)
-{
-    const int num_samples = std::max(
-        int64_t{1},
-        static_cast<int64_t>(static_cast<double>(num_rows) * rf_config.bootstrap_size_ratio()));
-
-    num_samples_out = num_samples;
-
-    CUDA_CHECK(cudaMalloc(&d_selected_examples, num_samples * sizeof(int)));
-
-    constexpr int BLOCK = 256;
-    const int blocks = (num_samples + BLOCK - 1) / BLOCK;
-
-    SampleTrainingExamplesKernel<<<blocks, BLOCK>>>(
-        d_selected_examples, num_samples, num_rows, seed);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    thrust::device_ptr<int> d_ptr(d_selected_examples);
-    thrust::sort(d_ptr, d_ptr + num_samples);
-
     return absl::OkStatus();
 }
 
@@ -342,32 +314,16 @@ __global__ void ComputeSplitFlagsAllDepthKernel(
     d_flags[rows_start + r] = val >= threshold ? 1 : 0;
 }
 
-__global__ void ComputeSplitFlagsAllDepthKernel_1D(
-    const float* __restrict__ d_col_add_projected,
-    const int* __restrict__ d_best_proj_per_node,
-    const float* __restrict__ d_best_threshold_per_node,
+__global__ void GatherLastPrefixSumKernel(
+    const int* __restrict__ d_prefix_sum,
     const int* __restrict__ d_node_row_off,
-    const int* __restrict__ d_node_block_off,
-    int* __restrict__ d_flags,
-    int num_proj,
-    int num_nodes
-) {
-    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
-    const int local_bx = blockIdx.x - d_node_block_off[node_id];
-    int rows_start = d_node_row_off[node_id];
-    int rows_node = d_node_row_off[node_id + 1] - rows_start;
-    int r = local_bx * blockDim.x + threadIdx.x;
-    if (r >= rows_node) return;
-
-    int best_projection_index = d_best_proj_per_node[node_id];
-    if (best_projection_index < 0) {
-        d_flags[rows_start + r] = 0;
-        return;
-    }
-
-    const int base = rows_start * num_proj + best_projection_index * rows_node;
-    float val = d_col_add_projected[base + r];
-    d_flags[rows_start + r] = val >= d_best_threshold_per_node[node_id] ? 1 : 0;
+    int* __restrict__ d_total_pos,
+    int num_nodes)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= num_nodes) return;
+    int last_idx = d_node_row_off[n + 1] - 1;
+    d_total_pos[n] = d_prefix_sum[last_idx];
 }
 
 __global__ void ScatterSplitAllDepthKernel(
@@ -379,8 +335,7 @@ __global__ void ScatterSplitAllDepthKernel(
     int* __restrict__ d_neg_examples,
     const int* __restrict__ d_labels,
     int* __restrict__ d_class_counts,
-    const int num_classes,
-    int* __restrict__ d_total_pos)
+    const int num_classes)
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     int node_id = blockIdx.y;
@@ -398,156 +353,6 @@ __global__ void ScatterSplitAllDepthKernel(
         d_pos_examples[rows_start + inclusive_sum - 1] = example_idx;
     } else {
         d_neg_examples[rows_start + r - inclusive_sum] = example_idx;
-    }
-
-    int cls = d_labels[example_idx];
-    atomicAdd(&d_class_counts[node_id * 2 * num_classes + side * num_classes + cls], 1);
-
-    if (r == rows_node - 1) {
-        d_total_pos[node_id] = inclusive_sum;
-    }
-}
-
-__global__ void ScatterSplitAllDepthKernel_1D(
-    const int* __restrict__ d_selected_examples,
-    const int* __restrict__ d_flags,
-    const int* __restrict__ d_prefix_sum,
-    const int* __restrict__ d_node_row_off,
-    const int* __restrict__ d_node_block_off,
-    int* __restrict__ d_pos_examples,
-    int* __restrict__ d_neg_examples,
-    const int* __restrict__ d_labels,
-    int* __restrict__ d_class_counts,
-    const int num_classes,
-    int* __restrict__ d_total_pos,
-    int num_nodes)
-{
-    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
-    const int local_bx = blockIdx.x - d_node_block_off[node_id];
-    int rows_start = d_node_row_off[node_id];
-    int rows_node = d_node_row_off[node_id + 1] - rows_start;
-    int r = local_bx * blockDim.x + threadIdx.x;
-
-    if (r >= rows_node) return;
-
-    int example_idx = d_selected_examples[rows_start + r];
-    int inclusive_sum = d_prefix_sum[rows_start + r];
-    int side = d_flags[rows_start + r];
-
-    if (side) {
-        d_pos_examples[rows_start + inclusive_sum - 1] = example_idx;
-    } else {
-        d_neg_examples[rows_start + r - inclusive_sum] = example_idx;
-    }
-
-    int cls = d_labels[example_idx];
-    atomicAdd(&d_class_counts[node_id * 2 * num_classes + side * num_classes + cls], 1);
-
-    if (r == rows_node - 1) {
-        d_total_pos[node_id] = inclusive_sum;
-    }
-}
-
-// Kernel 1: per-block local inclusive scan, write block aggregate
-__global__ void SegmentedInclusiveSumLocalKernel(
-    const int* __restrict__ d_flags,
-    int* __restrict__ d_prefix_sum,
-    int* __restrict__ d_block_agg,
-    const int* __restrict__ d_node_row_off,
-    const int* __restrict__ d_node_block_off,
-    int num_nodes)
-{
-    typedef cub::BlockScan<int, 256> BlockScan;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-
-    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
-    const int local_bx = blockIdx.x - d_node_block_off[node_id];
-    const int rows_start = d_node_row_off[node_id];
-    const int rows_node = d_node_row_off[node_id + 1] - rows_start;
-    const int r = local_bx * blockDim.x + threadIdx.x;
-
-    int val = (r < rows_node) ? d_flags[rows_start + r] : 0;
-
-    int scanned, block_aggregate;
-    BlockScan(temp_storage).InclusiveSum(val, scanned, block_aggregate);
-
-    if (r < rows_node) d_prefix_sum[rows_start + r] = scanned;
-    if (threadIdx.x == 0) d_block_agg[blockIdx.x] = block_aggregate;
-}
-
-// Kernel 2: compute exclusive prefix of block aggregates per node, add to elements
-__global__ void SegmentedInclusiveSumPropagateKernel(
-    int* __restrict__ d_prefix_sum,
-    const int* __restrict__ d_block_agg,
-    const int* __restrict__ d_node_row_off,
-    const int* __restrict__ d_node_block_off,
-    int num_nodes)
-{
-    __shared__ int s_prefix;
-
-    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
-    const int local_bx = blockIdx.x - d_node_block_off[node_id];
-    if (local_bx == 0) return;
-
-    if (threadIdx.x == 0) {
-        const int first_block = d_node_block_off[node_id];
-        int prefix = 0;
-        for (int b = first_block; b < first_block + local_bx; ++b) {
-            prefix += d_block_agg[b];
-        }
-        s_prefix = prefix;
-    }
-    __syncthreads();
-
-    const int rows_start = d_node_row_off[node_id];
-    const int rows_node = d_node_row_off[node_id + 1] - rows_start;
-    const int r = local_bx * blockDim.x + threadIdx.x;
-    if (r >= rows_node) return;
-
-    d_prefix_sum[rows_start + r] += s_prefix;
-}
-
-// Fused flags+scatter kernel — no prefix sum needed.
-// Uses atomicAdd on per-node pos/neg counters for write indices.
-// d_atomic_counters: [num_nodes pos | num_nodes neg], must be zeroed before launch.
-__global__ void FusedFlagScatterAllDepthKernel_1D(
-    const float* __restrict__ d_col_add_projected,
-    const int* __restrict__ d_selected_examples,
-    const int* __restrict__ d_best_proj_per_node,
-    const float* __restrict__ d_best_threshold_per_node,
-    const int* __restrict__ d_node_row_off,
-    const int* __restrict__ d_node_block_off,
-    int* __restrict__ d_pos_examples,
-    int* __restrict__ d_neg_examples,
-    const int* __restrict__ d_labels,
-    int* __restrict__ d_class_counts,
-    const int num_classes,
-    int* __restrict__ d_atomic_counters,
-    int num_proj,
-    int num_nodes)
-{
-    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
-    const int local_bx = blockIdx.x - d_node_block_off[node_id];
-    const int rows_start = d_node_row_off[node_id];
-    const int rows_node = d_node_row_off[node_id + 1] - rows_start;
-    const int r = local_bx * blockDim.x + threadIdx.x;
-    if (r >= rows_node) return;
-
-    int best_projection_index = d_best_proj_per_node[node_id];
-    int side = 0;
-    if (best_projection_index >= 0) {
-        const int base = rows_start * num_proj + best_projection_index * rows_node;
-        float val = d_col_add_projected[base + r];
-        side = val >= d_best_threshold_per_node[node_id] ? 1 : 0;
-    }
-
-    int example_idx = d_selected_examples[rows_start + r];
-    if (side) {
-        int pos_idx = atomicAdd(&d_atomic_counters[node_id], 1);
-        d_pos_examples[rows_start + pos_idx] = example_idx;
-    } else {
-        int neg_idx = atomicAdd(&d_atomic_counters[num_nodes + node_id], 1);
-        d_neg_examples[rows_start + neg_idx] = example_idx;
     }
 
     int cls = d_labels[example_idx];
@@ -575,20 +380,15 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 // {
 //     using UnsignedExampleIdx = yggdrasil_decision_forests::dataset::UnsignedExampleIdx;
 //     std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer> example_splits(num_nodes);
-
-//     auto t0 = std::chrono::steady_clock::now();
-
+//
 //     constexpr int BLOCK = 256;
 //     int blocks = (max_rows_per_node + BLOCK - 1) / BLOCK;
 //     dim3 grid(blocks, num_nodes, 1);
-
+//
 //     int* d_flags;
 //     int* d_prefix_sum;
 //     CUDA_CHECK(cudaMalloc(&d_flags, total_rows * sizeof(int)));
 //     CUDA_CHECK(cudaMalloc(&d_prefix_sum, total_rows * sizeof(int)));
-
-//     auto t1 = std::chrono::steady_clock::now();
-
 //     ComputeSplitFlagsAllDepthKernel<<<grid, BLOCK>>>(
 //         d_col_add_projected,
 //         d_best_proj_per_node,
@@ -599,9 +399,7 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //     );
 //     CUDA_CHECK(cudaDeviceSynchronize());
 //     CUDA_CHECK(cudaGetLastError());
-
-//     auto t2 = std::chrono::steady_clock::now();
-
+//
 //     // Per-node exclusive prefix sum using cub::DeviceScan
 //     void* d_temp = nullptr;
 //     size_t temp_bytes = 0;
@@ -610,7 +408,7 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //         d_flags, d_prefix_sum,
 //         max_rows_per_node);
 //     cudaMalloc(&d_temp, temp_bytes);
-
+//
 //     int offset = 0;
 //     for (int n = 0; n < num_nodes; ++n) {
 //       const int rows_n = static_cast<int>(sel_spans[n].size());
@@ -621,19 +419,17 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //       offset += rows_n;
 //     }
 //     cudaFree(d_temp);
-
-//     auto t3 = std::chrono::steady_clock::now();
-
+//
 //     int* d_pos_examples;
 //     int* d_neg_examples;
 //     cudaMalloc(&d_pos_examples, total_rows * sizeof(int));
 //     cudaMalloc(&d_neg_examples, total_rows * sizeof(int));
-
+//
 //     const int counts_size = num_nodes * 2 * num_classes;
 //     int* d_class_counts;
 //     CUDA_CHECK(cudaMalloc(&d_class_counts, counts_size * sizeof(int)));
 //     CUDA_CHECK(cudaMemset(d_class_counts, 0, counts_size * sizeof(int)));
-
+//
 //     ScatterSplitAllDepthKernel<<<grid, BLOCK>>>(
 //         d_selected_examples,
 //         d_flags,
@@ -646,9 +442,7 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //         num_classes);
 //     CUDA_CHECK(cudaDeviceSynchronize());
 //     CUDA_CHECK(cudaGetLastError());
-
-//     auto t4 = std::chrono::steady_clock::now();
-
+//
 //     std::vector<int> last_flag_per_node(num_nodes);
 //     std::vector<int> last_prefix_per_node(num_nodes);
 //     std::vector<int> total_pos_per_node(num_nodes);
@@ -672,13 +466,11 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //             .active = inactive_spans[n].subspan(total_pos_per_node[n]),
 //             .inactive = sel_spans[n].subspan(total_pos_per_node[n])};
 //     }
-
-//     auto t5 = std::chrono::steady_clock::now();
-
+//
 //     std::vector<int> h_class_counts(counts_size);
 //     CUDA_CHECK(cudaMemcpy(h_class_counts.data(), d_class_counts,
 //                           counts_size * sizeof(int), cudaMemcpyDeviceToHost));
-
+//
 //     pos_class_counts.resize(num_nodes);
 //     neg_class_counts.resize(num_nodes);
 //     for (int n = 0; n < num_nodes; ++n) {
@@ -689,40 +481,13 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
 //           h_class_counts.begin() + n * 2 * num_classes + 0 * num_classes,
 //           h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes);
 //     }
-
-//     auto t6 = std::chrono::steady_clock::now();
-
+//
 //     cudaFree(d_pos_examples);
 //     cudaFree(d_neg_examples);
 //     cudaFree(d_flags);
 //     cudaFree(d_prefix_sum);
 //     cudaFree(d_class_counts);
-
-//     auto t7 = std::chrono::steady_clock::now();
-
-//     auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b - a).count(); };
-//     std::cerr << "  SplitAllDepth microtiming:"
-//               << " malloc=" << ms(t0, t1)
-//               << " flags_kernel=" << ms(t1, t2)
-//               << " prefix_sum=" << ms(t2, t3)
-//               << " scatter_kernel=" << ms(t3, t4)
-//               << " d2h_loop=" << ms(t4, t5)
-//               << " d2h_counts=" << ms(t5, t6)
-//               << " free=" << ms(t6, t7)
-//               << " TOTAL=" << ms(t0, t7)
-//               << " nodes=" << num_nodes
-//               << " total_rows=" << total_rows
-//               << " max_rows=" << max_rows_per_node
-//               << "\n";
-
-//     s_sad_malloc      += ms(t0, t1);
-//     s_sad_flags       += ms(t1, t2);
-//     s_sad_prefix      += ms(t2, t3);
-//     s_sad_scatter     += ms(t3, t4);
-//     s_sad_d2h_scatter += ms(t4, t5);
-//     s_sad_d2h_counts  += ms(t5, t6);
-//     s_sad_free        += ms(t6, t7);
-
+//
 //     return example_splits;
 // }
 
@@ -734,8 +499,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
                 const float* d_best_threshold_per_node,
                 const int* d_node_row_off,
                 const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
                 std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& sel_spans,
                 std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& inactive_spans,
                 const int num_proj,
@@ -771,16 +534,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
         d_flags,
         num_proj
     );
-    // ComputeSplitFlagsAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-    //     d_col_add_projected,
-    //     d_best_proj_per_node,
-    //     d_best_threshold_per_node,
-    //     d_node_row_off,
-    //     d_node_block_off,
-    //     d_flags,
-    //     num_proj,
-    //     num_nodes
-    // );
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
@@ -794,6 +547,7 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
         d_flags, d_prefix_sum,
         max_rows_per_node);
     cudaMalloc(&d_temp, temp_bytes);
+
     int offset = 0;
     for (int n = 0; n < num_nodes; ++n) {
       const int rows_n = static_cast<int>(sel_spans[n].size());
@@ -804,61 +558,55 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
       offset += rows_n;
     }
     cudaFree(d_temp);
+    // Now I have d_prefix_sum segmented per node (inclusive)
 
     auto t3 = std::chrono::steady_clock::now();
 
-    int* d_neg_pos;  // [neg | pos] contiguous
-    cudaMalloc(&d_neg_pos, 2 * total_rows * sizeof(int));
-    int* d_neg_examples = d_neg_pos;
-    int* d_pos_examples = d_neg_pos + total_rows;
+    int* d_pos_examples;
+    int* d_neg_examples;
+    cudaMalloc(&d_pos_examples, total_rows * sizeof(int));
+    cudaMalloc(&d_neg_examples, total_rows * sizeof(int));
 
     const int counts_size = num_nodes * 2 * num_classes;
     int* d_class_counts;
     CUDA_CHECK(cudaMalloc(&d_class_counts, counts_size * sizeof(int)));
     CUDA_CHECK(cudaMemset(d_class_counts, 0, counts_size * sizeof(int)));
 
-    int* d_total_pos;
-    CUDA_CHECK(cudaMalloc(&d_total_pos, num_nodes * sizeof(int)));
-
     ScatterSplitAllDepthKernel<<<grid, BLOCK>>>(
         d_selected_examples,
-        d_flags,
-        d_prefix_sum,
+        d_flags,  // flattened for all active rows but per node
+        d_prefix_sum, // flattened but per node inclusive prefix sum
         d_node_row_off,
         d_pos_examples,
         d_neg_examples,
         d_labels,
-        d_class_counts,
-        num_classes,
-        d_total_pos);
-    // ScatterSplitAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-    //     d_selected_examples,
-    //     d_flags,
-    //     d_prefix_sum,
-    //     d_node_row_off,
-    //     d_node_block_off,
-    //     d_pos_examples,
-    //     d_neg_examples,
-    //     d_labels,
-    //     d_class_counts,
-    //     num_classes,
-    //     d_total_pos,
-    //     num_nodes);
+        d_class_counts, // flattened but per node counts for 2 sides
+        num_classes);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
     auto t4 = std::chrono::steady_clock::now();
+
+    // Gather total_pos per node on device, then 3 bulk D2H copies
+    int* d_total_pos;
+    CUDA_CHECK(cudaMalloc(&d_total_pos, num_nodes * sizeof(int)));
+    {
+      int gather_blocks = (num_nodes + 255) / 256;
+      GatherLastPrefixSumKernel<<<gather_blocks, 256>>>(
+          d_prefix_sum, d_node_row_off, d_total_pos, num_nodes);
+    }
 
     std::vector<int> total_pos_per_node(num_nodes);
     CUDA_CHECK(cudaMemcpy(total_pos_per_node.data(), d_total_pos,
                           num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
     cudaFree(d_total_pos);
 
-    std::vector<int> h_neg_pos(2 * total_rows);
-    CUDA_CHECK(cudaMemcpy(h_neg_pos.data(), d_neg_pos,
-                          2 * total_rows * sizeof(int), cudaMemcpyDeviceToHost));
-    int* h_neg_flat = h_neg_pos.data();
-    int* h_pos_flat = h_neg_pos.data() + total_rows;
+    std::vector<int> h_pos_flat(total_rows); // flattened for all active rows but per node for positive examples
+    std::vector<int> h_neg_flat(total_rows); // flattened for all active rows but per node for negative examples
+    CUDA_CHECK(cudaMemcpy(h_pos_flat.data(), d_pos_examples,
+                          total_rows * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_neg_flat.data(), d_neg_examples,
+                          total_rows * sizeof(int), cudaMemcpyDeviceToHost));
 
     for (int n = 0; n < num_nodes; ++n) {
         int rows_node = static_cast<int>(sel_spans[n].size());
@@ -867,12 +615,12 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
         int off = node_row_off[n];
         if (total_pos > 0) {
             std::memcpy(inactive_spans[n].data(),
-                        h_pos_flat + off,
+                        h_pos_flat.data() + off,
                         total_pos * sizeof(UnsignedExampleIdx));
         }
         if (total_neg > 0) {
             std::memcpy(inactive_spans[n].data() + total_pos,
-                        h_neg_flat + off,
+                        h_neg_flat.data() + off,
                         total_neg * sizeof(UnsignedExampleIdx));
         }
         example_splits[n].positive_examples = {
@@ -902,7 +650,8 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
 
     auto t6 = std::chrono::steady_clock::now();
 
-    cudaFree(d_neg_pos);
+    cudaFree(d_pos_examples);
+    cudaFree(d_neg_examples);
     cudaFree(d_flags);
     cudaFree(d_prefix_sum);
     cudaFree(d_class_counts);
@@ -910,6 +659,19 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     auto t7 = std::chrono::steady_clock::now();
 
     auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b - a).count(); };
+    std::cerr << "  SplitAllDepth microtiming:"
+              << " malloc=" << ms(t0, t1)
+              << " flags_kernel=" << ms(t1, t2)
+              << " prefix_sum=" << ms(t2, t3)
+              << " scatter_kernel=" << ms(t3, t4)
+              << " d2h_scatter=" << ms(t4, t5)
+              << " d2h_counts=" << ms(t5, t6)
+              << " free=" << ms(t6, t7)
+              << " TOTAL=" << ms(t0, t7)
+              << " nodes=" << num_nodes
+              << " total_rows=" << total_rows
+              << " max_rows=" << max_rows_per_node
+              << "\n";
 
     s_sad_malloc      += ms(t0, t1);
     s_sad_flags       += ms(t1, t2);
@@ -922,340 +684,20 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     return example_splits;
 }
 
-// --- No D2H version: inclusive prefix sum + bulk D2H + gather kernel ---
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_wrap(
-                const float* d_col_add_projected,
-                int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts,
-                std::vector<int>& pos_counts,
-                std::vector<int>& neg_counts)
-{
-
-
-    auto t0 = std::chrono::steady_clock::now();
-
-    constexpr int BLOCK = 256;
-    int blocks = (max_rows_per_node + BLOCK - 1) / BLOCK;
-    dim3 grid(blocks, num_nodes, 1);
-
-    int* d_flags;
-    int* d_prefix_sum;
-    CUDA_CHECK(cudaMalloc(&d_flags, total_rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_prefix_sum, total_rows * sizeof(int)));
-
-    auto t1 = std::chrono::steady_clock::now();
-
-    // ComputeSplitFlagsAllDepthKernel<<<grid, BLOCK>>>(
-    //     d_col_add_projected,
-    //     d_best_proj_per_node,
-    //     d_best_threshold_per_node,
-    //     d_node_row_off,
-    //     d_flags,
-    //     num_proj
-    // );
-    ComputeSplitFlagsAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-        d_col_add_projected,
-        d_best_proj_per_node,
-        d_best_threshold_per_node,
-        d_node_row_off,
-        d_node_block_off,
-        d_flags,
-        num_proj,
-        num_nodes
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    auto t2 = std::chrono::steady_clock::now();
-
-    // Per-node inclusive prefix sum using cub::DeviceScan
-    void* d_temp = nullptr;
-    size_t temp_bytes = 0;
-    cub::DeviceScan::InclusiveSum(
-        d_temp, temp_bytes,
-        d_flags, d_prefix_sum,
-        max_rows_per_node);
-    cudaMalloc(&d_temp, temp_bytes);
-    for (int n = 0; n < num_nodes; ++n) {
-      const int rows_n = node_row_off[n + 1] - node_row_off[n];
-      const int offset = node_row_off[n];
-      cub::DeviceScan::InclusiveSum(
-          d_temp, temp_bytes,
-          d_flags + offset, d_prefix_sum + offset,
-          rows_n);
-    }
-    cudaFree(d_temp);
-
-    auto t3 = std::chrono::steady_clock::now();
-
-    int* d_neg_pos;  // [neg | pos] contiguous — matches NodeTrain push order
-    cudaMalloc(&d_neg_pos, 2 * total_rows * sizeof(int));
-    int* d_neg_examples = d_neg_pos;
-    int* d_pos_examples = d_neg_pos + total_rows;
-
-    const int counts_size = num_nodes * 2 * num_classes;
-    int* d_class_counts;
-    CUDA_CHECK(cudaMalloc(&d_class_counts, counts_size * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_class_counts, 0, counts_size * sizeof(int)));
-
-    int* d_total_pos;
-    CUDA_CHECK(cudaMalloc(&d_total_pos, num_nodes * sizeof(int)));
-
-    // ScatterSplitAllDepthKernel<<<grid, BLOCK>>>(
-    //     d_selected_examples,
-    //     d_flags,
-    //     d_prefix_sum,
-    //     d_node_row_off,
-    //     d_pos_examples,
-    //     d_neg_examples,
-    //     d_labels,
-    //     d_class_counts,
-    //     num_classes,
-    //     d_total_pos);
-
-    ScatterSplitAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-        d_selected_examples,
-        d_flags,
-        d_prefix_sum,
-        d_node_row_off,
-        d_node_block_off,
-        d_pos_examples,
-        d_neg_examples,
-        d_labels,
-        d_class_counts,
-        num_classes,
-        d_total_pos,
-        num_nodes);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    auto t4 = std::chrono::steady_clock::now();
-
-    cudaFree(d_total_pos);
-
-    auto t5 = std::chrono::steady_clock::now();
-
-    std::vector<int> h_class_counts(counts_size);
-    CUDA_CHECK(cudaMemcpy(h_class_counts.data(), d_class_counts,
-                          counts_size * sizeof(int), cudaMemcpyDeviceToHost));
-
-    pos_class_counts.resize(num_nodes);
-    neg_class_counts.resize(num_nodes);
-    pos_counts.resize(num_nodes);
-    neg_counts.resize(num_nodes);
-    for (int n = 0; n < num_nodes; ++n) {
-      pos_class_counts[n].assign(
-          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes,
-          h_class_counts.begin() + n * 2 * num_classes + 2 * num_classes);
-      neg_class_counts[n].assign(
-          h_class_counts.begin() + n * 2 * num_classes + 0 * num_classes,
-          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes);
-      int pos_sum = 0;
-      for (int c = 0; c < num_classes; ++c) pos_sum += pos_class_counts[n][c];
-      int neg_sum = 0;
-      for (int c = 0; c < num_classes; ++c) neg_sum += neg_class_counts[n][c];
-      pos_counts[n] = pos_sum;
-      neg_counts[n] = neg_sum;
-    }
-
-    auto t6 = std::chrono::steady_clock::now();
-
-    // D2D: copy partitioned [neg|pos] back — matches NodeTrain push order
-    for (int n = 0; n < num_nodes; ++n) {
-      const int offset = node_row_off[n];
-      const int pos_n = pos_counts[n];
-      const int neg_n = neg_counts[n];
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + offset,
-                            d_neg_examples + offset,
-                            neg_n * sizeof(int), cudaMemcpyDeviceToDevice));
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + offset + neg_n,
-                            d_pos_examples + offset,
-                            pos_n * sizeof(int), cudaMemcpyDeviceToDevice));
-    }
-
-    auto t6b = std::chrono::steady_clock::now();
-
-    cudaFree(d_neg_pos);
-    cudaFree(d_flags);
-    cudaFree(d_prefix_sum);
-    cudaFree(d_class_counts);
-
-    auto t7 = std::chrono::steady_clock::now();
-
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b - a).count(); };
-
-    s_sad_malloc      += ms(t0, t1);
-    s_sad_flags       += ms(t1, t2);
-    s_sad_prefix      += ms(t2, t3);
-    s_sad_scatter     += ms(t3, t4);
-    s_sad_d2h_scatter += ms(t4, t5);
-    s_sad_d2h_counts  += ms(t5, t6);
-    s_sad_d2d_copy    += ms(t6, t6b);
-    s_sad_free        += ms(t6b, t7);
-
-    return std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>();
-}
-
-void PrintAndResetSplitAllDepthTimers(int depth) {
+void PrintAndResetSplitAllDepthTimers() {
     double total = s_sad_malloc + s_sad_flags + s_sad_prefix + s_sad_scatter
-                 + s_sad_d2h_scatter + s_sad_d2h_counts + s_sad_d2d_copy + s_sad_free;
-    std::cerr << "  SplitAllDepth D" << depth << ":"
+                 + s_sad_d2h_scatter + s_sad_d2h_counts + s_sad_free;
+    std::cerr << "SplitAllDepth TOTAL (tree):"
               << " malloc=" << s_sad_malloc
               << " flags_kernel=" << s_sad_flags
               << " prefix_sum=" << s_sad_prefix
               << " scatter_kernel=" << s_sad_scatter
               << " d2h_scatter=" << s_sad_d2h_scatter
               << " d2h_counts=" << s_sad_d2h_counts
-              << " d2d_copy=" << s_sad_d2d_copy
               << " free=" << s_sad_free
-              << " SUM=" << total << "ms" << std::endl;
+              << " SUM=" << total << "ms\n";
     s_sad_malloc = s_sad_flags = s_sad_prefix = s_sad_scatter = 0;
-    s_sad_d2h_scatter = s_sad_d2h_counts = s_sad_d2d_copy = s_sad_free = 0;
-}
-
-// --- Fused No D2H version: single kernel, no prefix sum ---
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap(
-                const float* d_col_add_projected,
-                int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts,
-                std::vector<int>& pos_counts,
-                std::vector<int>& neg_counts,
-                const std::vector<bool>& node_has_split,
-                std::vector<int>& child_offsets)
-{
-    auto t0 = std::chrono::steady_clock::now();
-
-    constexpr int BLOCK = 256;
-
-    int* d_neg_pos;
-    cudaMalloc(&d_neg_pos, 2 * total_rows * sizeof(int));
-    int* d_neg_examples = d_neg_pos;
-    int* d_pos_examples = d_neg_pos + total_rows;
-
-    const int counts_size = num_nodes * 2 * num_classes;
-    int* d_class_counts;
-    CUDA_CHECK(cudaMalloc(&d_class_counts, counts_size * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_class_counts, 0, counts_size * sizeof(int)));
-
-    // [0..num_nodes) = pos counters, [num_nodes..2*num_nodes) = neg counters
-    int* d_atomic_counters;
-    CUDA_CHECK(cudaMalloc(&d_atomic_counters, 2 * num_nodes * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_atomic_counters, 0, 2 * num_nodes * sizeof(int)));
-
-    auto t1 = std::chrono::steady_clock::now();
-
-    FusedFlagScatterAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-        d_col_add_projected,
-        d_selected_examples,
-        d_best_proj_per_node,
-        d_best_threshold_per_node,
-        d_node_row_off,
-        d_node_block_off,
-        d_pos_examples,
-        d_neg_examples,
-        d_labels,
-        d_class_counts,
-        num_classes,
-        d_atomic_counters,
-        num_proj,
-        num_nodes);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    auto t2 = std::chrono::steady_clock::now();
-
-    // D2H: class counts
-    std::vector<int> h_class_counts(counts_size);
-    CUDA_CHECK(cudaMemcpy(h_class_counts.data(), d_class_counts,
-                          counts_size * sizeof(int), cudaMemcpyDeviceToHost));
-
-    // D2H: pos/neg counters
-    std::vector<int> h_counters(2 * num_nodes);
-    CUDA_CHECK(cudaMemcpy(h_counters.data(), d_atomic_counters,
-                          2 * num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
-
-    pos_class_counts.resize(num_nodes);
-    neg_class_counts.resize(num_nodes);
-    pos_counts.resize(num_nodes);
-    neg_counts.resize(num_nodes);
-    for (int n = 0; n < num_nodes; ++n) {
-      pos_class_counts[n].assign(
-          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes,
-          h_class_counts.begin() + n * 2 * num_classes + 2 * num_classes);
-      neg_class_counts[n].assign(
-          h_class_counts.begin() + n * 2 * num_classes + 0 * num_classes,
-          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes);
-      pos_counts[n] = h_counters[n];
-      neg_counts[n] = h_counters[num_nodes + n];
-    }
-
-    auto t3 = std::chrono::steady_clock::now();
-
-    // D2D: copy partitioned [neg|pos] contiguously, skipping leaf parents.
-    // Reads from d_neg/d_pos (separate buffer), writes to d_selected_examples.
-    child_offsets.assign(num_nodes, -1);
-    int write_offset = 0;
-    for (int n = 0; n < num_nodes; ++n) {
-      if (!node_has_split[n]) continue;
-      const int src = node_row_off[n];
-      const int neg_n = neg_counts[n];
-      const int pos_n = pos_counts[n];
-      child_offsets[n] = write_offset;
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + write_offset,
-                            d_neg_examples + src,
-                            neg_n * sizeof(int), cudaMemcpyDeviceToDevice));
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + write_offset + neg_n,
-                            d_pos_examples + src,
-                            pos_n * sizeof(int), cudaMemcpyDeviceToDevice));
-      write_offset += neg_n + pos_n;
-    }
-
-    auto t4 = std::chrono::steady_clock::now();
-
-    cudaFree(d_neg_pos);
-    cudaFree(d_class_counts);
-    cudaFree(d_atomic_counters);
-
-    auto t5 = std::chrono::steady_clock::now();
-
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b - a).count(); };
-
-    s_sad_malloc      += ms(t0, t1);
-    s_sad_flags       += 0;
-    s_sad_prefix      += 0;
-    s_sad_scatter     += ms(t1, t2);  // fused kernel
-    s_sad_d2h_scatter += 0;
-    s_sad_d2h_counts  += ms(t2, t3);  // D2H counts + counters
-    s_sad_d2d_copy    += ms(t3, t4);  // D2D compaction
-    s_sad_free        += ms(t4, t5);
-
-    return std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>();
+    s_sad_d2h_scatter = s_sad_d2h_counts = s_sad_free = 0;
 }
 
 template<int BLOCK>

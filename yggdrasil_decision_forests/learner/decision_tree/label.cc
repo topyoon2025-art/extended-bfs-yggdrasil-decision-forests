@@ -52,6 +52,7 @@ absl::Status SetClassificationLabelDistribution(
                                   .columns(config_link.label())
                                   .categorical()
                                   .number_of_unique_values();
+  // num_classes = 3, which corresponds to the number of unique values in the label column
   label_distribution.SetNumClasses(num_classes);
   for (const UnsignedExampleIdx example_idx : selected_examples) {
     if constexpr (weighted) {
@@ -178,6 +179,8 @@ absl::Status SetLabelDistribution(
     NodeWithChildren* node) {
   switch (config.task()) {
     case model::proto::Task::CLASSIFICATION:
+      // config.tastk() = 1, which corresponds to CLASSIFICATION
+      // weights.empty() = 1, which corresponds to false, so the first branch is taken
       if (weights.empty()) {
         RETURN_IF_ERROR(SetClassificationLabelDistribution</*weighted=*/false>(
             train_dataset, selected_examples, weights, config_link,

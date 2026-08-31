@@ -23,7 +23,19 @@ build:symmetric_nodewise_control --cxxopt="-DSYMMETRIC_NODEWISE_CONTROL=1"
 # and symmetric_nodewise_control.
 build:bfs_only --cxxopt="-DBFS_ONLY=1"
 
+# combined means Apply Projection + Evaluate Projection
+build:combined --cxxopt="-DCOMBINED=1"
 
+# NO_D2H: eliminate Device-to-Host and Host-to-Device transfers for
+# selected_examples during BFS tree growth. Examples stay on GPU; splits
+# use D2D copies and leaf values come from GPU class counts.
+# Requires BFS_ONLY. Use --config=no_d2h alongside --config=bfs_only.
+build:no_d2h --cxxopt="-DNO_D2H=1"
+
+# USE_GPU: enable GPU code paths in the learner (BFS oblique projection,
+# histogram splits, example partitioning). Without this, all tree growth
+# uses the CPU-only NodeTrain path.
+build:use_gpu --cxxopt="-DUSE_GPU=1"
 
 # Bazel configuration for Yggdrasil Decision Forests
 #
@@ -70,7 +82,8 @@ common --enable_platform_specific_config
 # Required for bazel <=4, fails with bazel >= 5.
 # common --incompatible_restrict_string_escapes=false
 
-build -c opt
+# build -c opt --@rules_cuda//cuda:archs=sm_120
+build -c opt --@rules_cuda//cuda:archs=sm_89
 build --announce_rc
 build --noincompatible_strict_action_env
 

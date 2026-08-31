@@ -87,6 +87,10 @@ VectorSequenceComputer::Create(
   }
   auto c = absl::WrapUnique(new VectorSequenceComputer());
 
+  #ifdef BFS_ONLY 
+    use_gpu = true;
+  #endif
+  
   if (use_gpu) {
     const auto init_gpu_status = CheckHasGPU();
     if (!init_gpu_status.ok()) {

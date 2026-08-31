@@ -12,7 +12,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include "yggdrasil_decision_forests/learner/decision_tree/training.h"
 
 #include <stddef.h>
@@ -20,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <cstdint>
 #include <functional>
@@ -32,7 +32,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/flags/flag.h"
 #include "absl/base/optimization.h"
+
+ABSL_FLAG(bool, combined, false,
+          "If true, use GPU for both apply projection and evaluate projection.");
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
@@ -71,6 +75,17 @@
 #include <cuda_runtime.h>
 
 namespace yggdrasil_decision_forests::model::decision_tree {
+
+static double total_find_best_ms = 0;
+static double total_split_examples_ms = 0;
+static double total_node_setup_ms = 0;
+static double total_set_leaf_ms = 0;
+static double total_apply_constraint_ms = 0;
+static double total_constraints_ms = 0;
+static double total_node_push_ms = 0;
+static int total_node_train_count = 0;
+static int early_leaf_count = 0;
+static int no_split_leaf_count = 0;
 
 namespace {
 
@@ -1382,14 +1397,14 @@ absl::StatusOr<bool> FindBestConditionSingleThreadManager(
       break;
     case proto::DecisionTreeTrainingConfig::kSparseObliqueSplit:
     case proto::DecisionTreeTrainingConfig::kMhldObliqueSplit:
-    case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit:
+    case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit: {
       ASSIGN_OR_RETURN(
           found_good_condition,
           FindBestConditionOblique(
               train_dataset, selected_examples, weights, config, config_link,
               dt_config, parent, internal_config, label_stats, {}, constraints,
               best_condition, random, &cache->splitter_cache_list[0]));
-      break;
+      } break;
   }
 
   // Get the indices of the attributes to test.
@@ -1481,7 +1496,6 @@ absl::StatusOr<bool> FindBestConditionSingleThreadManager(
       }
     }
   }
-
   return found_good_condition;
 }
 
@@ -4752,6 +4766,7 @@ absl::Status DecisionTreeTrain(
     DecisionTree* dt, const InternalTrainConfig& internal_config) {
   // Note: This function is the entry point of all decision tree learning.
 
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
   // Check the sorting strategy.
   if (dt_config.internal().has_ensure_effective_sorting_strategy() &&
       (dt_config.internal().ensure_effective_sorting_strategy() !=
@@ -4877,7 +4892,10 @@ absl::Status DecisionTreeTrain(
                                ? std::optional<absl::Span<UnsignedExampleIdx>>(
                                      absl::MakeSpan(leaf_examples.value()))
                                : std::nullopt;
-
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  // Grayed out for 100 trees
+  //std::cerr << "Decision tree train set up time: " << duration.count() << " ms\n";
   return DecisionTreeCoreTrain(train_dataset, config, config_link, dt_config,
                                deployment, weights, random, internal_config, dt,
                                absl::MakeSpan(working_selected_examples),
@@ -4918,6 +4936,7 @@ absl::Status DecisionTreeCoreTrain(
     const InternalTrainConfig& internal_config, DecisionTree* dt,
     absl::Span<UnsignedExampleIdx> selected_examples,
     std::optional<absl::Span<UnsignedExampleIdx>> leaf_examples) {
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();    
   dt->CreateRoot();
   PerThreadCache cache;
 
@@ -4928,6 +4947,10 @@ absl::Status DecisionTreeCoreTrain(
     leaf_examples_rb = SelectedExamplesRollingBuffer::Create(
         leaf_examples.value(), &cache.leaf_example_buffer);
   }
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  // Grayed out for 100 trees
+  //std::cerr << "Decision tree core train set up time: " << duration.count() << " ms\n"; 
 
   switch (dt_config.growing_strategy_case()) {
     case proto::DecisionTreeTrainingConfig::kGrowingStrategyLocal: {
@@ -4973,20 +4996,19 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
   auto& selected_examples = node_and_examples.selected_examples;
   auto& leaf_examples = node_and_examples.leaf_examples;
   const auto depth = node_and_examples.depth;
-  std::cout << "NodeTrain: depth=" << depth
-            << " examples=" << selected_examples.size()
-            << " has_precomputed=" << !internal_config.precomputed_projected_values.empty()
-            << std::endl;
   const auto& constraints = node_and_examples.constraints;
   const auto set_leaf_already_set = node_and_examples.set_leaf_already_set;
   auto node = node_and_examples.node;
 
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
   if (selected_examples.empty()) {
     return absl::InternalError("No examples fed to the node trainer");
   }
   node->mutable_node()->set_num_pos_training_examples_without_weight(
       selected_examples.size());
 
+  // std::cout << "set_leaf_already_set: " << set_leaf_already_set << std::endl;
+  // set_leaf_already_set: 0 at the root node, 1 at the child nodes
   if (!set_leaf_already_set) {
     // Set the node value (i.e. the label distribution).
     RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
@@ -5012,6 +5034,7 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
       (dt_config.max_depth() >= 0 && depth >= dt_config.max_depth()) ||
       (internal_config.timeout.has_value() &&
        internal_config.timeout < absl::Now())) {
+    ++early_leaf_count;
     return finalize_as_leaf();
   }
 
@@ -5027,6 +5050,8 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
   // Extract the random local imputation.
   dataset::VerticalDataset random_local_imputation_train_dataset;
   std::vector<UnsignedExampleIdx> random_local_imputation_selected_examples;
+  // std::cout << "Missing value policy: " << dt_config.missing_value_policy() << std::endl;
+  // Missing value policy: 0
   if (dt_config.missing_value_policy() ==
       proto::DecisionTreeTrainingConfig::RANDOM_LOCAL_IMPUTATION) {
     std::vector<int> label_and_input_features(config_link.features().begin(),
@@ -5049,12 +5074,23 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
     splitter_dataset_is_compact = false;
     train_dataset_for_splitter = &train_dataset;
   }
-
+  // std::cout << "splitter_dataset_is_compact: " << splitter_dataset_is_compact << std::endl;
+  // splitter_dataset_is_compact: 0
   // Determine the best split.
   if (selected_examples_for_splitter.empty()) {
     return absl::InternalError("No examples fed to the splitter");
   }
+  double setup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start_time).count();
+  total_node_setup_ms += setup_ms;
 
+  // if (internal_config.precomputed_projected_values.empty() &&
+  //     internal_config.depthwise_projection_defs == nullptr &&
+  //     internal_config.best_condition == nullptr) {
+  //   std::cerr << "NodeTrain: no GPU data, depth=" << depth
+  //             << " examples=" << selected_examples.size() << "\n";
+  // }
+  auto t_find_best_start = std::chrono::steady_clock::now();
   ASSIGN_OR_RETURN(
       const auto has_better_condition,
       FindBestCondition(*train_dataset_for_splitter,
@@ -5062,7 +5098,11 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
                         config_link, dt_config, node->node(), internal_config,
                         constraints, node->mutable_node()->mutable_condition(),
                         random, cache));
+  total_find_best_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_find_best_start).count();
   if (!has_better_condition) {
+    ++no_split_leaf_count;
+    total_node_train_count++;
     return finalize_as_leaf();
   }
   STATUS_CHECK_EQ(
@@ -5073,13 +5113,59 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
                           dt_config.store_detailed_label_distribution());
 
   // Separate the positive and negative examples.
-  ASSIGN_OR_RETURN(
-      auto example_split,
-      internal::SplitExamplesInPlace(
-          *train_dataset_for_splitter, selected_examples,
-          node->node().condition(), splitter_dataset_is_compact,
-          dt_config.internal_error_on_wrong_splitter_statistics()));
+  auto t_split_start = std::chrono::steady_clock::now();
+  // std::cout << "splitter_dataset_is_compact: " << splitter_dataset_is_compact << std::endl;
+  // splitter_dataset_is_compact: 0
+  //  SelectedExamplesRollingBuffer selected_examples;
+  // Type of selected_examples.active: absl::Span<const UnsignedExampleIdx>
+  // Type of example_split: ExampleSplitRollingBuffer
+  // Type of example_split.positive_examples: SelectedExamplesRollingBuffer
+  // Type of example_split.negative_examples: SelectedExamplesRollingBuffer
+  // the below two matter the most
+  // Type of example_split.positive_examples.active: absl::Span<const UnsignedExampleIdx>
+  // Type of example_split.negative_examples.active: absl::Span<const UnsignedExampleIdx>
 
+  // #ifdef BFS_ONLY
+  // ASSIGN_OR_RETURN(
+  //     auto example_split, SplitExamplesInPlaceKernel_wrap(
+  //     internal_config.gpu_projected_data,
+  //     node->node().condition().condition().oblique_condition().threshold(),
+  //     selected_examples,
+  //     internal_config.rows_start,
+  //     internal_config.rows_node,
+  //     internal_config.best_projection_index,
+  //     internal_config.num_proj
+  //     ));
+  // #else
+  // ASSIGN_OR_RETURN(
+  //   auto example_split,
+  //   internal::SplitExamplesInPlace(
+  //       *train_dataset_for_splitter, selected_examples,
+  //       node->node().condition(), splitter_dataset_is_compact,
+  //       dt_config.internal_error_on_wrong_splitter_statistics()));
+  // #endif
+
+  #ifdef BFS_ONLY
+    auto example_split = internal_config.example_split;
+  #else
+  ASSIGN_OR_RETURN(
+    auto example_split,
+    internal::SplitExamplesInPlace(
+        *train_dataset_for_splitter, selected_examples,
+        node->node().condition(), splitter_dataset_is_compact,
+        dt_config.internal_error_on_wrong_splitter_statistics()));
+  #endif
+
+    // ASSIGN_OR_RETURN(
+    // auto example_split,
+    // internal::SplitExamplesInPlace(
+    //     *train_dataset_for_splitter, selected_examples,
+    //     node->node().condition(), splitter_dataset_is_compact,
+    //     dt_config.internal_error_on_wrong_splitter_statistics()));
+
+  // After splitting examples by the chosen condition, one side might end up empty,
+  // Meaning the split doesn't actually separate anything in practice. 
+  // If so, revert to a leaf.
   if (example_split.positive_examples.empty() ||
       example_split.negative_examples.empty()) {
     // The splitter statistics don't match exactly the condition evaluation and
@@ -5087,9 +5173,12 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
     node->ClearChildren();
     return finalize_as_leaf();
   }
+  total_split_examples_ms += std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - t_split_start).count();
 
   // Separate the positive and negative examples used only to determine the node
   // value.
+  // only used for honest trees
   std::optional<ExampleSplitRollingBuffer> node_only_example_split;
   if (leaf_examples.has_value()) {
     ASSIGN_OR_RETURN(
@@ -5106,18 +5195,46 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
   }
 
   // Set leaf outputs
-  RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
-      train_dataset, example_split.positive_examples.active, weights, config,
-      config_link, node->mutable_pos_child()));
-  RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
-      train_dataset, example_split.negative_examples.active, weights, config,
-      config_link, node->mutable_neg_child()));
+  auto t_set_leaf_start = std::chrono::steady_clock::now();
+  #if defined(BFS_ONLY)
+  if (internal_config.skip_set_leaf_on_children) {
+    const int nc = internal_config.gpu_num_classes;
+    utils::IntegerDistributionDouble dist_pos;
+    utils::IntegerDistributionDouble dist_neg;
+    dist_pos.SetNumClasses(nc);
+    dist_neg.SetNumClasses(nc);
+    for (int c = 0; c < nc; ++c) {
+      dist_pos.Add(c, internal_config.gpu_pos_class_counts[c]);
+      dist_neg.Add(c, internal_config.gpu_neg_class_counts[c]);
+    }
+    dist_pos.Save(node->mutable_pos_child()->mutable_node()->mutable_classifier()->mutable_distribution());
+    node->mutable_pos_child()->mutable_node()->mutable_classifier()->set_top_value(dist_pos.TopClass());
+    dist_neg.Save(node->mutable_neg_child()->mutable_node()->mutable_classifier()->mutable_distribution());
+    node->mutable_neg_child()->mutable_node()->mutable_classifier()->set_top_value(dist_neg.TopClass());
+  } else {
+  #endif
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, example_split.positive_examples.active, weights, config,
+        config_link, node->mutable_pos_child()));
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, example_split.negative_examples.active, weights, config,
+        config_link, node->mutable_neg_child()));
+  #if defined(BFS_ONLY)
+  }
+  #endif
+  total_set_leaf_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_set_leaf_start).count();
+
+  auto t_apply_constraint_start = std::chrono::steady_clock::now();
   RETURN_IF_ERROR(
       ApplyConstraintOnNode(constraints, node->mutable_pos_child()));
   RETURN_IF_ERROR(
       ApplyConstraintOnNode(constraints, node->mutable_neg_child()));
+  total_apply_constraint_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_apply_constraint_start).count();
 
   // Children constraints
+  auto t_constraints_start = std::chrono::steady_clock::now();
   auto pos_constraints = constraints;
   auto neg_constraints = constraints;
   const int monotonic_constraint_sign = MonotonicConstraintSign(
@@ -5129,8 +5246,11 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
         node->mutable_pos_child(), node->mutable_neg_child(), &pos_constraints,
         &neg_constraints));
   }
+  total_constraints_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_constraints_start).count();
 
   // Negative child.
+  auto t_push_start = std::chrono::steady_clock::now();
   node_stack.push_back(
       {node->mutable_neg_child(), std::move(example_split.negative_examples),
        node_only_example_split.has_value()
@@ -5146,7 +5266,10 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
                  std::move(node_only_example_split->positive_examples))
            : std::nullopt,
        depth + 1, pos_constraints, true});
+  total_node_push_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_push_start).count();
 
+  total_node_train_count++;
   return absl::OkStatus();
 }
 
@@ -5162,26 +5285,46 @@ absl::Status GrowTreeLocal(
     NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
     SelectedExamplesRollingBuffer selected_examples,
     std::optional<SelectedExamplesRollingBuffer> leaf_examples) {
+
   // All changed from vector to deque    
   std::deque<internal::NodeAndExamples> node_stack;
   node_stack.push_back({root, std::move(selected_examples),
                         std::move(leaf_examples), depth, constraints,
                         set_leaf_already_set});
- 
+  
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
   while (!node_stack.empty()) {
     auto current_node = std::move(node_stack.back());
     node_stack.pop_back();
 
-    // ADDED BY JY
-    std::cout << "Processing node at depth: " << current_node.depth 
-              << " with " << current_node.selected_examples.size() 
-              << " selected examples." << std::endl;
-    
     RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
                               deployment, weights, internal_config, random,
                               cache, std::move(current_node), node_stack));
   }
 
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_time = end_time - start_time;
+  std::cout << "Time taken for GrowTreeLocal DFS: " << elapsed_time.count() << " ms." << std::endl;
+
+  internal::PrintAndResetDfsTimers();
+  if (total_node_train_count > 0) {
+    std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+              << " find_best=" << total_find_best_ms << "ms"
+              << " split_examples=" << total_split_examples_ms << "ms"
+              << " set_leaf=" << total_set_leaf_ms << "ms"
+              << " apply_constraint=" << total_apply_constraint_ms << "ms"
+              << " constraints=" << total_constraints_ms << "ms"
+              << " push=" << total_node_push_ms << "ms"
+              << " nodes=" << total_node_train_count << "\n";
+  }
+  total_find_best_ms = 0;
+  total_split_examples_ms = 0;
+  total_node_setup_ms = 0;
+  total_set_leaf_ms = 0;
+  total_apply_constraint_ms = 0;
+  total_constraints_ms = 0;
+  total_node_push_ms = 0;
+  total_node_train_count = 0;
   return absl::OkStatus();
 }
 
@@ -5197,61 +5340,100 @@ absl::Status GrowTreeLocalBFS(
     NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
     SelectedExamplesRollingBuffer selected_examples,
     std::optional<SelectedExamplesRollingBuffer> leaf_examples) {
-  
-  std::chrono::steady_clock::time_point start_time_warmup = std::chrono::steady_clock::now();
-  cuda_warmup();
-  std::cout << "CUDA warmup done." << std::endl;
-  std::chrono::steady_clock::time_point end_time_warmup = std::chrono::steady_clock::now();
-  std::chrono::duration<double, std::milli> elapsed_time = end_time_warmup - start_time_warmup;
-  std::cout << "Time taken for CUDA warmup: " << elapsed_time.count() << " ms." << std::endl;
 
-  // Flatten the dataset for faster access during split finding GPU
-  // 1.1) Preprocessing: Flatten the dataset into a contiguous array for GPU processing
-  std::chrono::steady_clock::time_point start_time_flatten = std::chrono::steady_clock::now();
-  const int num_cols = config_link.numerical_features_size();
+  const bool combined = absl::GetFlag(FLAGS_combined);
+  const float* d_flat_data = internal_config.d_flat_data;
+  const int* d_labels = internal_config.d_labels;
   const int num_rows = train_dataset.nrow();
-  std::vector<float> flat(num_rows * num_cols);
-  for (int c = 0; c < num_cols; ++c) {
-    const int attr = config_link.numerical_features(c);
-    const auto* col = train_dataset
-        .ColumnWithCastOrNull<dataset::VerticalDataset::NumericalColumn>(attr);
-    for (int r = 0; r < num_rows; ++r) {
-      flat[c * num_rows + r] = col->values()[r];
-    }
-  }
-  // 1.2) Preprocessing: Extract labels for GPU processing
-  const auto* label_col = train_dataset
-      .ColumnWithCastOrNull<dataset::VerticalDataset::CategoricalColumn>(
-          config_link.label());
-  const std::vector<int32_t>& labels = label_col->values();
-  std::chrono::steady_clock::time_point end_time_flatten = std::chrono::steady_clock::now();
-  std::chrono::duration<double, std::milli> elapsed_time_flatten = end_time_flatten - start_time_flatten;
-  std::cout << "Time taken for dataset flattening: " << elapsed_time_flatten.count() << " ms." << std::endl;
+  const int32_t num_classes = train_dataset.data_spec()
+                                  .columns(config_link.label())
+                                  .categorical()
+                                  .number_of_unique_values();
 
-
-  // 2.1) Preprocessing: Allocate device memory for flattened data and labels
-  std::chrono::steady_clock::time_point start_time_cuda_alloc = std::chrono::steady_clock::now();
-  float* d_flat_data = nullptr;
-  cudaMalloc(&d_flat_data, static_cast<size_t>(num_rows) * num_cols * sizeof(float));
-  cudaMemcpy(d_flat_data, flat.data(), static_cast<size_t>(num_rows) * num_cols * sizeof(float), cudaMemcpyHostToDevice);
+  // Pre-allocate reusable GPU buffers sized for worst case (root level).
+  std::chrono::steady_clock::time_point start_time_malloc = std::chrono::steady_clock::now();
+  const int max_num_proj = GetNumProjections(
+      dt_config, config_link.numerical_features_size());
+  int* d_selected_examples = nullptr;
+  float* d_col_add_projected = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_selected_examples, static_cast<size_t>(num_rows) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_col_add_projected,
+             static_cast<size_t>(num_rows) * max_num_proj * sizeof(float)));
+  std::chrono::steady_clock::time_point end_time_malloc = std::chrono::steady_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_time_malloc = end_time_malloc - start_time_malloc;
+  // Grayed out for 100 trees
+  //std::cout << "Time taken for Selected examples and col add projected GPU memory allocation: " << elapsed_time_malloc.count() << " ms." << std::endl;
   
-  // 2.2) Preprocessing: Copy labels to device
-  int* d_labels = nullptr;
-  cudaMalloc(&d_labels, num_rows * sizeof(int));
-  cudaMemcpy(d_labels, labels.data(), num_rows * sizeof(int), cudaMemcpyHostToDevice);
-  std::chrono::steady_clock::time_point end_time_cuda_alloc = std::chrono::steady_clock::now();
-  std::chrono::duration<double, std::milli> elapsed_time_cuda_alloc = end_time_cuda_alloc - start_time_cuda_alloc;
-  std::cout << "Time taken for CUDA memory allocation: " << elapsed_time_cuda_alloc.count() << " ms." << std::endl;
+  std::vector<UnsignedExampleIdx> flat_sel(num_rows);
 
+  // Only using pinned memory for projected data to copy from GPU to CPU for split finding
+  float* pinned_projected = nullptr;
+  if (!combined) {
+    std::chrono::steady_clock::time_point start_time_pinned_malloc = std::chrono::steady_clock::now();
+    const size_t pinned_projected_bytes =
+        static_cast<size_t>(num_rows) * max_num_proj * sizeof(float);
+    CUDA_CHECK(cudaMallocHost(&pinned_projected, pinned_projected_bytes));
+    std::chrono::steady_clock::time_point end_time_pinned_malloc = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_pinned_malloc =  end_time_pinned_malloc - start_time_pinned_malloc;
+    std::cout << "Time taken for Pinned memory allocation: " << elapsed_time_pinned_malloc.count() << " ms." << std::endl;
+  }
+  
 
   std::deque<internal::NodeAndExamples> node_queue;
   node_queue.push_back({root, std::move(selected_examples),
                         std::move(leaf_examples), depth, constraints,
                         set_leaf_already_set});
 
+  double total_node_train_ms = 0.0;
+  double total_kernel_ms = 0.0;
+  double total_gpu_hist_ms = 0.0;
+  double total_blockmm_ms = 0.0;
+  double total_finalmm_ms = 0.0;
+  double total_randbnd_ms = 0.0;
+  double total_buildhist_ms = 0.0;
+  double total_entropy_ms = 0.0;
+  double total_bestnode_ms = 0.0;
+  double total_d2h_hist_ms = 0.0;
+  double total_reorder_ms = 0.0;
+  double total_sample_ms = 0.0;
+  double total_flatten_sel_ms = 0.0;
+  double total_flatten_proj_ms = 0.0;
+  double total_malloc_ms = 0.0;
+  double total_h2d_ms = 0.0;
+  double total_d2h_ms = 0.0; // not combined
+  double total_free_ms = 0.0;
+  double total_split_all_depth_ms = 0.0;
+  double total_prefixsum_ms = 0.0;
 
+  std::vector<int> node_row_offsets;
+  std::cout << "Starting BFS tree growth..." << std::endl;
   while (!node_queue.empty()) {
+
+    std::chrono::steady_clock::time_point start_time_depth = std::chrono::steady_clock::now();
     const int32_t current_depth = node_queue.front().depth;
+    // Grayed out for 100 trees
+    // std::cout << "Processing depth: " << current_depth << ", nodes in queue: " << node_queue.size() << std::endl;
+    if (current_depth >= dt_config.max_depth()) {
+      std::cout << "Reached maximum depth, finalizing remaining nodes as leaves." << std::endl;
+      size_t total_rows_d16 = 0;
+      int num_nodes_d16 = 0;
+      while (!node_queue.empty()) {
+        auto& nae = node_queue.front();
+        total_rows_d16 += nae.selected_examples.size();
+        num_nodes_d16++;
+        nae.node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+        node_queue.pop_front();
+      }
+      std::cerr << "D" << current_depth
+                << " nodes=" << num_nodes_d16
+                << " rows=" << total_rows_d16
+                << " (finalized as leaves)\n";
+      std::chrono::steady_clock::time_point end_time_depth = std::chrono::steady_clock::now();
+      std::chrono::duration<double, std::milli> elapsed_time_depth = end_time_depth - start_time_depth;
+      std::cout << "Time taken for depth " << current_depth << " processing: " << elapsed_time_depth.count() << " ms." << std::endl;
+      std::cout << "All nodes finalized as leaves. BFS tree growth complete." << std::endl;
+      break;
+    }
     std::vector<internal::NodeAndExamples> depth_batch;
     // Not chrono'd: measured at <0.1 s for 3M rows — completely trivial.
     while (!node_queue.empty() &&
@@ -5259,31 +5441,32 @@ absl::Status GrowTreeLocalBFS(
       depth_batch.push_back(std::move(node_queue.front()));
       node_queue.pop_front();
     }
-
-      if (dt_config.has_sparse_oblique_split() && depth_batch.size() > 1) {
-        // Fused-per-level CPU Apply. Sample projections per node, preserving
-        // ordinary Sparse Oblique RF semantics, then precompute each node's
-        // projected-value slab before per-node split search.
+    // Grayed out for 100 trees
+    // std::cerr << "BFS depth_batch built: " << depth_batch.size() << " nodes"
+    //           << ", has_sparse_oblique=" << dt_config.has_sparse_oblique_split()
+    //           << std::endl;
+    std::chrono::steady_clock::time_point end_time_depth = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_depth = end_time_depth - start_time_depth;
+    // Grayed out for 100 trees
+    // std::cout << "Time taken for depth " << current_depth << " processing: " << elapsed_time_depth.count() << " ms." << std::endl;
+    
+      if (dt_config.has_sparse_oblique_split() && depth_batch.size() >= 1) {
+        auto t_proj_start = std::chrono::steady_clock::now();
         const int num_proj = GetNumProjections(
-            dt_config, config_link.numerical_features_size()) * 1.5;
+            dt_config, config_link.numerical_features_size());
         const float projection_density = std::clamp(
             dt_config.sparse_oblique_split().projection_density_factor() /
                 config_link.numerical_features_size(),
             0.f, 1.f);
 
         const int num_nodes = depth_batch.size();
-        // Both dimensions are known on entry to the depth level: num_nodes is the
-        // frontier size and num_proj is static. Size the full 2D structure once
-        // here (outside the CHRONO_SCOPE below) so the allocation is not billed to
-        // kSampleProjection and the per-node resize/assign vanishes from the hot
-        // loop. SampleProjection self-clears each Projection (sparse list) and
-        // unconditionally writes monotonic_direction, so no pre-zeroing is needed.
+
+        // --- [1] Sample projections ---
+        auto t_sample_start = std::chrono::steady_clock::now();
         std::vector<std::vector<internal::Projection>> all_node_projs(
             num_nodes, std::vector<internal::Projection>(num_proj));
         std::vector<std::vector<int8_t>> all_node_mono(
             num_nodes, std::vector<int8_t>(num_proj));
-
-        // Projection-major sampling (K projections x 2^d nodes)
         for (int n = 0; n < num_nodes; ++n) {
           for (int p = 0; p < num_proj; ++p) {
             internal::SampleProjection(
@@ -5292,51 +5475,715 @@ absl::Status GrowTreeLocalBFS(
                 &all_node_projs[n][p], &all_node_mono[n][p], random);
           }
         }
+        auto t_sample_end = std::chrono::steady_clock::now();
+        double sample_ms = std::chrono::duration<double,std::milli>(t_sample_end - t_sample_start).count();
+        total_sample_ms += sample_ms;
 
-        std::cout << "Depth " << current_depth << ": "
-                  << num_nodes << " nodes, "
-                  << num_proj << " projections per node, "
-                  << projection_density << " density factor." << std::endl;
-        std::cout << "All node projs:" << std::endl;
+        // --- [2] Reorder projections ---
+        // Doesn't matter if option 0 selected
+        // int selected_features_count = 2;
+        int selected_features_count = 0;
+        auto t_reorder_start = std::chrono::steady_clock::now();
+        // 0 = no reorder, 6 = symmetric, 7 = Hungarian Iterative + Node Reorder
+        internal::ReorderProjections(all_node_projs, num_proj, num_nodes,
+                          selected_features_count,
+                          0, false);
+        auto t_reorder_end = std::chrono::steady_clock::now();
+        double reorder_ms = std::chrono::duration<double,std::milli>(t_reorder_end - t_reorder_start).count();
+        total_reorder_ms += reorder_ms;
+
+        // --- [3] Flatten selected examples ---
+        auto t_flatten_sel_start = std::chrono::steady_clock::now();
+        auto flat_sel_result =
+            internal::FlattenSelectedExamples(depth_batch);
+        auto& sel_spans = flat_sel_result.sel_spans;
+        auto& inactive_spans = flat_sel_result.inactive_spans;
+        const size_t total_rows = flat_sel_result.total_rows;
+        const int max_rows_per_node = flat_sel_result.max_rows_per_node;
+
+        node_row_offsets = std::move(flat_sel_result.node_row_offsets);
         for (int n = 0; n < num_nodes; ++n) {
-          std::cout << "Node " << n << ": ";
-          for (int p = 0; p < num_proj; ++p) {
-            std::cout << "Proj " << p << ": ";
-                
-            std::cout << "Mono: " << static_cast<int>(all_node_mono[n][p]) << "; ";
+            const size_t span_bytes = sel_spans[n].size() * sizeof(UnsignedExampleIdx);
+            std::memcpy(flat_sel.data() + node_row_offsets[n],
+                        sel_spans[n].data(), span_bytes);
+        }
+        auto t_flatten_sel_end = std::chrono::steady_clock::now();
+        double flatten_sel_ms = std::chrono::duration<double,std::milli>(t_flatten_sel_end - t_flatten_sel_start).count();
+        total_flatten_sel_ms += flatten_sel_ms;
+
+        // --- [4] Flatten projections ---
+        auto t_flatten_proj_start = std::chrono::steady_clock::now();
+        auto flat_proj_result =
+            internal::FlattenProjections(all_node_projs, num_proj, num_nodes);
+        auto& flat_proj_col_idx = flat_proj_result.col_idx;
+        auto& flat_proj_weights = flat_proj_result.weights;
+        auto& proj_offsets = flat_proj_result.offsets;
+        const int num_segments = num_proj * num_nodes;
+        auto t_flatten_proj_end = std::chrono::steady_clock::now();
+        double flatten_proj_ms = std::chrono::duration<double,std::milli>(t_flatten_proj_end - t_flatten_proj_start).count();
+        total_flatten_proj_ms += flatten_proj_ms;
+
+        // --- [5] cudaMalloc metadata buffers ---
+        auto t_malloc_start = std::chrono::steady_clock::now();
+        int* d_offset = nullptr;
+        int* d_flat_projection_col_idx = nullptr;
+        float* d_flat_projection_weights = nullptr;
+        int* d_node_row_off = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_offset, (num_segments + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_flat_projection_col_idx, flat_proj_col_idx.size() * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_flat_projection_weights, flat_proj_weights.size() * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_node_row_off, (num_nodes + 1) * sizeof(int)));
+        auto t_malloc_end = std::chrono::steady_clock::now();
+        double malloc_ms = std::chrono::duration<double,std::milli>(t_malloc_end - t_malloc_start).count();
+        total_malloc_ms += malloc_ms;
+
+        // --- [6] cudaMemcpy H→D (pinned flat_sel) ---
+        auto t_h2d_start = std::chrono::steady_clock::now();
+        CUDA_CHECK(cudaMemcpy(d_selected_examples, flat_sel.data(), total_rows * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_offset, proj_offsets.data(), (num_segments + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_flat_projection_col_idx, flat_proj_col_idx.data(), flat_proj_col_idx.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_flat_projection_weights, flat_proj_weights.data(), flat_proj_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_node_row_off, node_row_offsets.data(), (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        auto t_h2d_end = std::chrono::steady_clock::now();
+        double h2d_ms = std::chrono::duration<double,std::milli>(t_h2d_end - t_h2d_start).count();
+        total_h2d_ms += h2d_ms;
+
+        // --- [7] Kernel ---
+        // Common to both combined and not combined
+        auto t_kernel_start = std::chrono::steady_clock::now();
+        const int num_block = 256;
+        const int blocks_per_node = (max_rows_per_node + num_block - 1) / num_block;
+
+        auto t_prefixsum_start = std::chrono::steady_clock::now();
+
+        std::vector<int> h_node_block_off(num_nodes + 1);
+        h_node_block_off[0] = 0;
+        for (int i = 0; i < num_nodes; ++i) {
+            int rows_i = node_row_offsets[i + 1] - node_row_offsets[i];
+            h_node_block_off[i + 1] = h_node_block_off[i] + (rows_i + num_block - 1) / num_block;
+        }
+        int total_node_blocks = h_node_block_off[num_nodes];
+
+        int* d_node_block_off = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_node_block_off, (num_nodes + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_node_block_off, h_node_block_off.data(),
+                              (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+        std::vector<int> h_meta_block_off(num_nodes + 1);
+        h_meta_block_off[0] = 0;
+        for (int i = 0; i < num_nodes; ++i) {
+            int blocks_node = h_node_block_off[i + 1] - h_node_block_off[i];
+            h_meta_block_off[i + 1] = h_meta_block_off[i] + (blocks_node + 255) / 256;
+        }
+        int total_meta_blocks = h_meta_block_off[num_nodes];
+
+        int* d_meta_block_off = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_meta_block_off, (num_nodes + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_meta_block_off, h_meta_block_off.data(),
+                              (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+        auto t_prefixsum_end = std::chrono::steady_clock::now();
+        double prefixsum_ms = std::chrono::duration<double,std::milli>(t_prefixsum_end - t_prefixsum_start).count();
+        total_prefixsum_ms += prefixsum_ms;
+
+        // --- 2D compacted grid (no wasted blocks) ---
+        ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data,
+                                                d_selected_examples,
+                                                d_col_add_projected,
+                                                d_offset,
+                                                d_flat_projection_col_idx,
+                                                d_flat_projection_weights,
+                                                d_node_row_off,
+                                                d_node_block_off,
+                                                num_nodes,
+                                                num_proj,
+                                                num_rows,
+                                                total_rows,
+                                                total_node_blocks);
+        // --- 2D per-thread UpperBound (one thread per row) ---
+        // ColumnAddProjectionKernel_SRDW_1_2D_perthread_wrap(d_flat_data,
+        //                                         d_selected_examples,
+        //                                         d_col_add_projected,
+        //                                         d_offset,
+        //                                         d_flat_projection_col_idx,
+        //                                         d_flat_projection_weights,
+        //                                         d_node_row_off,
+        //                                         num_nodes,
+        //                                         num_proj,
+        //                                         num_rows,
+        //                                         total_rows);
+        // --- 3D grid based on max_rows_per_node (for comparison) ---
+        // ColumnAddProjectionKernel_SRDW_1_wrap(d_flat_data,
+        //                                         d_selected_examples,
+        //                                         d_col_add_projected,
+        //                                         d_offset,
+        //                                         d_flat_projection_col_idx,
+        //                                         d_flat_projection_weights,
+        //                                         d_node_row_off,
+        //                                         num_nodes,
+        //                                         num_proj,
+        //                                         num_rows,
+        //                                         total_rows,
+        //                                         blocks_per_node);
+        auto t_kernel_end = std::chrono::steady_clock::now();
+        double kernel_ms = std::chrono::duration<double,std::milli>(t_kernel_end - t_kernel_start).count();
+        total_kernel_ms += kernel_ms;
+
+
+          double d2h_ms = 0.0, free_ms = 0.0, node_train_ms = 0.0;
+          double gpu_hist_ms = 0.0;
+
+    
+          // // --- [7.5] Block Min/Max ---
+        if (combined) // BFS Only and GPU Apply Projection on Evaluate Projection
+        {
+          auto t_gpu_hist_start = std::chrono::steady_clock::now();
+          const int total_blocks = total_node_blocks * num_proj;
+          float *d_block_min = nullptr, *d_block_max = nullptr;
+          CUDA_CHECK(cudaMalloc(&d_block_min, total_blocks * sizeof(float)));
+          CUDA_CHECK(cudaMalloc(&d_block_max, total_blocks * sizeof(float)));
+
+          auto t_blockmm_start = std::chrono::steady_clock::now();
+          // --- 2D compacted grid (no wasted blocks) ---
+          BlockMinMax_2D_wrap(
+                            d_col_add_projected,
+                            d_node_row_off,
+                            d_block_min,
+                            d_block_max,
+                            d_node_block_off,
+                            num_nodes,
+                            num_proj,
+                            total_node_blocks);
+          // --- 3D grid based on max_rows_per_node (for comparison) ---
+          // BlockMinMax_wrap(
+          //                   d_col_add_projected,
+          //                   d_node_row_off,
+          //                   d_block_min,
+          //                   d_block_max,
+          //                   d_node_block_off,
+          //                   num_nodes,
+          //                   num_proj,
+          //                   blocks_per_node);
+          auto t_blockmm_end = std::chrono::steady_clock::now();
+          double blockmm_ms = std::chrono::duration<double,std::milli>(t_blockmm_end - t_blockmm_start).count();
+
+          float *d_min_val = nullptr, *d_max_val = nullptr;
+          CUDA_CHECK(cudaMalloc(&d_min_val, num_segments * sizeof(float)));
+          CUDA_CHECK(cudaMalloc(&d_max_val, num_segments * sizeof(float)));
+          {
+            std::vector<float> init_min(num_segments, std::numeric_limits<float>::infinity());
+            std::vector<float> init_max(num_segments, -std::numeric_limits<float>::infinity());
+            CUDA_CHECK(cudaMemcpy(d_min_val, init_min.data(), num_segments * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_max_val, init_max.data(), num_segments * sizeof(float), cudaMemcpyHostToDevice));
           }
-          std::cout << std::endl;
-        } 
+
+          auto t_finalmm_start = std::chrono::steady_clock::now();
+          finalMinMaxReduceAtomic_2D_wrap(d_block_min,
+                                          d_block_max,
+                                          d_node_block_off,
+                                          d_meta_block_off,
+                                          d_min_val,
+                                          d_max_val,
+                                          num_nodes,
+                                          num_proj,
+                                          total_meta_blocks);
+
+          // finalMinMaxReduceAtomic_wrap(d_block_min,
+          //                             d_block_max,
+          //                             d_node_block_off,
+          //                             d_min_val,
+          //                             d_max_val,
+          //                             num_nodes,
+          //                             num_proj,
+          //                             blocks_per_node);
+
+          auto t_finalmm_end = std::chrono::steady_clock::now();
+          double finalmm_ms = std::chrono::duration<double,std::milli>(t_finalmm_end - t_finalmm_start).count();
+
+          const int num_bins = dt_config.numerical_split().num_candidates();
+          const int splits_per_segment = num_bins - 1;
+          float* d_sorted_candidate_splits = nullptr;
+          const int total_splits = num_segments * splits_per_segment;
+          CUDA_CHECK(cudaMalloc(&d_sorted_candidate_splits, total_splits * sizeof(float)));
+          int rng_seed = (*random)();
+
+          auto t_randbnd_start = std::chrono::steady_clock::now();
+          RandomBoundaries_wrap(splits_per_segment,
+                              d_min_val,
+                              d_max_val,
+                              d_sorted_candidate_splits,
+                              num_segments,
+                              rng_seed);
+          auto t_randbnd_end = std::chrono::steady_clock::now();
+          double randbnd_ms = std::chrono::duration<double,std::milli>(t_randbnd_end - t_randbnd_start).count();
+
+          // Device histograms   (#segments × num_bins)
+          const int hist_elems = num_segments * num_bins;
+          int *d_hist_class0, *d_hist_class1;
+          CUDA_CHECK(cudaMalloc(&d_hist_class0, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_hist_class1, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMemset(d_hist_class0, 0, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMemset(d_hist_class1, 0, hist_elems * sizeof(int)));
+
+          auto t_buildhist_start = std::chrono::steady_clock::now();
+          BuildHistogramRandomKernel_2D_wrap(d_col_add_projected,
+                                          d_selected_examples,
+                                          d_labels,
+                                          d_hist_class0,
+                                          d_hist_class1,
+                                          num_proj,
+                                          num_bins,
+                                          d_sorted_candidate_splits,
+                                          d_node_row_off,
+                                          d_node_block_off,
+                                          num_nodes,
+                                          total_node_blocks);
+
+          // --- 3D grid based on max_rows_per_node (for comparison) ---
+          // BuildHistogramRandomKernel_wrap(d_col_add_projected,
+          //                                 d_selected_examples,
+          //                                 d_labels,
+          //                                 d_hist_class0,
+          //                                 d_hist_class1,
+          //                                 num_proj,
+          //                                 num_bins,
+          //                                 d_sorted_candidate_splits,
+          //                                 d_node_row_off,
+          //                                 num_nodes,
+          //                                 blocks_per_node);
+
+          auto t_buildhist_end = std::chrono::steady_clock::now();
+          double buildhist_ms = std::chrono::duration<double,std::milli>(t_buildhist_end - t_buildhist_start).count();
 
 
-        std::vector<absl::Span<const UnsignedExampleIdx>> sel_spans(num_nodes);
-        for (int n = 0; n < num_nodes; ++n) {
-          sel_spans[n] = depth_batch[n].selected_examples.active;
+          // Inclusive scan by key  (key = segment id)
+          // hist_elem is num_segments * num_bins
+          float *d_best_gain_per_seg;
+          int *d_best_split_per_seg;
+          CUDA_CHECK(cudaMalloc(&d_best_gain_per_seg, num_segments * sizeof(float)));
+          CUDA_CHECK(cudaMalloc(&d_best_split_per_seg, num_segments * sizeof(int)));
+          CUDA_CHECK(cudaMemset(d_best_gain_per_seg, 0xFF, num_segments * sizeof(float)));
+          CUDA_CHECK(cudaMemset(d_best_split_per_seg, 0xFF, num_segments * sizeof(int)));
+
+          int* d_prefix_0;
+          int* d_prefix_1;
+          float* d_out_per_bin_per_proj;
+          CUDA_CHECK(cudaMalloc(&d_prefix_0, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_prefix_1, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMemset(d_prefix_0, 0, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMemset(d_prefix_1, 0, hist_elems * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_out_per_bin_per_proj, hist_elems * sizeof(float)));
+          CUDA_CHECK(cudaMemset(d_out_per_bin_per_proj, 0, hist_elems * sizeof(float)));
+
+          auto t_entropy_start = std::chrono::steady_clock::now();
+          // Note: grid is (1, num_nodes, num_proj) — already one block per segment,
+          // no wasted blocks to compact. 2D version would not improve this.
+          FindBestEntropySplitKernel_wrap(d_hist_class0,
+                                          d_hist_class1,
+                                          d_best_gain_per_seg,
+                                          d_best_split_per_seg,
+                                          num_segments,
+                                          num_bins,
+                                          num_nodes,
+                                          num_proj,
+                                          hist_elems,
+                                          d_prefix_0,
+                                          d_prefix_1,
+                                          d_out_per_bin_per_proj);
+
+          auto t_entropy_end = std::chrono::steady_clock::now();
+          double entropy_ms = std::chrono::duration<double,std::milli>(t_entropy_end - t_entropy_start).count();
+
+
+          float* d_best_gain_per_node;
+          int* d_best_proj_per_node;
+          int* d_best_split_per_node;
+          int* d_num_pos_per_node;
+          float* d_best_threshold_per_node;
+          CUDA_CHECK(cudaMalloc(&d_best_gain_per_node,      num_nodes * sizeof(float)));
+          CUDA_CHECK(cudaMalloc(&d_best_proj_per_node,      num_nodes * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_best_split_per_node,     num_nodes * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_num_pos_per_node,        num_nodes * sizeof(int)));
+          CUDA_CHECK(cudaMalloc(&d_best_threshold_per_node, num_nodes * sizeof(float)));
+
+          auto t_bestnode_start = std::chrono::steady_clock::now();
+          BestProjectionPerNodeKernel_wrap(d_best_gain_per_seg,
+                                            d_best_split_per_seg,
+                                            d_best_gain_per_node,
+                                            d_best_proj_per_node,
+                                            d_best_split_per_node,
+                                            d_num_pos_per_node,
+                                            d_best_threshold_per_node,
+                                            num_nodes,
+                                            num_proj,
+                                            num_bins,
+                                            d_prefix_0,
+                                            d_prefix_1,
+                                            d_sorted_candidate_splits);
+          auto t_bestnode_end = std::chrono::steady_clock::now();
+          double bestnode_ms = std::chrono::duration<double,std::milli>(t_bestnode_end - t_bestnode_start).count();
+
+          // D2H Best Projection and Condition Data Per Node
+          auto t_d2h_hist_start = std::chrono::steady_clock::now();
+          std::vector<int> best_projection_per_node_index(num_nodes);
+          std::vector<int> best_split_per_node(num_nodes);
+          std::vector<float> best_gain_per_node(num_nodes);
+          std::vector<int> num_pos_per_node(num_nodes);
+          std::vector<float> best_threshold_per_node(num_nodes);
+          CUDA_CHECK(cudaMemcpy(best_projection_per_node_index.data(), d_best_proj_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(best_split_per_node.data(), d_best_split_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(best_gain_per_node.data(), d_best_gain_per_node, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(num_pos_per_node.data(), d_num_pos_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+          CUDA_CHECK(cudaMemcpy(best_threshold_per_node.data(), d_best_threshold_per_node, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+          auto t_d2h_hist_end = std::chrono::steady_clock::now();
+          double d2h_hist_ms = std::chrono::duration<double,std::milli>(t_d2h_hist_end - t_d2h_hist_start).count();
+
+          // Populate the best projection per node
+          std::vector<internal::Projection> best_projection_per_node(num_nodes);
+          std::vector<proto::NodeCondition> best_condition_per_node(num_nodes);
+          std::vector<bool> node_has_split(num_nodes, false);
+          for (int n = 0; n < num_nodes; ++n) {
+            if (best_projection_per_node_index[n] < 0 ||
+                best_projection_per_node_index[n] >= num_proj) continue;
+            node_has_split[n] = true;
+            best_projection_per_node[n] = all_node_projs[n][best_projection_per_node_index[n]];
+            best_condition_per_node[n].set_attribute(best_projection_per_node[n].front().attribute_idx);
+            best_condition_per_node[n].set_num_training_examples_with_weight(sel_spans[n].size());
+            best_condition_per_node[n].set_num_training_examples_without_weight(sel_spans[n].size());
+            best_condition_per_node[n].set_num_pos_training_examples_with_weight(num_pos_per_node[n]);
+            best_condition_per_node[n].set_num_pos_training_examples_without_weight(num_pos_per_node[n]);
+            best_condition_per_node[n].set_split_score(best_gain_per_node[n]);
+            best_condition_per_node[n].set_na_value(true);
+          }
+          auto t_gpu_hist_end = std::chrono::steady_clock::now();
+          gpu_hist_ms = std::chrono::duration<double,std::milli>(t_gpu_hist_end - t_gpu_hist_start).count();
+
+          // Grayed out for 100 trees
+          // std::cerr << "  D" << current_depth << " RHistSplit breakdown:"
+          //           << " BlockMM=" << blockmm_ms << "ms"
+          //           << " FinalMM=" << finalmm_ms << "ms"
+          //           << " RandBnd=" << randbnd_ms << "ms"
+          //           << " BuildHist=" << buildhist_ms << "ms"
+          //           << " Entropy=" << entropy_ms << "ms"
+          //           << " BestNode=" << bestnode_ms << "ms"
+          //           << " D2H=" << d2h_hist_ms << "ms"
+          //           << " TOTAL=" << gpu_hist_ms << "ms\n";
+
+          total_gpu_hist_ms += gpu_hist_ms;
+          total_blockmm_ms += blockmm_ms;
+          total_finalmm_ms += finalmm_ms;
+          total_randbnd_ms += randbnd_ms;
+          total_buildhist_ms += buildhist_ms;
+          total_entropy_ms += entropy_ms;
+          total_bestnode_ms += bestnode_ms;
+          total_d2h_hist_ms += d2h_hist_ms;
+
+
+          //d_col_add_projected, float*
+          //d_selected_examples, int*
+          //d_best_proj_per_node, int*
+          //d_best_threshold_per_node, float*
+          //d_node_row_off, int*
+          //num_proj, int
+          //num_nodes, y dim, int
+          //total_rows, int
+          //max_rows_per_node, int
+          
+          std::chrono::steady_clock::time_point t_split_examples_start = std::chrono::steady_clock::now();
+          std::vector<std::vector<int>> pos_class_counts;
+          std::vector<std::vector<int>> neg_class_counts;
+          
+          ASSIGN_OR_RETURN(auto example_splits,
+            SplitExamplesInPlaceKernel_all_depth_wrap(
+                  d_col_add_projected,
+                  d_selected_examples,
+                  d_best_proj_per_node,
+                  d_best_threshold_per_node,
+                  d_node_row_off,
+                  node_row_offsets.data(),
+                  sel_spans,
+                  inactive_spans,
+                  num_proj,
+                  num_nodes,
+                  total_rows,
+                  max_rows_per_node,
+                  d_labels,
+                  num_classes,
+                  pos_class_counts,
+                  neg_class_counts));
+                  
+          std::chrono::steady_clock::time_point t_split_examples_end = std::chrono::steady_clock::now();
+          double split_examples_ms = std::chrono::duration<double,std::milli>(t_split_examples_end - t_split_examples_start).count();
+          total_split_all_depth_ms += split_examples_ms;
+          // Grayed out for 100 trees
+          // std::cout << "Time taken for SplitExamplesInPlaceKernel_all_depth_wrap: " << split_examples_ms << " ms." << std::endl;
+
+        // --- [8] cudaFree metadata buffers ---
+          auto t_free_start_iter = std::chrono::steady_clock::now();
+
+          // Apply Projection
+          cudaFree(d_offset);
+          cudaFree(d_flat_projection_col_idx);
+          cudaFree(d_flat_projection_weights);
+          cudaFree(d_node_row_off); //reused in Block Min/Max and Histogram
+          cudaFree(d_node_block_off); //reused in Apply Projection and Block Min/Max
+          cudaFree(d_meta_block_off); //reused in finalMinMaxReduceAtomic 2D
+
+          //Block Min/Max
+          cudaFree(d_block_min); //reused in finalMinMaxReduceAtomic
+          cudaFree(d_block_max); //reused in finalMinMaxReduceAtomic
+
+          //Final Min/Max
+          cudaFree(d_min_val); //reused in Random Boundaries
+          cudaFree(d_max_val); //reused in Random Boundaries
+
+          // Random Boundaries
+          cudaFree(d_sorted_candidate_splits); //reused in Histogram
+
+          // Histogram
+          cudaFree(d_hist_class0); //reused in FindBestEntropySplit
+          cudaFree(d_hist_class1); //reused in FindBestEntropySplit
+
+          //Find Best Entropy Split
+          cudaFree(d_best_gain_per_seg); //reused in BestProjectionPerNode
+          cudaFree(d_best_split_per_seg); //reused in BestProjectionPerNode
+          cudaFree(d_prefix_0); //reused later
+          cudaFree(d_prefix_1); //reused later
+          cudaFree(d_out_per_bin_per_proj);
+
+          // Best Projection Per Node
+          cudaFree(d_best_gain_per_node);
+          cudaFree(d_best_proj_per_node);
+          cudaFree(d_best_split_per_node);
+          cudaFree(d_num_pos_per_node);
+          cudaFree(d_best_threshold_per_node);    
+
+          auto t_free_end_iter = std::chrono::steady_clock::now();
+          free_ms = std::chrono::duration<double,std::milli>(t_free_end_iter - t_free_start_iter).count();
+          total_free_ms += free_ms;
+
+          auto t_node_train_start = std::chrono::steady_clock::now();
+          for (int n = 0; n < num_nodes; ++n) {
+            if (!node_has_split[n]) {
+              depth_batch[n].node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+              continue;
+            }
+            auto node_config = internal_config;
+            node_config.best_threshold = best_threshold_per_node[n];
+            node_config.best_condition = &best_condition_per_node[n];
+            node_config.best_projection = &best_projection_per_node[n];
+            node_config.rows_start = node_row_offsets[n];
+            node_config.rows_node = sel_spans[n].size();
+            node_config.best_projection_index = best_projection_per_node_index[n];
+            node_config.num_proj = num_proj;
+            //if (n < pos_class_counts.size() && !pos_class_counts[n].empty()) {
+            node_config.skip_set_leaf_on_children = true;
+            node_config.gpu_num_classes = num_classes;
+            node_config.gpu_pos_class_counts = pos_class_counts[n];
+            node_config.gpu_neg_class_counts = neg_class_counts[n];
+            node_config.example_split = example_splits[n];
+            //}
+            node_config.gpu_projected_data = d_col_add_projected;
+            RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                      deployment, weights, node_config, random,
+                                      cache, std::move(depth_batch[n]),
+                                      node_queue));
+          }
+          auto t_node_train_end = std::chrono::steady_clock::now();
+          node_train_ms = std::chrono::duration<double,std::milli>(t_node_train_end - t_node_train_start).count();
+          total_node_train_ms += node_train_ms;
+
+          // Grayed out for 100 trees
+          // std::cerr << "D" << current_depth
+          //           << " nodes=" << num_nodes
+          //           << " rows=" << total_rows
+          //           << " sample=" << sample_ms << "ms"
+          //           << " reorder=" << reorder_ms << "ms"
+          //           << " flat_sel=" << flatten_sel_ms << "ms"
+          //           << " flat_proj=" << flatten_proj_ms << "ms"
+          //           << " malloc=" << malloc_ms << "ms"
+          //           << " h2d=" << h2d_ms << "ms"
+          //           << " APkernel=" << kernel_ms << "ms"
+          //           << " RHistSplit=" << gpu_hist_ms << "ms"
+          //           << " free=" << free_ms << "ms"
+          //           << " NodeTrain=" << node_train_ms << "ms"
+          //           << "\n";
         }
 
-        std::vector<std::vector<float>> projected(num_nodes);
+        else // BFS Only and GPU Apply Projection only
+        {
+          // --- [9] cudaMemcpy D→H (pinned) ---
+          auto t_d2h_start = std::chrono::steady_clock::now();
+          const size_t d2h_bytes = total_rows * num_proj * sizeof(float);
+          CUDA_CHECK(cudaMemcpy(pinned_projected, d_col_add_projected,
+                    d2h_bytes, cudaMemcpyDeviceToHost));
+          auto t_d2h_end = std::chrono::steady_clock::now();
+          d2h_ms = std::chrono::duration<double,std::milli>(t_d2h_end - t_d2h_start).count();
+          total_d2h_ms += d2h_ms;
 
-      for (int n = 0; n < num_nodes; ++n) {
-        auto node_config = internal_config;
-        node_config.depthwise_projection_defs = &all_node_projs[n];
-        node_config.depthwise_monotonic = &all_node_mono[n];
-        node_config.precomputed_projected_values =
-            absl::MakeConstSpan(projected[n]);
-        RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
-                                  deployment, weights, node_config, random,
-                                  cache, std::move(depth_batch[n]),
-                                  node_queue));
-        std::vector<float>().swap(projected[n]);
-      }
-    } else
+          // --- [10] Memory cleanup ---
+          auto t_free_start_iter = std::chrono::steady_clock::now();
+          cudaFree(d_offset);
+          cudaFree(d_flat_projection_col_idx);
+          cudaFree(d_flat_projection_weights);
+          cudaFree(d_node_row_off);
+
+          auto t_free_end_iter = std::chrono::steady_clock::now();
+          free_ms = std::chrono::duration<double,std::milli>(t_free_end_iter - t_free_start_iter).count();
+          total_free_ms += free_ms;
+
+          // --- [11] Split finding ---
+          auto t_node_train_start = std::chrono::steady_clock::now();
+          size_t gpu_offset = 0;
+          for (int n = 0; n < num_nodes; ++n) {
+            const size_t slab = num_proj * sel_spans[n].size();
+            auto node_config = internal_config;
+            node_config.depthwise_projection_defs = &all_node_projs[n];
+            node_config.depthwise_monotonic = &all_node_mono[n];
+            node_config.precomputed_projected_values =
+                absl::MakeConstSpan(pinned_projected + gpu_offset, slab);
+            RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                      deployment, weights, node_config, random,
+                                      cache, std::move(depth_batch[n]),
+                                      node_queue));
+            gpu_offset += slab;
+          }
+          auto t_node_train_end = std::chrono::steady_clock::now();
+          node_train_ms = std::chrono::duration<double,std::milli>(t_node_train_end - t_node_train_start).count();
+          total_node_train_ms += node_train_ms;
+
+          std::cerr << "D" << current_depth
+                    << " nodes=" << num_nodes
+                    << " rows=" << total_rows
+                    << " sample=" << sample_ms << "ms"
+                    << " reorder=" << reorder_ms << "ms"
+                    << " flat_sel=" << flatten_sel_ms << "ms"
+                    << " flat_proj=" << flatten_proj_ms << "ms"
+                    << " malloc=" << malloc_ms << "ms"
+                    << " h2d=" << h2d_ms << "ms"
+                    << " APkernel=" << kernel_ms << "ms"
+                    << " d2h=" << d2h_ms << "ms"
+                    << " free=" << free_ms << "ms"
+                    << " NodeTrain(+EP)=" << node_train_ms << "ms"
+                    << "\n";
+
+        }
+    } 
+    
+    else
     {
-      for (auto& nae : depth_batch) {
+      // BFS all CPU path
+      std::cerr << "BFS default path: processing " << depth_batch.size()
+                << " nodes with NodeTrain" << std::endl;
+      for (size_t i = 0; i < depth_batch.size(); ++i) {
+        auto& nae = depth_batch[i];
+        std::cerr << "  NodeTrain node " << i
+                  << " examples=" << nae.selected_examples.size()
+                  << " depth=" << nae.depth << std::endl;
         RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
                                   deployment, weights, internal_config, random,
                                   cache, std::move(nae), node_queue));
+        std::cerr << "  NodeTrain node " << i << " done" << std::endl;
       }
     }
+    auto end_time_depth_all = std::chrono::steady_clock::now();
+    //Grayed out for 100 trees
+    // std::cerr << "D" << current_depth << " TOTAL="
+    //           << std::chrono::duration<double, std::milli>(end_time_depth_all - start_time_depth).count()
+    //           << "ms\n";
   }
+
+  if (combined) {
+    std::cerr << "TOTAL (COMBINED)"
+              << " sample=" << total_sample_ms << "ms"
+              << " reorder=" << total_reorder_ms << "ms"
+              << " flat_sel=" << total_flatten_sel_ms << "ms"
+              << " flat_proj=" << total_flatten_proj_ms << "ms"
+              << " malloc=" << total_malloc_ms << "ms"
+              << " h2d=" << total_h2d_ms << "ms"
+              << " APkernel=" << total_kernel_ms << "ms"
+              << " APTotal=" << total_reorder_ms + total_flatten_sel_ms + total_flatten_proj_ms + total_malloc_ms + total_h2d_ms + total_kernel_ms << "ms"
+              << " RHistSplit=" << total_gpu_hist_ms << "ms"
+              << " [BlockMM=" << total_blockmm_ms
+              << " FinalMM=" << total_finalmm_ms
+              << " RandBnd=" << total_randbnd_ms
+              << " BuildHist=" << total_buildhist_ms
+              << " Entropy=" << total_entropy_ms
+              << " BestNode=" << total_bestnode_ms
+              << " D2H=" << total_d2h_hist_ms
+              << " PrefixSum=" << total_prefixsum_ms << "]"
+              << " AP + Hist + SPlit=" << total_reorder_ms + total_flatten_sel_ms + total_flatten_proj_ms + total_malloc_ms + total_h2d_ms + total_kernel_ms + total_gpu_hist_ms << "ms"
+              << " SplitAllDepth=" << total_split_all_depth_ms << "ms"
+              << " free=" << total_free_ms << "ms"
+              << " NodeTrain=" << total_node_train_ms << "ms\n";
+    std::cerr << "NodeTrain leaf exits: early_leaf=" << early_leaf_count
+              << " no_split_leaf=" << no_split_leaf_count << "\n";
+    early_leaf_count = 0;
+    no_split_leaf_count = 0;
+    internal::PrintAndResetDfsTimers();
+    PrintAndResetSplitAllDepthTimers();
+    if (total_node_train_count > 0) {
+      std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+                << " find_best=" << total_find_best_ms << "ms"
+                << " split_examples=" << total_split_examples_ms << "ms"
+                << " set_leaf=" << total_set_leaf_ms << "ms"
+                << " constraints=" << total_constraints_ms << "ms"
+                << " push=" << total_node_push_ms << "ms"
+                << " nodes=" << total_node_train_count << "\n";
+    }
+    total_find_best_ms = 0;
+    total_split_examples_ms = 0;
+    total_node_setup_ms = 0;
+    total_set_leaf_ms = 0;
+    total_constraints_ms = 0;
+    total_node_push_ms = 0;
+    total_node_train_count = 0;
+  } else {
+    std::cerr << "TOTAL (NOT COMBINED)"
+              << " sample=" << total_sample_ms << "ms"
+              << " reorder=" << total_reorder_ms << "ms"
+              << " flat_sel=" << total_flatten_sel_ms << "ms"
+              << " flat_proj=" << total_flatten_proj_ms << "ms"
+              << " malloc=" << total_malloc_ms << "ms"
+              << " h2d=" << total_h2d_ms << "ms"
+              << " APkernel=" << total_kernel_ms << "ms"
+              << " d2h=" << total_d2h_ms << "ms"
+              << " APtotal=" << total_reorder_ms + total_flatten_sel_ms + total_flatten_proj_ms + total_malloc_ms + total_h2d_ms + total_kernel_ms + total_d2h_ms << "ms"
+              << " free=" << total_free_ms << "ms"
+              << " NodeTrain(+EP)=" << total_node_train_ms << "ms\n";
+
+    std::cerr << "NodeTrain leaf exits: early_leaf=" << early_leaf_count
+              << " no_split_leaf=" << no_split_leaf_count << "\n";
+    early_leaf_count = 0;
+    no_split_leaf_count = 0;
+    internal::PrintAndResetDfsTimers();
+  if (total_node_train_count > 0) {
+    std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+              << " find_best=" << total_find_best_ms << "ms"
+              << " split_examples=" << total_split_examples_ms << "ms"
+              << " set_leaf=" << total_set_leaf_ms << "ms"
+              << " apply_constraint=" << total_apply_constraint_ms << "ms"
+              << " constraints=" << total_constraints_ms << "ms"
+              << " push=" << total_node_push_ms << "ms"
+              << " nodes=" << total_node_train_count << "\n";
+  }
+  total_find_best_ms = 0;
+  total_split_examples_ms = 0;
+  total_node_setup_ms = 0;
+  total_set_leaf_ms = 0;
+  total_apply_constraint_ms = 0;
+  total_constraints_ms = 0;
+  total_node_push_ms = 0;
+  total_node_train_count = 0;
+  }
+  auto t_free_start = std::chrono::steady_clock::now();
+  if (pinned_projected) cudaFreeHost(pinned_projected);
+  cudaFree(d_selected_examples);
+  cudaFree(d_col_add_projected);
+  auto t_free_end = std::chrono::steady_clock::now();
+  std::cerr << "CLEANUP free per tree="
+            << std::chrono::duration<double,std::milli>(t_free_end - t_free_start).count()
+            << "ms\n";
   return absl::OkStatus();
 }
 
@@ -5508,6 +6355,10 @@ absl::StatusOr<ExampleSplitRollingBuffer> SplitExamplesInPlace(
   DCHECK(std::is_sorted(examples.active.begin(), examples.active.end()));
 
   ExampleSplitRollingBuffer example_split;
+
+  // dataset_is_dense = 0
+  // examples_are_training_examples: 1
+  // error_on_wrong_splitter_statistics: 0
   RETURN_IF_ERROR(EvalConditionOnDataset(dataset, examples, condition,
                                          dataset_is_dense, &example_split));
 

@@ -53,9 +53,6 @@
 #include "yggdrasil_decision_forests/utils/random.h"
 #include "yggdrasil_decision_forests/utils/status_macros.h"
 
-#ifndef BFS_ONLY
-#define BFS_ONLY 0
-#endif
 
 namespace yggdrasil_decision_forests {
 namespace model {
@@ -74,6 +71,8 @@ namespace internal {
 static double dfs_total_proj_ms = 0;
 static double dfs_total_split_ms = 0;
 static int dfs_node_count = 0;
+static double bfs_total_eval_ms = 0;
+static int bfs_node_count = 0;
 }  // namespace internal
 
 template <typename T>
@@ -194,49 +193,79 @@ absl::StatusOr<bool> FindBestConditionSparseObliqueTemplate(
     return false;
   }
 
-  Projection best_projection; // Both
-  float best_threshold; // Both
-  // TODO: Cache.
-  const auto selected_labels = ExtractLabels(label_stats, selected_examples); // Both
-  std::vector<float> selected_weights; // Both
-  if (!weights.empty()) {
-    selected_weights = Extract(weights, selected_examples);
-  }
-
-  std::vector<UnsignedExampleIdx> dense_example_idxs(selected_examples.size()); // Both
-  std::iota(dense_example_idxs.begin(), dense_example_idxs.end(), 0); // Both
+  Projection best_projection;
+  float best_threshold;
 
   const bool has_precomputed_projected =
     !internal_config.precomputed_projected_values.empty() &&
     internal_config.depthwise_projection_defs != nullptr &&
     internal_config.depthwise_monotonic != nullptr;
-  
-  if (has_precomputed_projected) {
-    // Use precomputed projected values.
-    const auto& depth_projs = *internal_config.depthwise_projection_defs;
-    const auto& depth_mono = *internal_config.depthwise_monotonic;
-    const size_t rows_n = selected_examples.size();
-    const size_t num_projs = depth_projs.size();
-    const float* slab = internal_config.precomputed_projected_values.data();
-    for (size_t proj_idx = 0; proj_idx < num_projs; ++proj_idx) {
-      if (depth_projs[proj_idx].empty()) continue;
-      const absl::Span<const float> values_span =
-          absl::MakeConstSpan(slab + proj_idx * rows_n, rows_n);
-      ASSIGN_OR_RETURN(
-          const auto result,
-          EvaluateProjection(dt_config, label_stats, dense_example_idxs,
-                             selected_weights, selected_labels, values_span,
-                             internal_config,
-                             depth_projs[proj_idx].front().attribute_idx,
-                             constraints, depth_mono[proj_idx], best_condition,
-                             cache));
-      if (result == SplitSearchResult::kBetterSplitFound) {
-        best_projection = depth_projs[proj_idx];
-        best_threshold =
-            best_condition->condition().higher_condition().threshold();
-      }
+
+  const bool has_best_condition = internal_config.best_condition != nullptr &&
+                                  internal_config.best_projection != nullptr;
+
+  if (has_precomputed_projected || has_best_condition) {
+    if (has_best_condition) { // Done the evaluation of the precomputed projections and found the best projection already
+      best_projection = *internal_config.best_projection;
+      best_threshold = internal_config.best_threshold;
+      *best_condition = *internal_config.best_condition;
+      internal::bfs_node_count++;
     }
-  } else {
+    else { // has_precomputed_projected only still need to do the evaluation of the precomputed projections
+      const auto selected_labels = ExtractLabels(label_stats, selected_examples);
+      std::vector<float> selected_weights;
+      if (!weights.empty()) {
+        selected_weights = Extract(weights, selected_examples);
+      }
+      std::vector<UnsignedExampleIdx> dense_example_idxs(selected_examples.size());
+      std::iota(dense_example_idxs.begin(), dense_example_idxs.end(), 0);
+      // Use precomputed projected values.
+      const auto& depth_projs = *internal_config.depthwise_projection_defs;
+      const auto& depth_mono = *internal_config.depthwise_monotonic;
+      const size_t rows_n = selected_examples.size();
+      const size_t num_projs = depth_projs.size();
+      const float* slab = internal_config.precomputed_projected_values.data();
+      double eval_ms = 0;
+      for (size_t proj_idx = 0; proj_idx < num_projs; ++proj_idx) {
+        if (depth_projs[proj_idx].empty()) continue;
+        const absl::Span<const float> values_span =
+            absl::MakeConstSpan(slab + proj_idx * rows_n, rows_n);
+        auto t_eval_start = std::chrono::steady_clock::now();
+        ASSIGN_OR_RETURN(
+            const auto result,
+            EvaluateProjection(dt_config, label_stats, dense_example_idxs,
+                              selected_weights, selected_labels, values_span,
+                              internal_config,
+                              depth_projs[proj_idx].front().attribute_idx,
+                              constraints, depth_mono[proj_idx], best_condition,
+                              cache));
+        auto t_eval_end = std::chrono::steady_clock::now();
+        eval_ms += std::chrono::duration<double, std::milli>(t_eval_end - t_eval_start).count();
+        if (result == SplitSearchResult::kBetterSplitFound) {
+          best_projection = depth_projs[proj_idx];
+          best_threshold =
+              best_condition->condition().higher_condition().threshold();
+        }
+      }
+      internal::bfs_total_eval_ms += eval_ms;
+      internal::bfs_node_count++;
+    }
+  } 
+  else { // No precomputed projected values, need to generate and evaluate projections
+    // std::cerr << "DFS fallback: has_precomputed=" << has_precomputed_projected
+    //           << " has_best=" << has_best_condition
+    //           << " precomputed_empty=" << internal_config.precomputed_projected_values.empty()
+    //           << " proj_defs=" << (internal_config.depthwise_projection_defs != nullptr)
+    //           << " mono=" << (internal_config.depthwise_monotonic != nullptr)
+    //           << " examples=" << selected_examples.size()
+    //           << " num_proj=" << override_num_projections.value_or(-1) << "\n";
+    const auto selected_labels = ExtractLabels(label_stats, selected_examples);
+    std::vector<float> selected_weights;
+    if (!weights.empty()) {
+      selected_weights = Extract(weights, selected_examples);
+    }
+    std::vector<UnsignedExampleIdx> dense_example_idxs(selected_examples.size());
+    std::iota(dense_example_idxs.begin(), dense_example_idxs.end(), 0);
     // Effective number of projections to test.
     int num_projections; // DFS Only
     if (override_num_projections.has_value()) {
@@ -294,10 +323,6 @@ absl::StatusOr<bool> FindBestConditionSparseObliqueTemplate(
     internal::dfs_total_proj_ms += proj_ms;
     internal::dfs_total_split_ms += split_ms;
     internal::dfs_node_count++;
-    std::cerr << "DFS node examples=" << selected_examples.size()
-              << " nproj=" << num_projections
-              << " proj=" << proj_ms << "ms"
-              << " split=" << split_ms << "ms\n";
   }
   // Update with the actual current_projection definition.
   if (!best_projection.empty()) {
@@ -1225,7 +1250,8 @@ void SampleProjection(const absl::Span<const int>& features,
 
   // To control the number of selected features, we can use the max_num_features parameter.
   // MODIFIED BY JY
-  num_selected_features = 1;
+  // Gray out the below to use what YDF gives
+  num_selected_features = 2; 
  
   
   // TODO: Try std::bitmap
@@ -1566,6 +1592,75 @@ void SubtractTransposeMultiplyAdd(
   }
 }
 
+FlattenedSelectedExamples FlattenSelectedExamples(
+    std::vector<NodeAndExamples>& depth_batch) {
+  const int num_nodes = depth_batch.size();
+  FlattenedSelectedExamples result;
+  result.sel_spans.resize(num_nodes);
+  result.inactive_spans.resize(num_nodes);
+  result.node_row_offsets.resize(num_nodes + 1);
+  result.total_rows = 0;
+  result.max_rows_per_node = 0;
+
+  for (int n = 0; n < num_nodes; ++n) {
+    result.sel_spans[n] = depth_batch[n].selected_examples.active;
+    result.inactive_spans[n] = depth_batch[n].selected_examples.inactive;
+    result.total_rows += result.sel_spans[n].size();
+  }
+
+  result.node_row_offsets[0] = 0;
+  for (int n = 0; n < num_nodes; ++n) {
+    result.node_row_offsets[n + 1] =
+        result.node_row_offsets[n] +
+        static_cast<int>(result.sel_spans[n].size());
+    result.max_rows_per_node = std::max(
+        result.max_rows_per_node,
+        static_cast<int>(result.sel_spans[n].size()));
+  }
+  return result;
+}
+
+FlattenedProjections FlattenProjections(
+    const std::vector<std::vector<Projection>>& all_node_projs,
+    int num_proj, int num_nodes) {
+  FlattenedProjections result;
+  const int num_segments = num_proj * num_nodes;
+  result.offsets.resize(num_segments + 1);
+  result.offsets[0] = 0;
+  for (int n = 0; n < num_nodes; ++n) {
+    for (int p = 0; p < num_proj; ++p) {
+      for (const auto& aw : all_node_projs[n][p]) {
+        result.col_idx.push_back(aw.attribute_idx);
+        result.weights.push_back(aw.weight);
+      }
+      result.offsets[n * num_proj + p + 1] =
+          static_cast<int>(result.col_idx.size());
+    }
+  }
+  return result;
+}
+
+FlattenedProjections FlattenProjections(
+    const std::vector<Projection>& shared_projs,
+    int num_nodes) {
+  const int num_proj = shared_projs.size();
+  FlattenedProjections result;
+  const int num_segments = num_proj * num_nodes;
+  result.offsets.resize(num_segments + 1);
+  result.offsets[0] = 0;
+  for (int n = 0; n < num_nodes; ++n) {
+    for (int p = 0; p < num_proj; ++p) {
+      for (const auto& aw : shared_projs[p]) {
+        result.col_idx.push_back(aw.attribute_idx);
+        result.weights.push_back(aw.weight);
+      }
+      result.offsets[n * num_proj + p + 1] =
+          static_cast<int>(result.col_idx.size());
+    }
+  }
+  return result;
+}
+
 void ReorderProjections(
     std::vector<std::vector<Projection>>& all_node_projs,
     int num_proj, int num_nodes, int selected_features_count,
@@ -1627,9 +1722,15 @@ void PrintAndResetDfsTimers() {
               << " split=" << dfs_total_split_ms << "ms"
               << " nodes=" << dfs_node_count << "\n";
   }
+  if (bfs_node_count > 0) {
+    std::cerr << "BFS TOTAL eval CPU=" << bfs_total_eval_ms << "ms"
+              << " nodes=" << bfs_node_count << "\n";
+  }
   dfs_total_proj_ms = 0;
   dfs_total_split_ms = 0;
   dfs_node_count = 0;
+  bfs_total_eval_ms = 0;
+  bfs_node_count = 0;
 }
 
 }  // namespace internal

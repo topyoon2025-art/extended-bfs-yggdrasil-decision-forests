@@ -38,6 +38,7 @@
 #include "yggdrasil_decision_forests/learner/decision_tree/decision_tree.pb.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/gpu.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/label.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique_types.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/preprocessing.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/splitter_accumulator.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/splitter_scanner.h"
@@ -64,6 +65,10 @@ struct NodeAndExamples {
   NodeConstraints constraints;
   // If true, the leaf value of the node has already been set.
   bool set_leaf_already_set;
+  // Pointer into shared device buffer for this node's selected examples.
+  int* d_selected_examples = nullptr;
+  // Number of selected examples for this node on device.
+  int d_sel_count = 0;
 };
 
 // Initializes the item mask i.e. the bitmap of the items to consider or to
@@ -343,6 +348,10 @@ struct InternalTrainConfig {
 
   absl::Span<const float> precomputed_projected_values;
 
+  internal::Projection* best_projection = nullptr;
+  float best_threshold = 0.f;
+  proto::NodeCondition* best_condition = nullptr;
+
   // If true, the list of selected example index ("selected_examples") can
   // contain duplicated values. If false, all selected examples are expected to
   // be unique.
@@ -369,6 +378,28 @@ struct InternalTrainConfig {
   // Seed for the honest trees split. If not given, the default random engine is
   // used.
   std::optional<int64_t> honest_split_seed;
+
+  // GPU dataset pointers. Non-owning. When set, GPU-accelerated paths may
+  // be used instead of CPU evaluation.
+  const float* gpu_projected_data = nullptr;
+  int rows_start = 0;
+  int rows_node = 0;
+  int best_projection_index = 0;
+  int num_proj = 0;
+
+  bool skip_split_examples = false;
+  bool skip_set_leaf_on_children = false;
+  std::vector<int> gpu_pos_class_counts;
+  std::vector<int> gpu_neg_class_counts;
+  int gpu_num_classes = 0;
+  yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer example_split;
+
+  float* d_flat_data = nullptr;
+  int* d_labels = nullptr;
+  int* d_selected_examples = nullptr;
+  int gpu_root_sel_count = 0;
+  int gpu_pos_count = 0;
+  int gpu_neg_count = 0;
 };
 
 // Find the best condition for a leaf node. Return true if a condition better

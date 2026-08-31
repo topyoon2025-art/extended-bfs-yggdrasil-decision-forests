@@ -309,6 +309,31 @@ absl::Status SetCondition(const Projection& projection, float threshold,
                           const dataset::proto::DataSpecification& dataspec,
                           proto::NodeCondition* condition);
 
+struct FlattenedSelectedExamples {
+  std::vector<absl::Span<UnsignedExampleIdx>> sel_spans;
+  std::vector<absl::Span<UnsignedExampleIdx>> inactive_spans;
+  std::vector<int> node_row_offsets;
+  size_t total_rows;
+  int max_rows_per_node;
+};
+
+FlattenedSelectedExamples FlattenSelectedExamples(
+    std::vector<NodeAndExamples>& depth_batch);
+
+struct FlattenedProjections {
+  std::vector<int> col_idx;
+  std::vector<float> weights;
+  std::vector<int> offsets;
+};
+
+FlattenedProjections FlattenProjections(
+    const std::vector<std::vector<Projection>>& all_node_projs,
+    int num_proj, int num_nodes);
+
+FlattenedProjections FlattenProjections(
+    const std::vector<Projection>& shared_projs,
+    int num_nodes);
+
 void ReorderProjections(
     std::vector<std::vector<Projection>>& all_node_projs,
     int num_proj, int num_nodes, int selected_features_count,

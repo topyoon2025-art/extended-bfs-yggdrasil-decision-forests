@@ -15,7 +15,11 @@
 
 #include "yggdrasil_decision_forests/learner/random_forest/random_forest.h"
 
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique_apply_projection.cuh"
+
 #include <algorithm>
+
+#include "hwy/contrib/sort/vqsort.h"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -71,6 +75,7 @@
 #include "yggdrasil_decision_forests/utils/status_macros.h"
 #include "yggdrasil_decision_forests/utils/synchronization_primitives.h"
 #include "yggdrasil_decision_forests/utils/time.h"
+#include <cuda_runtime.h>
 
 namespace yggdrasil_decision_forests {
 namespace model {
@@ -123,6 +128,7 @@ absl::StatusOr<std::vector<int64_t>> GenerateHonestSplitSeeds(
 }
 
 }  // namespace
+
 
 constexpr double kAdaptativeWarmUpSeconds = 5.0;
 
@@ -412,6 +418,7 @@ RandomForestLearner::TrainWithStatusImpl(
     const dataset::VerticalDataset& train_dataset,
     std::optional<std::reference_wrapper<const dataset::VerticalDataset>>
         valid_dataset) const {
+
   // TODO: Divide function into smaller blocks.
   const auto begin_training = absl::Now();
 
@@ -635,11 +642,59 @@ RandomForestLearner::TrainWithStatusImpl(
     concurrent_fields.model_size_in_bytes =
         mdl->AbstractAttributesSizeInBytes().value_or(0);
   }
+  const absl::Time begin_tree_grow = absl::Now();
 
+  #ifdef USE_GPU
+    std::chrono::steady_clock::time_point start_warmup = std::chrono::steady_clock::now();
+    cuda_warmup();
+    std::chrono::steady_clock::time_point end_warmup = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed_warmup = end_warmup - start_warmup;
+    LOG(INFO) << "GPU warmup time Random Forest: " << elapsed_warmup.count() << " seconds";
+
+    // Flatten the dataset for faster access during split finding GPU
+    // 1.1) Preprocessing: Flatten the dataset into a contiguous array for GPU processing
+    std::chrono::steady_clock::time_point start_time_flatten = std::chrono::steady_clock::now();
+    const int num_cols = config_link.numerical_features_size();
+    const int num_rows = train_dataset.nrow();
+    std::vector<float> flat(num_rows * num_cols);
+    for (int c = 0; c < num_cols; ++c) {
+      const int attr = config_link.numerical_features(c);
+      const auto* col = train_dataset
+          .ColumnWithCastOrNull<dataset::VerticalDataset::NumericalColumn>(attr);
+      for (int r = 0; r < num_rows; ++r) {
+        flat[c * num_rows + r] = col->values()[r];
+      }
+    }
+    // 1.2) Preprocessing: Extract labels for GPU processing
+    const auto* label_col = train_dataset
+        .ColumnWithCastOrNull<dataset::VerticalDataset::CategoricalColumn>(
+            config_link.label());
+    const std::vector<int32_t>& labels = label_col->values();
+    std::chrono::steady_clock::time_point end_time_flatten = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_flatten = end_time_flatten - start_time_flatten;
+    std::cout << "Time taken for dataset flattening in RF: " << elapsed_time_flatten.count() << " ms." << std::endl;
+
+    std::chrono::steady_clock::time_point start_time_outer = std::chrono::steady_clock::now();
+    float* d_flat_data = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_flat_data, static_cast<size_t>(num_rows) * num_cols * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_flat_data, flat.data(), static_cast<size_t>(num_rows) * num_cols * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<float>().swap(flat);  // free host copy
+
+    int* d_labels = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_labels, num_rows * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_labels, labels.data(), num_rows * sizeof(int), cudaMemcpyHostToDevice));
+    std::chrono::steady_clock::time_point end_time_outer = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_outer = end_time_outer - start_time_outer;
+    std::cout << "Time taken for Tree wide GPU dataset memory allocation and data transfer in RF: " << elapsed_time_outer.count() << " ms." << std::endl;
+
+    std::cout << "GPU Dataset Flattening and Copying Time in RF: " << elapsed_time_flatten.count() + elapsed_time_outer.count() << " ms." << std::endl;
+  #endif
   // Note: "num_trained_trees" is defined outside of the following brackets so
   // to make use it is not released before "pool".
   std::atomic<int> num_trained_trees{0};
-  const absl::Time begin_tree_grow = absl::Now();
+  std::atomic<double> total_sampling_ms{0.0};
+  std::atomic<double> total_train_ms{0.0};
+  std::atomic<double> total_oob_ms{0.0};
   {
     yggdrasil_decision_forests::utils::concurrency::ThreadPool pool(
         deployment().num_threads(), {.name_prefix = std::string("TrainRF")});
@@ -712,15 +767,50 @@ RandomForestLearner::TrainWithStatusImpl(
         // out-of-bag set. It is important that sampling starts with a fresh
         // random engine to make the OOB set reproducible without re-running the
         // entire training.
-        auto status_sampling = internal::SampleTrainingExamples(
-            train_dataset.nrow(), rf_config, bootstrap_size_ratio_factor,
-            &random, &selected_examples);
+        const absl::Time begin_sampling = absl::Now();
+        absl::Status status_sampling;
+        #ifndef USE_GPU
+        {
+          status_sampling = internal::SampleTrainingExamples(
+              train_dataset.nrow(), rf_config, bootstrap_size_ratio_factor,
+              &random, &selected_examples);
+        }
+        #else
+        int* d_selected_examples = nullptr;
+        int gpu_root_sel_count = 0;
+        {
+        #ifdef NO_D2H
+        status_sampling = SampleTrainingExamplesKernel_No_D2H_wrap(
+                                              num_rows,
+                                              rf_config,
+                                              bootstrap_size_ratio_factor,
+                                              d_selected_examples,
+                                              gpu_root_sel_count,
+                                              static_cast<unsigned long long>(tree_seeds[tree_idx]));
+        if (compute_oob_performances) {
+          // D2H the bootstrap indices so OOB evaluation can identify in-bag examples
+          selected_examples.resize(gpu_root_sel_count);
+          cudaMemcpy(selected_examples.data(), d_selected_examples,
+                    gpu_root_sel_count * sizeof(UnsignedExampleIdx),
+                    cudaMemcpyDeviceToHost);
+        }
+        #else
+        status_sampling = SampleTrainingExamplesKernel_wrap(
+                                              num_rows,
+                                              rf_config,
+                                              bootstrap_size_ratio_factor,
+                                              d_selected_examples,
+                                              &selected_examples,
+                                              static_cast<unsigned long long>(tree_seeds[tree_idx]));
+        #endif
+        }
+        #endif
+        const absl::Duration sampling_duration = absl::Now() - begin_sampling;
 
         {
           utils::concurrency::MutexLock lock(concurrent_fields.mutex);
           concurrent_fields.status.Update(status_sampling);
           if (!concurrent_fields.status.ok()) {
-            // Sampling training examples for one of the fields has failed.
             return;
           }
         }
@@ -728,6 +818,14 @@ RandomForestLearner::TrainWithStatusImpl(
         decision_tree::InternalTrainConfig internal_config;
         internal_config.preprocessing = &preprocessing;
         internal_config.timeout = timeout;
+        #ifdef USE_GPU
+          internal_config.d_flat_data = d_flat_data;
+          internal_config.d_labels = d_labels;
+          internal_config.d_selected_examples = d_selected_examples;
+          #ifdef NO_D2H
+          internal_config.gpu_root_sel_count = gpu_root_sel_count;
+          #endif
+        #endif
         if (vector_sequence_computer) {
           internal_config.vector_sequence_computer =
               vector_sequence_computer.get();
@@ -736,10 +834,19 @@ RandomForestLearner::TrainWithStatusImpl(
           DCHECK_LT(tree_idx, honest_split_seeds->size());
           internal_config.honest_split_seed = (*honest_split_seeds)[tree_idx];
         }
+        const absl::Time begin_tree_train = absl::Now();
         auto status_train = decision_tree::Train(
             train_dataset, selected_examples, config_with_default, config_link,
             rf_config.decision_tree(), deployment(), weights, &random,
             decision_tree.get(), internal_config);
+        const absl::Duration tree_train_duration = absl::Now() - begin_tree_train;
+
+        #ifdef NO_D2H
+        if (d_selected_examples) {
+          cudaFree(d_selected_examples);
+          d_selected_examples = nullptr;
+        }
+        #endif
 
         int current_num_trained_trees;
         {
@@ -834,6 +941,7 @@ RandomForestLearner::TrainWithStatusImpl(
         };
 
         // OOB Metrics.
+        const absl::Time begin_oob = absl::Now();
         if (compute_oob_performances) {
           utils::concurrency::MutexLock lock(oob_metrics_mutex);
           // Update the prediction accumulator.
@@ -912,12 +1020,31 @@ RandomForestLearner::TrainWithStatusImpl(
             }
           }
         } else {
-          LOG_EVERY_N_SEC(INFO, 20)
-              << build_common_snippet() << build_common_snippet_extra();
+          LOG(INFO) << build_common_snippet() << build_common_snippet_extra();
         }
+        const absl::Duration oob_duration = absl::Now() - begin_oob;
+
+        double s_ms = absl::ToDoubleMilliseconds(sampling_duration);
+        double t_ms = absl::ToDoubleMilliseconds(tree_train_duration);
+        double o_ms = absl::ToDoubleMilliseconds(oob_duration);
+        total_sampling_ms.store(total_sampling_ms.load() + s_ms);
+        total_train_ms.store(total_train_ms.load() + t_ms);
+        total_oob_ms.store(total_oob_ms.load() + o_ms);
+        std::cerr << absl::StrFormat(
+            "Tree %d/%d sampling=%.2fms train=%.2fms oob=%.2fms\n",
+            current_num_trained_trees, rf_config.num_trees(),
+            s_ms, t_ms, o_ms);
       });
     }
   }
+  std::cerr << absl::StrFormat(
+      "ALL TREES TOTAL sampling=%.2fms train=%.2fms oob=%.2fms total=%.2fms\n",
+      total_sampling_ms.load(), total_train_ms.load(), total_oob_ms.load(),
+      total_sampling_ms.load() + total_train_ms.load() + total_oob_ms.load());
+  #ifdef USE_GPU
+    cudaFree(d_flat_data);
+    cudaFree(d_labels);
+  #endif
 
   if (training_stopped_early) {
     // Remove the non-trained trees.
@@ -1295,9 +1422,8 @@ absl::Status SampleTrainingExamples(
     std::iota(selected->begin(), selected->end(), 0);
     return absl::OkStatus();
   }
-
+  
   double bootstrap_size_ratio = rf_config.bootstrap_size_ratio();
-
   if (rf_config.adapt_bootstrap_size_ratio_for_maximum_training_duration()) {
     if (!bootstrap_size_ratio_factor.has_value()) {
       return absl::InvalidArgumentError(
@@ -1312,7 +1438,7 @@ absl::Status SampleTrainingExamples(
           "set, but bootstrap_size_ratio_factor is provided");
     }
   }
-
+  std::cout << "Sampling with replacement: " << rf_config.sampling_with_replacement() << std::endl;
   if (!rf_config.sampling_with_replacement() &&
       rf_config.bootstrap_size_ratio() == 1.f) {
     LOG_FIRST_N(WARNING, 1)
@@ -1338,6 +1464,7 @@ absl::Status SampleTrainingExamples(
       selected->push_back(example_idx_distrib(*random));
     }
     std::sort(selected->begin(), selected->end());
+    // hwy::VQSort(selected->data(), selected->size(), hwy::SortAscending());
   } else {
     // Sampling without replacement.
     std::uniform_real_distribution<float> dist_01;

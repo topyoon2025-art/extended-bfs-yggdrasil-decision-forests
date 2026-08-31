@@ -920,7 +920,8 @@ absl::Status EvalConditionTemplate(EvalFn eval_fn,
   std::ptrdiff_t next_neg_idx =
       static_cast<std::ptrdiff_t>(examples.size()) - 1;
   DCHECK_EQ(examples.active.size(), examples.inactive.size());
-
+  // std::cout << "Dataset is dense: " << dataset_is_dense << std::endl;
+  // Dataset is dense: 0
   if (!dataset_is_dense) {
     for (const UnsignedExampleIdx example_idx : examples.active) {
       ASSIGN_OR_RETURN(const bool eval, eval_fn(data, example_idx, na_value));
@@ -987,11 +988,14 @@ absl::Status EvalConditionIsNaTemplate(
                                dataset_is_dense, false, example_split);
 }
 
+
 absl::Status EvalConditionOnDataset(const dataset::VerticalDataset& dataset,
                                     SelectedExamplesRollingBuffer examples,
                                     const proto::NodeCondition& condition,
                                     const bool dataset_is_dense,
                                     ExampleSplitRollingBuffer* example_split) {
+  // std::cout<< "Condition type: " << condition.condition().type_case() << std::endl;
+  // Condition type: 7, oblique condition
   switch (condition.condition().type_case()) {
     case proto::Condition::TypeCase::TYPE_NOT_SET:
       return absl::InvalidArgumentError("Non set condition");
@@ -1145,6 +1149,7 @@ absl::Status EvalConditionOnDataset(const dataset::VerticalDataset& dataset,
 
   return absl::OkStatus();
 }
+
 
 absl::StatusOr<bool> EvalConditionFromColumn(
     const proto::NodeCondition& condition,

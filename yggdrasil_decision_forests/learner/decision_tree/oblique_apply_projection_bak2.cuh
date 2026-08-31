@@ -41,16 +41,7 @@ absl::Status SampleTrainingExamplesKernel_wrap(
     const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config,
     std::optional<double> bootstrap_size_ratio_factor,
     int* d_selected_examples,
-    std::vector<yggdrasil_decision_forests::model::UnsignedExampleIdx>* selected_examples,
-    unsigned long long seed);
-
-absl::Status SampleTrainingExamplesKernel_No_D2H_wrap(
-    const int num_rows,
-    const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config,
-    std::optional<double> bootstrap_size_ratio_factor,
-    int*& d_selected_examples,
-    int& num_samples_out,
-    unsigned long long seed);
+    std::vector<yggdrasil_decision_forests::model::UnsignedExampleIdx>* selected_examples);
 
 absl::StatusOr<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer> SplitExamplesInPlaceKernel_wrap(
     const float* d_col_add_projected,
@@ -68,8 +59,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
                 const float* d_best_threshold_per_node,
                 const int* d_node_row_off,
                 const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
                 std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& sel_spans,
                 std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& inactive_spans,
                 const int num_proj,
@@ -80,48 +69,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
                 const int num_classes,
                 std::vector<std::vector<int>>& pos_class_counts,
                 std::vector<std::vector<int>>& neg_class_counts);
-
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_wrap(
-                const float* d_col_add_projected,
-                int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts,
-                std::vector<int>& pos_counts,
-                std::vector<int>& neg_counts);
-
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap(
-                const float* d_col_add_projected,
-                int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts,
-                std::vector<int>& pos_counts,
-                std::vector<int>& neg_counts,
-                const std::vector<bool>& node_has_split,
-                std::vector<int>& child_offsets);
 
 void BlockMinMax_wrap(
     const float* d_col_add_projected,
@@ -397,4 +344,41 @@ void ApplyProjectionColumnADDFused (const float* d_flat_data,
                                     int num_elems_per_thread
                                     );
 
-void PrintAndResetSplitAllDepthTimers(int depth = -1);
+void PrintAndResetSplitAllDepthTimers();
+
+struct SplitAllDepthResult {
+    std::vector<int> total_pos_per_node;
+    std::vector<int> total_neg_per_node;
+    std::vector<std::vector<int>> pos_class_counts;
+    std::vector<std::vector<int>> neg_class_counts;
+};
+
+struct ChildMapping {
+    int src_off;   // offset in d_pos or d_neg
+    int dst_off;   // offset in d_selected_examples
+    int count;     // number of examples
+    int is_pos;    // 1 = from d_pos, 0 = from d_neg
+};
+
+absl::StatusOr<SplitAllDepthResult> SplitExamplesInPlaceKernel_all_depth_no_d2h(
+                const float* d_col_add_projected,
+                const int* d_selected_examples,
+                const int* d_best_proj_per_node,
+                const float* d_best_threshold_per_node,
+                const int* d_node_row_off,
+                const int* node_row_off,
+                const std::vector<int>& node_sizes,
+                const int num_proj,
+                const int num_nodes,
+                const int total_rows,
+                const int max_rows_per_node,
+                const int* d_labels,
+                const int num_classes,
+                int* d_pos_examples,
+                int* d_neg_examples);
+
+void CompactSplitResults_wrap(
+    const int* d_pos_examples,
+    const int* d_neg_examples,
+    int* d_selected_examples,
+    const std::vector<ChildMapping>& children);
