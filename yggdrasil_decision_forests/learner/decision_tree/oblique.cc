@@ -1251,7 +1251,7 @@ void SampleProjection(const absl::Span<const int>& features,
   // To control the number of selected features, we can use the max_num_features parameter.
   // MODIFIED BY JY
   // Gray out the below to use what YDF gives
-  num_selected_features = 2; 
+  // num_selected_features = 8; 
  
   
   // TODO: Try std::bitmap

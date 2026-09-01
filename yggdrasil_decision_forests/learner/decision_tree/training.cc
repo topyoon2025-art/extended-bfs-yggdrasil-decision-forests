@@ -5423,6 +5423,14 @@ absl::Status GrowTreeLocalBFS(
   float* d_col_add_projected = nullptr;
   CUDA_CHECK(cudaMalloc(&d_col_add_projected,
              static_cast<size_t>(num_rows) * max_num_proj * sizeof(float)));
+
+  // DRSW: pre-allocate node_ids/node_offsets once at max size (num_rows),
+  // reused across all BFS depth levels to avoid per-depth cudaMalloc/cudaFree.
+  int* d_node_ids = nullptr;
+  int* d_node_offsets = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_node_ids, static_cast<size_t>(num_rows) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_node_offsets, static_cast<size_t>(num_rows) * sizeof(int)));
+
   std::chrono::steady_clock::time_point end_time_malloc = std::chrono::steady_clock::now();
   std::chrono::duration<double, std::milli> elapsed_time_malloc = end_time_malloc - start_time_malloc;
   // Grayed out for 100 trees
@@ -5691,7 +5699,21 @@ absl::Status GrowTreeLocalBFS(
       double prefixsum_ms = std::chrono::duration<double,std::milli>(t_prefixsum_end - t_prefixsum_start).count();
       total_prefixsum_ms += prefixsum_ms;
 
-      // --- 2D compacted grid (no wasted blocks) ---
+        // ColumnAddProjectionKernel_DRSW_1_wrap(d_flat_data,
+        //                                       d_selected_examples,
+        //                                       d_col_add_projected,
+        //                                       d_node_ids,
+        //                                       d_node_offsets,
+        //                                       d_offset,
+        //                                       d_flat_projection_col_idx,
+        //                                       d_flat_projection_weights,
+        //                                       d_node_row_off,
+        //                                       num_proj,
+        //                                       num_rows,
+        //                                       num_nodes,
+        //                                       total_rows);
+
+      // --- 2D compacted grid (no wasted blocks) --- (ACTIVE)
       ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data,
                                               d_selected_examples,
                                               d_col_add_projected,
@@ -5705,6 +5727,57 @@ absl::Status GrowTreeLocalBFS(
                                               num_rows,
                                               total_rows,
                                               total_node_blocks);
+
+
+      // --- VERIFY: Run DRSW_1 into a separate buffer and compare with SRDW ---
+      // {
+      //   const size_t proj_buf_bytes = static_cast<size_t>(total_rows) * num_proj * sizeof(float);
+      //   float* d_drsw_projected = nullptr;
+      //   CUDA_CHECK(cudaMalloc(&d_drsw_projected, proj_buf_bytes));
+
+      //   ColumnAddProjectionKernel_DRSW_1_wrap(d_flat_data,
+      //                                         d_selected_examples,
+      //                                         d_drsw_projected,
+      //                                         d_node_ids,
+      //                                         d_node_offsets,
+      //                                         d_offset,
+      //                                         d_flat_projection_col_idx,
+      //                                         d_flat_projection_weights,
+      //                                         d_node_row_off,
+      //                                         num_proj,
+      //                                         num_rows,
+      //                                         num_nodes,
+      //                                         total_rows);
+
+      //   std::vector<float> h_srdw(static_cast<size_t>(total_rows) * num_proj);
+      //   std::vector<float> h_drsw(static_cast<size_t>(total_rows) * num_proj);
+      //   CUDA_CHECK(cudaMemcpy(h_srdw.data(), d_col_add_projected, proj_buf_bytes, cudaMemcpyDeviceToHost));
+      //   CUDA_CHECK(cudaMemcpy(h_drsw.data(), d_drsw_projected, proj_buf_bytes, cudaMemcpyDeviceToHost));
+
+      //   int mismatches = 0;
+      //   float max_diff = 0.0f;
+      //   for (size_t i = 0; i < h_srdw.size(); ++i) {
+      //     float diff = std::abs(h_srdw[i] - h_drsw[i]);
+      //     if (diff > 1e-5f) {
+      //       if (mismatches < 5) {
+      //         std::cerr << "  MISMATCH idx=" << i
+      //                   << " SRDW=" << h_srdw[i]
+      //                   << " DRSW=" << h_drsw[i]
+      //                   << " diff=" << diff << "\n";
+      //       }
+      //       mismatches++;
+      //     }
+      //     if (diff > max_diff) max_diff = diff;
+      //   }
+      //   std::cerr << "VERIFY D" << current_depth
+      //             << " nodes=" << num_nodes
+      //             << " total_elems=" << h_srdw.size()
+      //             << " mismatches=" << mismatches
+      //             << " max_diff=" << max_diff << "\n";
+
+      //   CUDA_CHECK(cudaFree(d_drsw_projected));
+      // }
+
       // --- 2D per-thread UpperBound (one thread per row) ---
       // ColumnAddProjectionKernel_SRDW_1_2D_perthread_wrap(d_flat_data,
       //                                         d_selected_examples,
@@ -5730,6 +5803,8 @@ absl::Status GrowTreeLocalBFS(
       //                                         num_rows,
       //                                         total_rows,
       //                                         blocks_per_node);
+
+
       auto t_kernel_end = std::chrono::steady_clock::now();
       double kernel_ms = std::chrono::duration<double,std::milli>(t_kernel_end - t_kernel_start).count();
       total_kernel_ms += kernel_ms;
@@ -6348,6 +6423,8 @@ absl::Status GrowTreeLocalBFS(
   cudaFree(d_selected_examples);
   #endif
   cudaFree(d_col_add_projected);
+  cudaFree(d_node_ids);
+  cudaFree(d_node_offsets);
   auto t_free_end = std::chrono::steady_clock::now();
   std::cerr << "CLEANUP free per tree="
             << std::chrono::duration<double,std::milli>(t_free_end - t_free_start).count()

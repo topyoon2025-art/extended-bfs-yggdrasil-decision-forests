@@ -2241,6 +2241,8 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
 
     constexpr int BLOCK = 256;
 
+    auto t0 = std::chrono::steady_clock::now();
+
     dim3 grid(total_blocks, num_proj);
     ColumnAddProjectionKernel_SRDW_1_2D<BLOCK><<<grid, BLOCK>>>(
         d_flat_data, d_selected_examples, d_col_add_projected,
@@ -2248,6 +2250,11 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
         d_node_row_off, d_node_block_off, num_nodes, num_proj, num_rows, total_rows);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto t1 = std::chrono::steady_clock::now();
+    std::cerr << "SRDW_1_2D_wrap: Kernel="
+              << std::chrono::duration<double,std::milli>(t1 - t0).count()
+              << "ms\n";
 }
 
 template<int BLOCK>
@@ -2299,11 +2306,33 @@ __global__ void ColumnAddProjectionKernel_SRDW_2(
     }
 }
 
+__global__ void ComputeDRSWArrays(
+        const int* __restrict__ d_selected_examples,
+        const int* __restrict__ node_row_off,
+        int* __restrict__ node_ids,
+        int* __restrict__ node_offsets,
+        int num_nodes,
+        int num_total_rows)
+{
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= num_total_rows) return;
 
-template<int BLOCK>
+    int lo = 0, hi = num_nodes;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (node_row_off[mid] <= pos) lo = mid;
+        else hi = mid - 1;
+    }
+    int node_id = lo;
+    int ex_idx = d_selected_examples[pos];
+    node_ids[ex_idx] = node_id;
+    node_offsets[ex_idx] = pos - node_row_off[node_id];
+}
+
 __global__ void ColumnAddProjectionKernel_DRSW_1(
         const float*        __restrict__ dataset,
         float*              __restrict__ projected,
+        const int*          __restrict__ d_selected_examples,
         const int*          __restrict__ node_ids,
         const int*          __restrict__ node_offsets,
         const int*          __restrict__ col_offset,
@@ -2311,46 +2340,93 @@ __global__ void ColumnAddProjectionKernel_DRSW_1(
         const float*        __restrict__ flat_weights,
         const int*          __restrict__ node_row_off,
         int                 num_proj,
-        int                 num_total_rows,
+        int                 num_rows,
         int                 num_nodes,
-        int*                node_counts,
-        int*                node_row_start_by_row) // Added num_nodes parameter
+        int                 num_total_rows)
 {
     const int proj_id = blockIdx.y;
     const int row_stride = gridDim.x * blockDim.x;
-    const int global_row = blockIdx.x * blockDim.x + threadIdx.x; // global row index for all nodes
-    // if (global_row >= num_total_rows) return; // out of bounds check
- 
-    for (int r = global_row; r < num_total_rows; r += row_stride)
+    const int global_row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int r = global_row; r < num_rows; r += row_stride)
     {
-        const int node_id = node_ids[r]; // node_id for this block
-        const int row_start = node_row_off[node_id]; // Prefix sum of rows for each node, gives us the starting index in the output for this node
-        const int row_end   = node_row_off[node_id + 1];  // node_row_off size is num_nodes + 1, so this is safe
-        const int rows_node = row_end - row_start; // number of rows for this node
-        // Or just pass in the node counts per node? then we read once per thread instead of twice. 
+        const int node_id = node_ids[r];
+        if (node_id < 0 || node_id >= num_nodes) continue;
 
-        const int node_offset = node_offsets[r]; // offset in the output for this thread
-        
-        // const int seg_id = proj_id * num_nodes + node_id;
-        const int seg_id = node_id * num_proj + proj_id; // Changed to node-major order for col_offset
+        const int row_start = node_row_off[node_id];
+        const int rows_node = node_row_off[node_id + 1] - row_start;
 
-        const int begin = col_offset[seg_id]; // can get rid of this if offset is uniform across all nodes, but for now we keep it general
-        const int end   = col_offset[seg_id + 1]; 
+        const int node_offset = node_offsets[r];
+
+        const int seg_id = node_id * num_proj + proj_id;
+
+        const int begin = col_offset[seg_id];
+        const int end   = col_offset[seg_id + 1];
 
         float sum = 0.0f;
         for (int idx = begin; idx < end; ++idx) {
-            int   col   = flat_col_data[idx]; // flat_col_data size: num_nodes * num_proj * selected_features_count
+            int   col   = flat_col_data[idx];
             float w     = flat_weights[idx];
-            const std::size_t dataset_idx = static_cast<std::size_t>(col) * num_total_rows + r;
+            const std::size_t dataset_idx = static_cast<std::size_t>(col) * num_rows + r;
             const float x = dataset[dataset_idx];
             sum += w * x;
         }
-        // output layout: node-major, then projection, then row
         const int base = row_start * num_proj + proj_id * rows_node;
         projected[base + node_offset] = sum;
     }
 }
 
+
+void ColumnAddProjectionKernel_DRSW_1_wrap(
+    const float* d_flat_data,
+    const int* d_selected_examples,
+    float* d_col_add_projected,
+    int* d_node_ids,
+    int* d_node_offsets,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    int num_proj,
+    int num_rows,
+    int num_nodes,
+    int num_total_rows)
+{
+    constexpr int BLOCK = 256;
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    CUDA_CHECK(cudaMemset(d_node_ids, -1, static_cast<size_t>(num_rows) * sizeof(int)));
+
+    const int drsw_blocks = (num_total_rows + BLOCK - 1) / BLOCK;
+    ComputeDRSWArrays<<<drsw_blocks, BLOCK>>>(
+        d_selected_examples, d_node_row_off,
+        d_node_ids, d_node_offsets,
+        num_nodes, num_total_rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto t1 = std::chrono::steady_clock::now();
+
+    const int proj_blocks = (num_rows + BLOCK - 1) / BLOCK;
+    dim3 grid(proj_blocks, num_proj);
+    ColumnAddProjectionKernel_DRSW_1<<<grid, BLOCK>>>(
+        d_flat_data, d_col_add_projected,
+        d_selected_examples, d_node_ids, d_node_offsets,
+        d_offset, d_flat_projection_col_idx, d_flat_projection_weights,
+        d_node_row_off, num_proj, num_rows, num_nodes, num_total_rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto t2 = std::chrono::steady_clock::now();
+    std::cerr << "DRSW_1_wrap: ComputeArrays="
+              << std::chrono::duration<double,std::milli>(t1 - t0).count()
+              << "ms Projection="
+              << std::chrono::duration<double,std::milli>(t2 - t1).count()
+              << "ms Total="
+              << std::chrono::duration<double,std::milli>(t2 - t0).count()
+              << "ms\n";
+}
 
 // void ApplyProjectionBaseline (const float* d_flat_data,
 //                               int* d_selected_examples,//selected examples indices

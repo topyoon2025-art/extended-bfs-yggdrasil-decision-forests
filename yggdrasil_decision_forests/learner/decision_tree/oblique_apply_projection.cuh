@@ -266,6 +266,21 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
     int total_rows,
     int total_blocks);
 
+void ColumnAddProjectionKernel_DRSW_1_wrap(
+    const float* d_flat_data,
+    const int* d_selected_examples,
+    float* d_col_add_projected,
+    int* d_node_ids,
+    int* d_node_offsets,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    int num_proj,
+    int num_rows,
+    int num_nodes,
+    int num_total_rows);
+
 void ApplyProjectionBaseline (const float* d_flat_data,
                               int* d_selected_examples,//selected examples indices
                               float* d_col_add_projected,

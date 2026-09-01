@@ -31,7 +31,7 @@ ABSL_FLAG(std::string, label_col, "target",
           "Name of label column (used in all modes).");
 
 ABSL_FLAG(int, num_threads, 1, "Number of threads to use.");
-ABSL_FLAG(int, num_trees, 100, "Number of trees in the random forest.");
+ABSL_FLAG(int, num_trees, 3, "Number of trees in the random forest.");
 ABSL_FLAG(int, tree_depth, 16, "Maximum depth of trees (-1 for unlimited).");
 
 ABSL_FLAG(std::string, feature_split_type, "Oblique",

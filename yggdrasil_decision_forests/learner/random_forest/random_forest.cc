@@ -807,6 +807,10 @@ RandomForestLearner::TrainWithStatusImpl(
         #endif
         const absl::Duration sampling_duration = absl::Now() - begin_sampling;
 
+        // status_sampling = internal::SampleTrainingExamples(
+        //       train_dataset.nrow(), rf_config, bootstrap_size_ratio_factor,
+        //       &random, &selected_examples);
+
         {
           utils::concurrency::MutexLock lock(concurrent_fields.mutex);
           concurrent_fields.status.Update(status_sampling);
