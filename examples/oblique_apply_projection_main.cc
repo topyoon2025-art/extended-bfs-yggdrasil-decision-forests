@@ -31,18 +31,18 @@ ABSL_FLAG(std::string, label_col, "target",
           "Name of label column (used in all modes).");
 
 ABSL_FLAG(int, num_threads, 1, "Number of threads to use.");
-ABSL_FLAG(int, num_trees, 3, "Number of trees in the random forest.");
+ABSL_FLAG(int, num_trees, 1, "Number of trees in the random forest.");
 ABSL_FLAG(int, tree_depth, 16, "Maximum depth of trees (-1 for unlimited).");
 
 ABSL_FLAG(std::string, feature_split_type, "Oblique",
           "Type of feature splits in decision trees: 'Axis Aligned' or 'Oblique'.");
 
 // Oblique split parameters (only used when feature_split_type = "Oblique")
-ABSL_FLAG(int, max_num_projections, 64,
+ABSL_FLAG(int, max_num_projections, 1000,
           "Maximum number of projections for oblique splits.");
 ABSL_FLAG(float, num_projections_exponent, .5,
           "Exponent to determine number of projections.");
-ABSL_FLAG(float, projection_density_factor, 2.0f,
+ABSL_FLAG(float, projection_density_factor, 1.5f,
           "Projection density factor.");
 
 ABSL_FLAG(std::string, ensemble_method, "Bagging",
@@ -70,8 +70,6 @@ ABSL_FLAG(int, histogram_num_bins, 256,
 ABSL_FLAG(std::string, model_out_dir, "",
           "Path to output trained model directory (optional)."
           " If empty, model is not saved.");
-
-ABSL_DECLARE_FLAG(bool, combined);
 
 template<class DataSet>
 void runExperiment(const DataSet& dataset, const Utils::ExperimentParams& params, int exp_id)

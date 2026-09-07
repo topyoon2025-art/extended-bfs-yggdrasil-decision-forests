@@ -17,6 +17,7 @@
 #define YGGDRASIL_DECISION_FORESTS_LEARNER_DECISION_TREE_TRAINING_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -1043,7 +1044,8 @@ absl::Status GrowTreeLocalBFS(
     const NodeConstraints& constraints, bool set_leaf_already_set,
     NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
     SelectedExamplesRollingBuffer selected_examples,
-    std::optional<SelectedExamplesRollingBuffer> leaf_examples);
+    std::optional<SelectedExamplesRollingBuffer> leaf_examples,
+    std::chrono::steady_clock::time_point t_entry);
 
 // The core training logic that is the same between single-threaded execution
 // and concurrent execution.
@@ -1063,7 +1065,8 @@ absl::Status DecisionTreeCoreTrain(
     const std::vector<float>& weights, utils::RandomEngine* random,
     const InternalTrainConfig& internal_config, DecisionTree* dt,
     absl::Span<UnsignedExampleIdx> selected_examples,
-    std::optional<absl::Span<UnsignedExampleIdx>> leaf_examples);
+    std::optional<absl::Span<UnsignedExampleIdx>> leaf_examples,
+    std::chrono::steady_clock::time_point t_entry);
 
 // Train the tree. Fails if the tree is not empty.
 absl::Status DecisionTreeTrain(

@@ -753,8 +753,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     auto t0 = std::chrono::steady_clock::now();
 
     constexpr int BLOCK = 256;
-    int blocks = (max_rows_per_node + BLOCK - 1) / BLOCK;
-    dim3 grid(blocks, num_nodes, 1);
 
     int* d_flags;
     int* d_prefix_sum;
@@ -763,24 +761,16 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
 
     auto t1 = std::chrono::steady_clock::now();
 
-    ComputeSplitFlagsAllDepthKernel<<<grid, BLOCK>>>(
+    ComputeSplitFlagsAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
         d_col_add_projected,
         d_best_proj_per_node,
         d_best_threshold_per_node,
         d_node_row_off,
+        d_node_block_off,
         d_flags,
-        num_proj
+        num_proj,
+        num_nodes
     );
-    // ComputeSplitFlagsAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-    //     d_col_add_projected,
-    //     d_best_proj_per_node,
-    //     d_best_threshold_per_node,
-    //     d_node_row_off,
-    //     d_node_block_off,
-    //     d_flags,
-    //     num_proj,
-    //     num_nodes
-    // );
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
@@ -820,30 +810,19 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     int* d_total_pos;
     CUDA_CHECK(cudaMalloc(&d_total_pos, num_nodes * sizeof(int)));
 
-    ScatterSplitAllDepthKernel<<<grid, BLOCK>>>(
+    ScatterSplitAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
         d_selected_examples,
         d_flags,
         d_prefix_sum,
         d_node_row_off,
+        d_node_block_off,
         d_pos_examples,
         d_neg_examples,
         d_labels,
         d_class_counts,
         num_classes,
-        d_total_pos);
-    // ScatterSplitAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
-    //     d_selected_examples,
-    //     d_flags,
-    //     d_prefix_sum,
-    //     d_node_row_off,
-    //     d_node_block_off,
-    //     d_pos_examples,
-    //     d_neg_examples,
-    //     d_labels,
-    //     d_class_counts,
-    //     num_classes,
-    //     d_total_pos,
-    //     num_nodes);
+        d_total_pos,
+        num_nodes);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
@@ -948,8 +927,6 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     auto t0 = std::chrono::steady_clock::now();
 
     constexpr int BLOCK = 256;
-    int blocks = (max_rows_per_node + BLOCK - 1) / BLOCK;
-    dim3 grid(blocks, num_nodes, 1);
 
     int* d_flags;
     int* d_prefix_sum;
@@ -1807,8 +1784,8 @@ __global__ void FindBestEntropySplitKernel(
     int* best_split_per_seg
     ) 
 {
-    const int node_id = blockIdx.y;
-    const int proj_id = blockIdx.z;
+    const int node_id = blockIdx.x;
+    const int proj_id = blockIdx.y;
     const int seg_id  = node_id * num_proj + proj_id;
     const int bin_id  = threadIdx.x;
     const int base_idx = seg_id * num_bins;
@@ -1905,7 +1882,7 @@ void FindBestEntropySplitKernel_wrap(
     float* d_out_per_bin_per_proj)
 {
     constexpr int BLOCK = 256;
-    dim3 grid(1, num_nodes, num_proj);
+    dim3 grid(num_nodes, num_proj, 1);
     FindBestEntropySplitKernel<BLOCK><<<grid, BLOCK>>>(
         d_hist_class0,
         d_hist_class1,
@@ -2252,9 +2229,9 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
     CUDA_CHECK(cudaDeviceSynchronize());
 
     auto t1 = std::chrono::steady_clock::now();
-    std::cerr << "SRDW_1_2D_wrap: Kernel="
-              << std::chrono::duration<double,std::milli>(t1 - t0).count()
-              << "ms\n";
+    // std::cerr << "SRDW_1_2D_wrap: Kernel="
+    //           << std::chrono::duration<double,std::milli>(t1 - t0).count()
+    //           << "ms\n";
 }
 
 template<int BLOCK>

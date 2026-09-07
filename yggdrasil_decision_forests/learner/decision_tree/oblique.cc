@@ -158,11 +158,11 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
                     num_numerical_features,
                     dt_config.guided_oblique_split().num_candidate_exponent()));
       // MODIFIED BY JY
-      // return std::max(std::min(target_num_projections, max_num_projections),
-      //                 min_num_projections);
-      return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
-                      max_num_projections),
+      return std::max(std::min(target_num_projections, max_num_projections),
                       min_num_projections);
+      // return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
+      //                 max_num_projections),
+      //                 min_num_projections);
     } break;
     case proto::DecisionTreeTrainingConfig::SPLIT_AXIS_NOT_SET:
     case proto::DecisionTreeTrainingConfig::kMhldObliqueSplit:

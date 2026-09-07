@@ -1,0 +1,6676 @@
+/*
+ * Copyright 2022 Google LLC.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "yggdrasil_decision_forests/learner/decision_tree/training.h"
+
+#include <stddef.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <queue>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/flags/flag.h"
+#include "absl/base/optimization.h"
+
+ABSL_FLAG(bool, combined, true,
+          "If true, use GPU for both apply projection and evaluate projection.");
+#include "absl/log/log.h"
+#include "absl/memory/memory.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/substitute.h"
+#include "absl/time/clock.h"
+#include "absl/types/span.h"
+#include "yggdrasil_decision_forests/dataset/data_spec.h"
+#include "yggdrasil_decision_forests/dataset/data_spec.pb.h"
+#include "yggdrasil_decision_forests/dataset/types.h"
+#include "yggdrasil_decision_forests/dataset/vertical_dataset.h"
+#include "yggdrasil_decision_forests/learner/abstract_learner.pb.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/decision_tree.pb.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/label.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique_cpu_depthwise_1pass.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique_apply_projection.cuh"
+#include "yggdrasil_decision_forests/learner/decision_tree/splitter_accumulator.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/splitter_scanner.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/uplift.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/utils.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/vector_sequence.h"
+#include "yggdrasil_decision_forests/model/abstract_model.pb.h"
+#include "yggdrasil_decision_forests/model/decision_tree/decision_tree.h"
+#include "yggdrasil_decision_forests/model/decision_tree/decision_tree.pb.h"
+#include "yggdrasil_decision_forests/utils/cast.h"
+#include "yggdrasil_decision_forests/utils/concurrency.h"
+#include "yggdrasil_decision_forests/utils/distribution.h"
+#include "yggdrasil_decision_forests/utils/distribution.pb.h"
+#include "yggdrasil_decision_forests/utils/logging.h"
+#include "yggdrasil_decision_forests/utils/random.h"
+#include "yggdrasil_decision_forests/utils/status_macros.h"
+
+#include <cuda_runtime.h>
+
+namespace yggdrasil_decision_forests::model::decision_tree {
+
+static double total_find_best_ms = 0;
+static double total_split_examples_ms = 0;
+static double total_node_setup_ms = 0;
+static double total_set_leaf_ms = 0;
+static double total_apply_constraint_ms = 0;
+static double total_constraints_ms = 0;
+static double total_node_push_ms = 0;
+static int total_node_train_count = 0;
+static int early_leaf_count = 0;
+static int no_split_leaf_count = 0;
+
+namespace {
+
+// Generates a failure absl status if the configuration contains monotonic
+// constraints.
+absl::Status FailIfMonotonic(
+    const model::proto::TrainingConfigLinking& config_link,
+    const int attribute_idx, const NodeConstraints& constraints,
+    const absl::string_view why) {
+  if (config_link.per_columns_size() > 0 &&
+      (config_link.per_columns(attribute_idx).has_monotonic_constraint() ||
+       constraints.min_max_output.has_value())) {
+    return absl::InternalError(
+        absl::StrCat("Monotonic constraints not supported for ", why));
+  }
+  return absl::OkStatus();
+}
+
+// Number of trials to run when learning a categorical split with randomly
+// generated masks.
+//
+// Args:
+//   config: A random categorical split learning configuration.
+//
+// Returns:
+//   A function active_dictionary_size -> number_of_trials.
+//
+// The "active_dictionary_size" is the number of unique categorical values that
+// are present at least once in the training examples of the node.
+std::function<int(const int active_dictionary_size)>
+NumTrialsForRandomCategoricalSplit(const proto::Categorical::Random& config) {
+  const auto num_trial_exponent = config.num_trial_exponent();
+  const auto max_num_trials = config.max_num_trials();
+  return
+      [num_trial_exponent, max_num_trials](const int active_dictionary_size) {
+        const int num_trials =
+            32 + std::pow(active_dictionary_size, num_trial_exponent);
+        return std::min(num_trials, max_num_trials);
+      };
+}
+
+// Helper function to set a condition statistics. Do not set the following
+// fields: "mutable_condition" and "na_value".
+void SetConditionHelper(
+    const double information_gain, const int32_t attribute_idx,
+    const utils::BinaryToIntegerConfusionMatrixDouble& running_confusion,
+    const utils::BinaryToIntegerConfusionMatrixInt64&
+        running_confusion_no_weights,
+    proto::NodeCondition* condition) {
+  condition->set_split_score(information_gain);
+  condition->set_attribute(attribute_idx);
+  condition->set_num_pos_training_examples_without_weight(
+      running_confusion_no_weights.pos().NumObservations());
+  condition->set_num_pos_training_examples_with_weight(
+      running_confusion.pos().NumObservations());
+  condition->set_num_training_examples_without_weight(
+      running_confusion_no_weights.NumObservations());
+  condition->set_num_training_examples_with_weight(
+      running_confusion.NumObservations());
+}
+
+// Helper function to set a condition statistics.
+// Similar as "SetConditionHelper" above, but for a regression problem.
+void SetConditionHelper(
+    const double variance_reduction, const int32_t attribute_idx,
+    const utils::BinaryToNormalDistributionDouble& running_confusion,
+    const utils::BinaryToNormalDistributionDouble& running_confusion_no_weights,
+    proto::NodeCondition* condition) {
+  condition->set_split_score(variance_reduction);
+  condition->set_attribute(attribute_idx);
+  condition->set_num_pos_training_examples_without_weight(
+      running_confusion_no_weights.pos().NumObservations());
+  condition->set_num_pos_training_examples_with_weight(
+      running_confusion.pos().NumObservations());
+  condition->set_num_training_examples_without_weight(
+      running_confusion_no_weights.NumObservations());
+  condition->set_num_training_examples_with_weight(
+      running_confusion.NumObservations());
+}
+
+// Computes and set in "na_replacement" the value to use as a replacement of
+// missing values when the "local imputation" strategy is used.
+//
+// Explanation: The "local imputation" strategy to handle missing values
+// consists in replacing these missing values by the mean of the feature in the
+// training dataset.
+//
+// If the feature only contains missing values, the "na_replacement" argument is
+// left unchanged.
+//
+// `weights` may be empty which is equivalent to unit weights.
+void LocalImputationForNumericalAttribute(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    float* na_replacement) {
+  double na_replacement_value_accumulator = 0;
+  double na_replacement_weight_accumulator = 0;
+  for (const auto example_idx : selected_examples) {
+    const float attribute = attributes[example_idx];
+    const float weight = weights.empty() ? 1.f : weights[example_idx];
+    if (!std::isnan(attribute)) {
+      na_replacement_value_accumulator += attribute * weight;
+      na_replacement_weight_accumulator += weight;
+    }
+  }
+  if (na_replacement_weight_accumulator > 0) {
+    *na_replacement = static_cast<float>(na_replacement_value_accumulator /
+                                         na_replacement_weight_accumulator);
+  }
+}
+
+// Similar as "LocalImputationForNumericalAttribute", but for a categorical
+// attribute. Return the most frequent attribute value.
+void LocalImputationForCategoricalAttribute(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const int32_t num_attribute_classes, int32_t* na_replacement) {
+  utils::IntegerDistributionDouble attribute_distribution;
+  attribute_distribution.SetNumClasses(num_attribute_classes);
+  for (const auto example_idx : selected_examples) {
+    const auto attribute_value = attributes[example_idx];
+    if (attribute_value !=
+        dataset::VerticalDataset::CategoricalColumn::kNaValue) {
+      const float weight = weights.empty() ? 1.f : weights[example_idx];
+      attribute_distribution.Add(attribute_value, weight);
+    }
+  }
+  if (attribute_distribution.NumObservations() > 0) {
+    *na_replacement = attribute_distribution.TopClass();
+  }
+}
+
+// Similar to "LocalImputationForCategoricalAttribute", but for a boolean
+// attribute. Returns the most frequent attribute value.
+void LocalImputationForBooleanAttribute(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    bool* na_replacement) {
+  DCHECK(!weights.empty());
+  utils::IntegerDistributionDouble attribute_distribution;
+  attribute_distribution.SetNumClasses(2);
+  for (const auto example_idx : selected_examples) {
+    const auto attribute_value = attributes[example_idx];
+    if (attribute_value != dataset::VerticalDataset::BooleanColumn::kNaValue) {
+      const float weight = weights.empty() ? 1.f : weights[example_idx];
+      attribute_distribution.Add(attribute_value, weight);
+    }
+  }
+  if (attribute_distribution.NumObservations() > 0) {
+    *na_replacement = attribute_distribution.TopClass();
+  }
+}
+
+// Return the minimum and maximum values of a numerical attribute.
+// Return false if there is no min-max e.g. selected_examples is empty or all
+// the values are NAs.
+bool MinMaxNumericalAttribute(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const absl::Span<const float> attributes, float* min_value,
+    float* max_value) {
+  float local_min_value = 0;
+  float local_max_value = 0;
+  bool first = true;
+  for (const auto example_idx : selected_examples) {
+    const float attribute = attributes[example_idx];
+    if (first && !std::isnan(attribute)) {
+      local_max_value = local_min_value = attribute;
+      first = false;
+    } else if (attribute > local_max_value) {
+      local_max_value = attribute;
+    } else if (attribute < local_min_value) {
+      local_min_value = attribute;
+    }
+  }
+  *min_value = local_min_value;
+  *max_value = local_max_value;
+  return !first;
+}
+
+// For each dictionary item of a Categorical Set attribute, computes the label
+// distribution of examples containing this item. This distribution is
+// equivalent as the label distribution of the positive branch splitted on a
+// categorical-set condition with mask equal to {item}.
+template <bool weighted>
+void InitializeRegressionAttributeDistributions(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& labels, const std::vector<float>& weights,
+    const utils::NormalDistributionDouble& label_distribution,
+    const std::vector<int>& candidate_attributes_list,
+    const std::vector<std::vector<UnsignedExampleIdx>>& examples_by_candidate,
+    std::vector<utils::BinaryToNormalDistributionDouble>*
+        attribute_distributions) {
+  if constexpr (weighted) {
+    DCHECK_EQ(weights.size(), labels.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+
+  const auto num_attribute_classes = examples_by_candidate.size();
+
+  // Initialize active candidates with the full distribution in the negative
+  // side.
+  if (attribute_distributions->size() < num_attribute_classes) {
+    attribute_distributions->resize(num_attribute_classes);
+  }
+  for (const int candidate_attr_value : candidate_attributes_list) {
+    auto& dist = (*attribute_distributions)[candidate_attr_value];
+    dist.Clear();
+    *dist.mutable_neg() = label_distribution;
+
+    // Push all examples containing this value to the positive side.
+    for (const auto select_idx : examples_by_candidate[candidate_attr_value]) {
+      const auto example_idx = selected_examples[select_idx];
+      const float label = labels[example_idx];
+      if constexpr (weighted) {
+        const auto weight = weights[example_idx];
+        dist.mutable_pos()->Add(label, weight);
+        dist.mutable_neg()->Sub(label, weight);
+      } else {
+        dist.mutable_pos()->Add(label);
+        dist.mutable_neg()->Sub(label);
+      }
+    }
+  }
+}
+
+// For each dictionary item of a Categorical Set attribute, computes the label
+// distribution of examples containing this item. This distribution is
+// equivalent as the label distribution of the positive branch splitted on a
+// categorical-set condition with mask equal to {item}.
+template <bool weighted>
+std::vector<utils::BinaryToIntegerConfusionMatrixDouble>
+InitializeClassificationAttributeDistributions(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<int32_t>& labels, const std::vector<float>& weights,
+    const std::vector<std::pair<size_t, size_t>>& attribute_values,
+    const std::vector<int32_t>& attribute_bank,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const std::vector<bool>& candidate_attributes_bitmap) {
+  if constexpr (weighted) {
+    DCHECK_EQ(weights.size(), labels.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  const int num_attribute_classes = candidate_attributes_bitmap.size();
+
+  // Initialize all candidates with the full distribution in the negative side.
+  std::vector<utils::BinaryToIntegerConfusionMatrixDouble>
+      attribute_distributions(
+          num_attribute_classes,
+          utils::BinaryToIntegerConfusionMatrixDouble(
+              label_distribution, utils::IntegerDistributionDouble(
+                                      label_distribution.NumClasses())));
+
+  // For every attribute value, push all examples containing this value to the
+  // positive side of the corresponding distribution.
+  for (const auto example_idx : selected_examples) {
+    const int32_t label = labels[example_idx];
+    const auto& example_attrs_range = attribute_values[example_idx];
+
+    // Iterate through attributes present in this example
+    for (auto bank_idx = example_attrs_range.first;
+         bank_idx < example_attrs_range.second; ++bank_idx) {
+      const int32_t candidate_attr_value = attribute_bank[bank_idx];
+      if (!candidate_attributes_bitmap[candidate_attr_value]) {
+        continue;
+      }
+      // This attribute is a candidate, update its stats
+      auto& dist = attribute_distributions[candidate_attr_value];
+      // Move example contribution from neg to pos.
+      if constexpr (weighted) {
+        const auto weight = weights[example_idx];
+        dist.mutable_pos()->Add(label, weight);
+        dist.mutable_neg()->Sub(label, weight);
+      } else {
+        dist.mutable_pos()->Add(label);
+        dist.mutable_neg()->Sub(label);
+      }
+    }
+  }
+
+  return attribute_distributions;
+}
+
+// Select which sorting strategy to use effectively.
+//
+// If the strategy is AUTO or PRESORTED, the fastest / selected strategy depends
+// on the data.
+proto::DecisionTreeTrainingConfig::Internal::SortingStrategy EffectiveStrategy(
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const int64_t num_selected_examples,
+    const InternalTrainConfig& internal_config) {
+  proto::DecisionTreeTrainingConfig::Internal::SortingStrategy strategy;
+
+  if (internal_config.override_sorting_strategy.has_value()) {
+    // The internal configuration configured by the learning algorithm takes
+    // precedence on the sorting strategy.
+    strategy = internal_config.override_sorting_strategy.value();
+  } else {
+    // Otherwise, the training configuration (controlled by the user or
+    // unit-test controller) selects the strategy.
+    strategy = dt_config.internal().sorting_strategy();
+  }
+  switch (strategy) {
+    // User specified strategy.
+    case proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED:
+    case proto::DecisionTreeTrainingConfig::Internal::IN_NODE:
+      return strategy;
+
+    case proto::DecisionTreeTrainingConfig::Internal::AUTO:
+      CHECK(false);  // The AUTO strategy should have been resolved before.
+      break;
+    case proto::DecisionTreeTrainingConfig::Internal::PRESORTED: {
+      DCHECK(internal_config.preprocessing);
+      const auto num_total_examples =
+          internal_config.preprocessing->num_examples();
+      const float ratio =
+          static_cast<float>(num_selected_examples) / num_total_examples;
+      return (num_selected_examples >= 25 && ratio >= 0.125)
+                 ? proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED
+                 : proto::DecisionTreeTrainingConfig::Internal::IN_NODE;
+    }
+  };
+}
+
+}  // namespace
+
+// Specialization in the case of classification.
+absl::StatusOr<SplitSearchResult> FindBestConditionClassification(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const ClassificationLabelStats& label_stats, const int32_t attribute_idx,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  if (dt_config.internal().generate_fake_error_in_splitter()) {
+    return absl::InternalError("Fake error");
+  }
+
+  const int min_num_obs =
+      dt_config.in_split_min_examples_check() ? dt_config.min_examples() : 1;
+
+  const auto& attribute_column_spec =
+      train_dataset.data_spec().columns(attribute_idx);
+
+  RETURN_IF_ERROR(FailIfMonotonic(config_link, attribute_idx, constraints,
+                                  "classification"));
+
+  SplitSearchResult result;
+
+  switch (train_dataset.column(attribute_idx)->type()) {
+    case dataset::proto::ColumnType::NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalColumn>(attribute_idx));
+
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      if (dt_config.numerical_split().type() == proto::NumericalSplit::EXACT) {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelClassificationFeatureNumericalCart(
+                        selected_examples, weights, attribute_data->values(),
+                        label_stats.label_data, label_stats.num_label_classes,
+                        na_replacement, min_num_obs, dt_config,
+                        label_stats.label_distribution, attribute_idx,
+                        internal_config, best_condition, cache));
+      } else {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelClassificationFeatureNumericalHistogram(
+                        selected_examples, weights, attribute_data->values(),
+                        label_stats.label_data, label_stats.num_label_classes,
+                        na_replacement, min_num_obs, dt_config,
+                        label_stats.label_distribution, attribute_idx, random,
+                        best_condition));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::DISCRETIZED_NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::DiscretizedNumericalColumn>(
+              attribute_idx));
+
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      const auto num_bins =
+          attribute_column_spec.discretized_numerical().boundaries_size() + 1;
+      const auto na_replacement_index =
+          dataset::NumericalToDiscretizedNumerical(attribute_column_spec,
+                                                   na_replacement);
+      ASSIGN_OR_RETURN(
+          result, FindSplitLabelClassificationFeatureDiscretizedNumericalCart(
+                      selected_examples, weights, attribute_data->values(),
+                      num_bins, label_stats.label_data,
+                      label_stats.num_label_classes, na_replacement_index,
+                      min_num_obs, dt_config, label_stats.label_distribution,
+                      attribute_idx, best_condition, cache));
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL: {
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::CategoricalColumn>(attribute_idx));
+
+      const auto na_replacement =
+          attribute_column_spec.categorical().most_frequent_value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+      ASSIGN_OR_RETURN(
+          result, FindSplitLabelClassificationFeatureCategorical(
+                      selected_examples, weights, attribute_data->values(),
+                      label_stats.label_data, num_attribute_classes,
+                      label_stats.num_label_classes, na_replacement,
+                      min_num_obs, dt_config, label_stats.label_distribution,
+                      attribute_idx, random, best_condition, cache));
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL_SET: {
+      ASSIGN_OR_RETURN(
+          const auto* attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::CategoricalSetColumn>(attribute_idx));
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelClassificationFeatureCategoricalSetGreedyForward<
+                /*weighted=*/false>(selected_examples, weights, *attribute_data,
+                                    label_stats.label_data,
+                                    num_attribute_classes,
+                                    label_stats.num_label_classes, min_num_obs,
+                                    dt_config, label_stats.label_distribution,
+                                    attribute_idx, best_condition, random));
+      } else {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelClassificationFeatureCategoricalSetGreedyForward<
+                /*weighted=*/true>(selected_examples, weights, *attribute_data,
+                                   label_stats.label_data,
+                                   num_attribute_classes,
+                                   label_stats.num_label_classes, min_num_obs,
+                                   dt_config, label_stats.label_distribution,
+                                   attribute_idx, best_condition, random));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::BOOLEAN: {
+      // Condition of the type "Attr is True".
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::BooleanColumn>(attribute_idx));
+
+      const auto na_replacement =
+          attribute_column_spec.boolean().count_true() >=
+          attribute_column_spec.boolean().count_false();
+      ASSIGN_OR_RETURN(
+          result, FindSplitLabelClassificationFeatureBoolean(
+                      selected_examples, weights, attribute_data->values(),
+                      label_stats.label_data, label_stats.num_label_classes,
+                      na_replacement, min_num_obs, dt_config,
+                      label_stats.label_distribution, attribute_idx,
+                      best_condition, cache));
+    } break;
+
+    case dataset::proto::ColumnType::NUMERICAL_VECTOR_SEQUENCE: {
+      ASSIGN_OR_RETURN(
+          const auto* attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalVectorSequenceColumn>(
+              attribute_idx));
+      ASSIGN_OR_RETURN(
+          result, FindSplitAnyLabelFeatureNumericalVectorSequence(
+                      model::proto::Task::CLASSIFICATION, selected_examples,
+                      weights, *attribute_data, attribute_column_spec,
+                      label_stats, min_num_obs, dt_config, attribute_idx,
+                      internal_config, best_condition, random, cache));
+    } break;
+
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          dataset::proto::ColumnType_Name(
+              train_dataset.column(attribute_idx)->type()),
+          " attribute ", train_dataset.column(attribute_idx)->name(),
+          " is not supported."));
+  }
+
+  // Condition of the type "Attr is NA".
+  if (dt_config.allow_na_conditions()) {
+    ASSIGN_OR_RETURN(
+        const auto na_result,
+        FindSplitLabelClassificationFeatureNA(
+            selected_examples, weights, train_dataset.column(attribute_idx),
+            label_stats.label_data, label_stats.num_label_classes, min_num_obs,
+            dt_config, label_stats.label_distribution, attribute_idx,
+            best_condition, cache));
+    result = std::min(result, na_result);
+  }
+
+  return result;
+}
+
+absl::StatusOr<SplitSearchResult> FindBestConditionRegressionHessianGain(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const RegressionHessianLabelStats& label_stats, const int32_t attribute_idx,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  if (dt_config.internal().generate_fake_error_in_splitter()) {
+    return absl::InternalError("Fake error");
+  }
+
+  const int min_num_obs =
+      dt_config.in_split_min_examples_check() ? dt_config.min_examples() : 1;
+
+  const auto& attribute_column_spec =
+      train_dataset.data_spec().columns(attribute_idx);
+
+  SplitSearchResult result;
+
+  const int8_t monotonic_direction =
+      MonotonicConstraintSign(config_link, attribute_idx);
+
+  switch (train_dataset.column(attribute_idx)->type()) {
+    case dataset::proto::ColumnType::NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      // Condition of the type "Attr >= threshold".
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalColumn>(attribute_idx));
+
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      if (dt_config.numerical_split().type() == proto::NumericalSplit::EXACT) {
+        if (weights.empty()) {
+          ASSIGN_OR_RETURN(
+              result,
+              FindSplitLabelHessianRegressionFeatureNumericalCart<
+                  /*weighted=*/false>(
+                  selected_examples, weights, attribute_data->values(),
+                  label_stats.gradient_data, label_stats.hessian_data,
+                  na_replacement, min_num_obs, dt_config,
+                  label_stats.sum_gradient, label_stats.sum_hessian,
+                  label_stats.sum_weights, attribute_idx, internal_config,
+                  constraints, monotonic_direction, best_condition, cache));
+        } else {
+          ASSIGN_OR_RETURN(
+              result,
+              FindSplitLabelHessianRegressionFeatureNumericalCart<
+                  /*weighted=*/true>(
+                  selected_examples, weights, attribute_data->values(),
+                  label_stats.gradient_data, label_stats.hessian_data,
+                  na_replacement, min_num_obs, dt_config,
+                  label_stats.sum_gradient, label_stats.sum_hessian,
+                  label_stats.sum_weights, attribute_idx, internal_config,
+                  constraints, monotonic_direction, best_condition, cache));
+        }
+      } else {
+        return absl::InvalidArgumentError(
+            "Only split exact implemented for hessian gains.");
+      }
+    } break;
+
+    case dataset::proto::ColumnType::DISCRETIZED_NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      // Condition of the type "Attr >= threshold".
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::DiscretizedNumericalColumn>(
+              attribute_idx));
+
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      const auto num_bins =
+          attribute_column_spec.discretized_numerical().boundaries_size() + 1;
+      const auto na_replacement_index =
+          dataset::NumericalToDiscretizedNumerical(attribute_column_spec,
+                                                   na_replacement);
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureDiscretizedNumericalCart<
+                /*weighted=*/false>(
+                selected_examples, weights, attribute_data->values(), num_bins,
+                label_stats.gradient_data, label_stats.hessian_data,
+                na_replacement_index, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, monotonic_direction, best_condition, cache));
+      } else {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureDiscretizedNumericalCart<
+                /*weighted=*/true>(
+                selected_examples, weights, attribute_data->values(), num_bins,
+                label_stats.gradient_data, label_stats.hessian_data,
+                na_replacement_index, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, monotonic_direction, best_condition, cache));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL: {
+      // Condition of the type "Attr \in X".
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::CategoricalColumn>(attribute_idx));
+
+      const auto na_replacement =
+          attribute_column_spec.categorical().most_frequent_value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureCategorical<
+                /*weighted=*/false>(
+                selected_examples, weights, attribute_data->values(),
+                label_stats.gradient_data, label_stats.hessian_data,
+                num_attribute_classes, na_replacement, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, best_condition, cache, random));
+      } else {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureCategorical<
+                /*weighted=*/true>(
+                selected_examples, weights, attribute_data->values(),
+                label_stats.gradient_data, label_stats.hessian_data,
+                num_attribute_classes, na_replacement, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, best_condition, cache, random));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::BOOLEAN: {
+      // Condition of the type "Attr is True".
+      ASSIGN_OR_RETURN(
+          const auto& attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::BooleanColumn>(attribute_idx));
+
+      const auto na_replacement =
+          attribute_column_spec.boolean().count_true() >=
+          attribute_column_spec.boolean().count_false();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureBoolean</*weighted=*/false>(
+                selected_examples, weights, attribute_data->values(),
+                label_stats.gradient_data, label_stats.hessian_data,
+                na_replacement, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, best_condition, cache));
+      } else {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelHessianRegressionFeatureBoolean</*weighted=*/true>(
+                selected_examples, weights, attribute_data->values(),
+                label_stats.gradient_data, label_stats.hessian_data,
+                na_replacement, min_num_obs, dt_config,
+                label_stats.sum_gradient, label_stats.sum_hessian,
+                label_stats.sum_weights, attribute_idx, internal_config,
+                constraints, best_condition, cache));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::NUMERICAL_VECTOR_SEQUENCE: {
+      ASSIGN_OR_RETURN(
+          const auto* attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalVectorSequenceColumn>(
+              attribute_idx));
+      ASSIGN_OR_RETURN(result,
+                       FindSplitAnyLabelFeatureNumericalVectorSequence(
+                           model::proto::Task::REGRESSION, selected_examples,
+                           weights, *attribute_data, attribute_column_spec,
+                           label_stats, min_num_obs, dt_config, attribute_idx,
+                           internal_config, best_condition, random, cache));
+    } break;
+
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          dataset::proto::ColumnType_Name(
+              train_dataset.column(attribute_idx)->type()),
+          " attribute ", train_dataset.column(attribute_idx)->name(),
+          " is not supported."));
+  }
+
+  // Condition of the type "Attr is NA".
+  if (dt_config.allow_na_conditions()) {
+    if (weights.empty()) {
+      ASSIGN_OR_RETURN(
+          const auto na_result,
+          FindSplitLabelHessianRegressionFeatureNA</*weighted=*/false>(
+              selected_examples, weights, train_dataset.column(attribute_idx),
+              label_stats.gradient_data, label_stats.hessian_data, min_num_obs,
+              dt_config, label_stats.sum_gradient, label_stats.sum_hessian,
+              label_stats.sum_weights, attribute_idx, internal_config,
+              constraints, best_condition, cache));
+      result = std::min(result, na_result);
+    } else {
+      ASSIGN_OR_RETURN(
+          const auto na_result,
+          FindSplitLabelHessianRegressionFeatureNA</*weighted=*/true>(
+              selected_examples, weights, train_dataset.column(attribute_idx),
+              label_stats.gradient_data, label_stats.hessian_data, min_num_obs,
+              dt_config, label_stats.sum_gradient, label_stats.sum_hessian,
+              label_stats.sum_weights, attribute_idx, internal_config,
+              constraints, best_condition, cache));
+      result = std::min(result, na_result);
+    }
+  }
+
+  return result;
+}
+
+// Specialization in the case of regression.
+absl::StatusOr<SplitSearchResult> FindBestConditionRegression(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const RegressionLabelStats& label_stats, const int32_t attribute_idx,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  if (dt_config.internal().generate_fake_error_in_splitter()) {
+    return absl::InternalError("Fake error");
+  }
+
+  const int min_num_obs =
+      dt_config.in_split_min_examples_check() ? dt_config.min_examples() : 1;
+
+  const auto& attribute_column_spec =
+      train_dataset.data_spec().columns(attribute_idx);
+
+  SplitSearchResult result;
+
+  RETURN_IF_ERROR(
+      FailIfMonotonic(config_link, attribute_idx, constraints, "regression"));
+
+  switch (train_dataset.column(attribute_idx)->type()) {
+    case dataset::proto::ColumnType::NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      // Condition of the type "Attr >= threshold".
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::NumericalColumn>(attribute_idx)
+              .value()
+              ->values();
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      if (dt_config.numerical_split().type() == proto::NumericalSplit::EXACT) {
+        if (weights.empty()) {
+          ASSIGN_OR_RETURN(
+              result,
+              FindSplitLabelRegressionFeatureNumericalCart</*weighted=*/false>(
+                  selected_examples, weights, attribute_data,
+                  label_stats.label_data, na_replacement, min_num_obs,
+                  dt_config, label_stats.label_distribution, attribute_idx,
+                  internal_config, best_condition, cache));
+        } else {
+          ASSIGN_OR_RETURN(
+              result,
+              FindSplitLabelRegressionFeatureNumericalCart</*weighted=*/true>(
+                  selected_examples, weights, attribute_data,
+                  label_stats.label_data, na_replacement, min_num_obs,
+                  dt_config, label_stats.label_distribution, attribute_idx,
+                  internal_config, best_condition, cache));
+        }
+      } else {
+        if (weights.empty()) {
+          ASSIGN_OR_RETURN(
+              result, FindSplitLabelRegressionFeatureNumericalHistogram<
+                          /*weighted=*/false>(
+                          selected_examples, weights, attribute_data,
+                          label_stats.label_data, na_replacement, min_num_obs,
+                          dt_config, label_stats.label_distribution,
+                          attribute_idx, random, best_condition));
+        } else {
+          ASSIGN_OR_RETURN(
+              result, FindSplitLabelRegressionFeatureNumericalHistogram<
+                          /*weighted=*/true>(
+                          selected_examples, weights, attribute_data,
+                          label_stats.label_data, na_replacement, min_num_obs,
+                          dt_config, label_stats.label_distribution,
+                          attribute_idx, random, best_condition));
+        }
+      }
+    } break;
+
+    case dataset::proto::ColumnType::DISCRETIZED_NUMERICAL: {
+      if (!dt_config.has_axis_aligned_split()) {
+        return SplitSearchResult::kNoBetterSplitFound;
+      }
+
+      // Condition of the type "Attr >= threshold".
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::DiscretizedNumericalColumn>(
+                  attribute_idx)
+              .value()
+              ->values();
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+      const auto num_bins =
+          attribute_column_spec.discretized_numerical().boundaries_size() + 1;
+      const auto na_replacement_index =
+          dataset::NumericalToDiscretizedNumerical(attribute_column_spec,
+                                                   na_replacement);
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureDiscretizedNumericalCart<
+                        /*weighted=*/false>(
+                        selected_examples, weights, attribute_data, num_bins,
+                        label_stats.label_data, na_replacement_index,
+                        min_num_obs, dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache));
+      } else {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureDiscretizedNumericalCart<
+                        /*weighted=*/true>(
+                        selected_examples, weights, attribute_data, num_bins,
+                        label_stats.label_data, na_replacement_index,
+                        min_num_obs, dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL: {
+      // Condition of the type "Attr \in X".
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::CategoricalColumn>(attribute_idx)
+              .value()
+              ->values();
+      const auto na_replacement =
+          attribute_column_spec.categorical().most_frequent_value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelRegressionFeatureCategorical</*weighted=*/false>(
+                selected_examples, weights, attribute_data,
+                label_stats.label_data, num_attribute_classes, na_replacement,
+                min_num_obs, dt_config, label_stats.label_distribution,
+                attribute_idx, best_condition, cache, random));
+      } else {
+        ASSIGN_OR_RETURN(
+            result,
+            FindSplitLabelRegressionFeatureCategorical</*weighted=*/true>(
+                selected_examples, weights, attribute_data,
+                label_stats.label_data, num_attribute_classes, na_replacement,
+                min_num_obs, dt_config, label_stats.label_distribution,
+                attribute_idx, best_condition, cache, random));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL_SET: {
+      const auto* attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::CategoricalSetColumn>(attribute_idx)
+              .value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureCategoricalSetGreedyForward<
+                        /*weighted=*/false>(
+                        selected_examples, weights, *attribute_data,
+                        label_stats.label_data, num_attribute_classes,
+                        min_num_obs, dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache, random));
+      } else {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureCategoricalSetGreedyForward<
+                        /*weighted=*/true>(
+                        selected_examples, weights, *attribute_data,
+                        label_stats.label_data, num_attribute_classes,
+                        min_num_obs, dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache, random));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::BOOLEAN: {
+      // Condition of the type "Attr is True".
+      ASSIGN_OR_RETURN(
+          const auto* attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::BooleanColumn>(attribute_idx));
+      const auto na_replacement =
+          attribute_column_spec.boolean().count_true() >=
+          attribute_column_spec.boolean().count_false();
+      if (weights.empty()) {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureBoolean</*weighted=*/false>(
+                        selected_examples, weights, attribute_data->values(),
+                        label_stats.label_data, na_replacement, min_num_obs,
+                        dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache));
+      } else {
+        ASSIGN_OR_RETURN(
+            result, FindSplitLabelRegressionFeatureBoolean</*weighted=*/true>(
+                        selected_examples, weights, attribute_data->values(),
+                        label_stats.label_data, na_replacement, min_num_obs,
+                        dt_config, label_stats.label_distribution,
+                        attribute_idx, best_condition, cache));
+      }
+    } break;
+
+    case dataset::proto::ColumnType::NUMERICAL_VECTOR_SEQUENCE: {
+      ASSIGN_OR_RETURN(
+          const auto* attribute_data,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalVectorSequenceColumn>(
+              attribute_idx));
+      ASSIGN_OR_RETURN(result,
+                       FindSplitAnyLabelFeatureNumericalVectorSequence(
+                           model::proto::Task::REGRESSION, selected_examples,
+                           weights, *attribute_data, attribute_column_spec,
+                           label_stats, min_num_obs, dt_config, attribute_idx,
+                           internal_config, best_condition, random, cache));
+    } break;
+
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          dataset::proto::ColumnType_Name(
+              train_dataset.column(attribute_idx)->type()),
+          " attribute ", train_dataset.column(attribute_idx)->name(),
+          " is not supported."));
+  }
+
+  // Condition of the type "Attr is NA".
+  if (dt_config.allow_na_conditions()) {
+    if (weights.empty()) {
+      ASSIGN_OR_RETURN(
+          const auto na_result,
+          FindSplitLabelRegressionFeatureNA</*weighted=*/false>(
+              selected_examples, weights, train_dataset.column(attribute_idx),
+              label_stats.label_data, min_num_obs, dt_config,
+              label_stats.label_distribution, attribute_idx, best_condition,
+              cache));
+      result = std::min(result, na_result);
+    } else {
+      ASSIGN_OR_RETURN(
+          const auto na_result,
+          FindSplitLabelRegressionFeatureNA</*weighted=*/true>(
+              selected_examples, weights, train_dataset.column(attribute_idx),
+              label_stats.label_data, min_num_obs, dt_config,
+              label_stats.label_distribution, attribute_idx, best_condition,
+              cache));
+      result = std::min(result, na_result);
+    }
+  }
+
+  return result;
+}
+
+// Specialization in the case of uplift with categorical outcome.
+absl::StatusOr<SplitSearchResult> FindBestConditionUpliftCategorical(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const CategoricalUpliftLabelStats& label_stats, const int32_t attribute_idx,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  const int min_num_obs =
+      dt_config.in_split_min_examples_check() ? dt_config.min_examples() : 1;
+  const auto& attribute_column_spec =
+      train_dataset.data_spec().columns(attribute_idx);
+
+  RETURN_IF_ERROR(FailIfMonotonic(config_link, attribute_idx, constraints,
+                                  "categorical uplift"));
+
+  SplitSearchResult result;
+
+  switch (train_dataset.column(attribute_idx)->type()) {
+    case dataset::proto::ColumnType::NUMERICAL: {
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::NumericalColumn>(attribute_idx)
+              .value()
+              ->values();
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+
+      ASSIGN_OR_RETURN(
+          result, FindSplitLabelUpliftCategoricalFeatureNumericalCart(
+                      selected_examples, weights, attribute_data, label_stats,
+                      na_replacement, min_num_obs, dt_config, attribute_idx,
+                      internal_config, best_condition, cache));
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL: {
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCastWithStatus<
+                  dataset::VerticalDataset::CategoricalColumn>(attribute_idx)
+              .value()
+              ->values();
+      const auto na_replacement =
+          attribute_column_spec.categorical().most_frequent_value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+
+      ASSIGN_OR_RETURN(
+          result,
+          FindSplitLabelUpliftCategoricalFeatureCategorical(
+              selected_examples, weights, attribute_data, label_stats,
+              num_attribute_classes, na_replacement, min_num_obs, dt_config,
+              attribute_idx, internal_config, best_condition, cache, random));
+    } break;
+
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          dataset::proto::ColumnType_Name(
+              train_dataset.column(attribute_idx)->type()),
+          " attribute ", train_dataset.column(attribute_idx)->name(),
+          " is not supported."));
+  }
+
+  // Condition of the type "Attr is NA".
+  if (dt_config.allow_na_conditions()) {
+    return absl::InvalidArgumentError("allow_na_conditions not supported");
+  }
+
+  return result;
+}
+
+// Specialization in the case of uplift with numerical outcome.
+absl::StatusOr<SplitSearchResult> FindBestConditionUpliftNumerical(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const NumericalUpliftLabelStats& label_stats, const int32_t attribute_idx,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  const int min_num_obs =
+      dt_config.in_split_min_examples_check() ? dt_config.min_examples() : 1;
+  const auto& attribute_column_spec =
+      train_dataset.data_spec().columns(attribute_idx);
+
+  RETURN_IF_ERROR(FailIfMonotonic(config_link, attribute_idx, constraints,
+                                  "numerical uplift"));
+
+  SplitSearchResult result;
+
+  switch (train_dataset.column(attribute_idx)->type()) {
+    case dataset::proto::ColumnType::NUMERICAL: {
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCast<dataset::VerticalDataset::NumericalColumn>(
+                  attribute_idx)
+              ->values();
+      const auto na_replacement = attribute_column_spec.numerical().mean();
+
+      ASSIGN_OR_RETURN(
+          result, FindSplitLabelUpliftNumericalFeatureNumericalCart(
+                      selected_examples, weights, attribute_data, label_stats,
+                      na_replacement, min_num_obs, dt_config, attribute_idx,
+                      internal_config, best_condition, cache));
+    } break;
+
+    case dataset::proto::ColumnType::CATEGORICAL: {
+      const auto& attribute_data =
+          train_dataset
+              .ColumnWithCast<dataset::VerticalDataset::CategoricalColumn>(
+                  attribute_idx)
+              ->values();
+      const auto na_replacement =
+          attribute_column_spec.categorical().most_frequent_value();
+      const auto num_attribute_classes =
+          attribute_column_spec.categorical().number_of_unique_values();
+
+      ASSIGN_OR_RETURN(
+          result,
+          FindSplitLabelUpliftNumericalFeatureCategorical(
+              selected_examples, weights, attribute_data, label_stats,
+              num_attribute_classes, na_replacement, min_num_obs, dt_config,
+              attribute_idx, internal_config, best_condition, cache, random));
+    } break;
+
+    default:
+      return absl::InvalidArgumentError(absl::StrCat(
+          dataset::proto::ColumnType_Name(
+              train_dataset.column(attribute_idx)->type()),
+          " attribute ", train_dataset.column(attribute_idx)->name(),
+          " is not supported."));
+  }
+
+  // Condition of the type "Attr is NA".
+  if (dt_config.allow_na_conditions()) {
+    return absl::InvalidArgumentError("allow_na_conditions not supported");
+  }
+
+  return result;
+}
+
+absl::StatusOr<SplitterWorkResponse> FindBestConditionFromSplitterWorkRequest(
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const InternalTrainConfig& internal_config,
+    const SplitterWorkRequest& request) {
+  SplitterWorkResponse response;
+  response.manager_data = request.manager_data;
+  request.splitter_cache->random.seed(request.seed);
+
+  response.condition = std::make_unique<proto::NodeCondition>();
+  response.condition->set_split_score(request.best_score);
+
+  if (request.num_oblique_projections_to_run != -1) {
+    DCHECK_EQ(request.attribute_idx, -1);
+    ASSIGN_OR_RETURN(
+        const auto found_oblique_condition,
+        FindBestConditionOblique(
+            request.common->train_dataset, request.common->selected_examples,
+            weights, config, config_link, dt_config, request.common->parent,
+            internal_config, request.common->label_stats,
+            request.num_oblique_projections_to_run, request.common->constraints,
+            response.condition.get(), &request.splitter_cache->random,
+            request.splitter_cache));
+
+    // An oblique split cannot be invalid.
+    response.status = found_oblique_condition
+                          ? SplitSearchResult::kBetterSplitFound
+                          : SplitSearchResult::kNoBetterSplitFound;
+    return response;
+  }
+
+  if (request.attribute_idx < 0 ||
+      request.attribute_idx >=
+          request.common->train_dataset.data_spec().columns_size()) {
+    return absl::OutOfRangeError(absl::StrCat(
+        "The attribute index is out of bounds - attribute_idx: ",
+        request.attribute_idx, ", columns in the dataset: ",
+        request.common->train_dataset.data_spec().columns_size(), "."));
+  }
+
+  switch (config.task()) {
+    case model::proto::Task::CLASSIFICATION: {
+      const auto& label_stats =
+          utils::down_cast<const ClassificationLabelStats&>(
+              request.common->label_stats);
+
+      ASSIGN_OR_RETURN(
+          response.status,
+          FindBestConditionClassification(
+              request.common->train_dataset, request.common->selected_examples,
+              weights, config, config_link, dt_config, request.common->parent,
+              internal_config, label_stats, request.attribute_idx,
+              request.common->constraints, response.condition.get(),
+              &request.splitter_cache->random, request.splitter_cache));
+    } break;
+    case model::proto::Task::REGRESSION:
+      if (internal_config.hessian_score) {
+        const auto& label_stats =
+            utils::down_cast<const RegressionHessianLabelStats&>(
+                request.common->label_stats);
+
+        ASSIGN_OR_RETURN(
+            response.status,
+            FindBestConditionRegressionHessianGain(
+                request.common->train_dataset,
+                request.common->selected_examples, weights, config, config_link,
+                dt_config, request.common->parent, internal_config, label_stats,
+                request.attribute_idx, request.common->constraints,
+                response.condition.get(), &request.splitter_cache->random,
+                request.splitter_cache));
+
+      } else {
+        const auto& label_stats = utils::down_cast<const RegressionLabelStats&>(
+            request.common->label_stats);
+
+        ASSIGN_OR_RETURN(
+            response.status,
+            FindBestConditionRegression(
+                request.common->train_dataset,
+                request.common->selected_examples, weights, config, config_link,
+                dt_config, request.common->parent, internal_config, label_stats,
+                request.attribute_idx, request.common->constraints,
+                response.condition.get(), &request.splitter_cache->random,
+                request.splitter_cache));
+      }
+      break;
+    default:
+      NOTREACHED();
+  }
+
+  return response;
+}
+
+absl::StatusOr<bool> FindBestConditionOblique(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const LabelStats& label_stats,
+    const std::optional<int>& override_num_projections,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, SplitterPerThreadCache* cache) {
+  switch (config.task()) {
+    case model::proto::Task::CLASSIFICATION: {
+      const auto& class_label_stats =
+          utils::down_cast<const ClassificationLabelStats&>(label_stats);
+      return FindBestConditionOblique(
+          train_dataset, selected_examples, weights, config, config_link,
+          dt_config, parent, internal_config, class_label_stats,
+          override_num_projections, best_condition, random, cache);
+    } break;
+    case model::proto::Task::REGRESSION:
+      if (internal_config.hessian_score) {
+        const auto& reg_label_stats =
+            utils::down_cast<const RegressionHessianLabelStats&>(label_stats);
+        return FindBestConditionOblique(
+            train_dataset, selected_examples, weights, config, config_link,
+            dt_config, parent, internal_config, reg_label_stats,
+            override_num_projections, constraints, best_condition, random,
+            cache);
+      } else {
+        const auto& reg_label_stats =
+            utils::down_cast<const RegressionLabelStats&>(label_stats);
+        return FindBestConditionOblique(
+            train_dataset, selected_examples, weights, config, config_link,
+            dt_config, parent, internal_config, reg_label_stats,
+            override_num_projections, best_condition, random, cache);
+      }
+      break;
+    default:
+      return absl::UnimplementedError(
+          "Oblique splits not implemented for this task");
+  }
+
+  return false;
+}
+
+absl::StatusOr<bool> FindBestConditionSingleThreadManager(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const LabelStats& label_stats, const NodeConstraints& constraints,
+    proto::NodeCondition* best_condition, utils::RandomEngine* random,
+    PerThreadCache* cache) {
+  // Single Thread Setup.
+  cache->splitter_cache_list.resize(1);
+
+  // Was a least one good split found?
+  bool found_good_condition = false;
+
+  const bool has_gpu_best_condition = internal_config.best_condition != nullptr &&
+                                     internal_config.best_projection != nullptr;
+
+  switch (dt_config.split_axis_case()) {
+    case proto::DecisionTreeTrainingConfig::SPLIT_AXIS_NOT_SET:
+    case proto::DecisionTreeTrainingConfig::kAxisAlignedSplit:
+      // Nothing to do.
+      break;
+    case proto::DecisionTreeTrainingConfig::kSparseObliqueSplit:
+    case proto::DecisionTreeTrainingConfig::kMhldObliqueSplit:
+    case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit: {
+      ASSIGN_OR_RETURN(
+          found_good_condition,
+          FindBestConditionOblique(
+              train_dataset, selected_examples, weights, config, config_link,
+              dt_config, parent, internal_config, label_stats, {}, constraints,
+              best_condition, random, &cache->splitter_cache_list[0]));
+      } break;
+  }
+
+  // GPU BFS already found best split; skip axis-aligned testing.
+  // In NO_D2H mode, CPU-side selected_examples is empty at depth > 0,
+  // so axis-aligned tests would run on no data and diverge from D2H.
+  if (has_gpu_best_condition) {
+    return found_good_condition;
+  }
+
+  // Get the indices of the attributes to test.
+  int remaining_attributes_to_test;
+  std::vector<int32_t>& candidate_attributes = cache->candidate_attributes;
+  GetCandidateAttributes(config, config_link, dt_config,
+                         &remaining_attributes_to_test, &candidate_attributes,
+                         random);
+
+  // Index of the next attribute to be tested in "candidate_attributes".
+  int candidate_attribute_idx_in_candidate_list = 0;
+
+  while (remaining_attributes_to_test >= 0 &&
+         candidate_attribute_idx_in_candidate_list <
+             candidate_attributes.size()) {
+    // Get the attribute data.
+    const int32_t attribute_idx =
+        candidate_attributes[candidate_attribute_idx_in_candidate_list++];
+    SplitSearchResult result;
+
+    switch (config.task()) {
+      case model::proto::Task::CLASSIFICATION: {
+        const auto& class_label_stats =
+            utils::down_cast<const ClassificationLabelStats&>(label_stats);
+
+        ASSIGN_OR_RETURN(result, FindBestConditionClassification(
+                                     train_dataset, selected_examples, weights,
+                                     config, config_link, dt_config, parent,
+                                     internal_config, class_label_stats,
+                                     attribute_idx, constraints, best_condition,
+                                     random, &cache->splitter_cache_list[0]));
+      } break;
+      case model::proto::Task::REGRESSION:
+        if (internal_config.hessian_score) {
+          const auto& reg_label_stats =
+              utils::down_cast<const RegressionHessianLabelStats&>(label_stats);
+
+          ASSIGN_OR_RETURN(
+              result,
+              FindBestConditionRegressionHessianGain(
+                  train_dataset, selected_examples, weights, config,
+                  config_link, dt_config, parent, internal_config,
+                  reg_label_stats, attribute_idx, constraints, best_condition,
+                  random, &cache->splitter_cache_list[0]));
+
+        } else {
+          const auto& reg_label_stats =
+              utils::down_cast<const RegressionLabelStats&>(label_stats);
+
+          ASSIGN_OR_RETURN(
+              result,
+              FindBestConditionRegression(
+                  train_dataset, selected_examples, weights, config,
+                  config_link, dt_config, parent, internal_config,
+                  reg_label_stats, attribute_idx, constraints, best_condition,
+                  random, &cache->splitter_cache_list[0]));
+        }
+        break;
+
+      case model::proto::Task::CATEGORICAL_UPLIFT: {
+        const auto& uplift_label_stats =
+            utils::down_cast<const CategoricalUpliftLabelStats&>(label_stats);
+        ASSIGN_OR_RETURN(result, FindBestConditionUpliftCategorical(
+                                     train_dataset, selected_examples, weights,
+                                     config, config_link, dt_config, parent,
+                                     internal_config, uplift_label_stats,
+                                     attribute_idx, constraints, best_condition,
+                                     random, &cache->splitter_cache_list[0]));
+      } break;
+
+      case model::proto::Task::NUMERICAL_UPLIFT: {
+        const auto& uplift_label_stats =
+            utils::down_cast<const NumericalUpliftLabelStats&>(label_stats);
+        ASSIGN_OR_RETURN(result, FindBestConditionUpliftNumerical(
+                                     train_dataset, selected_examples, weights,
+                                     config, config_link, dt_config, parent,
+                                     internal_config, uplift_label_stats,
+                                     attribute_idx, constraints, best_condition,
+                                     random, &cache->splitter_cache_list[0]));
+      } break;
+
+      default:
+        return absl::UnimplementedError("Non implemented");
+    }
+    if (result != SplitSearchResult::kInvalidAttribute) {
+      remaining_attributes_to_test--;
+      if (result == SplitSearchResult::kBetterSplitFound) {
+        found_good_condition = true;
+      }
+    }
+  }
+  return found_good_condition;
+}
+
+absl::StatusOr<bool> FindBestConditionConcurrentManager(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const LabelStats& label_stats, const NodeConstraints& constraints,
+    proto::NodeCondition* best_condition, utils::RandomEngine* random,
+    PerThreadCache* cache) {
+  // This method looks for the best split using worker threads.
+  //
+  // Background:
+  // The best split is the split with the best score among the first
+  // "min_num_jobs_to_test" valid split searches. The order of the split is
+  // defined by the list of candidate attributes generated by
+  // GetCandidateAttributes. A split search is valid if it tested at least one
+  // split.
+  //
+  // Since the execution is multi-threaded, splits are computed/evaluated in
+  // unpredictable order. However, this method's result is as if the splits were
+  // evaluated sequentially according to the order defined by
+  // GetCandidateAttributes. Oblique splits are always evaluated (if requested
+  // by the user).
+  //
+  // A work unit (called a "job") is the evaluation of a single attribute or, in
+  // the case of oblique splits, the evaluation of a given number of random
+  // projections. A job with a given idx can be in one of multiple states (in
+  // chronological order):
+  //
+  // 1. Before being scheduled (idx >= next_job_to_schedule).
+  // 2. Scheduled and being computed by a worker.
+  // 3. The worker is done with the computation, and the result was recorded by
+  // the manager (cache->durable_response_list[idx].set).
+  // 4. The result was processed by the manager (idx < next_job_to_process).
+  //
+  // This method guarantees that the jobs/splits are processed in order.
+  //
+  // Note that next_job_to_process < next_job_to_schedule always holds.
+  if (internal_config.split_finder_processor == nullptr) {
+    return absl::InternalError(
+        "Multi-threaded execution requested but no worker threads created.");
+  }
+  const int num_threads = internal_config.split_finder_processor->num_threads();
+  DCHECK_GT(num_threads, 0);
+
+  if (config_link.features().empty()) {
+    return false;
+  }
+
+  // Constant and static part of the requests.
+  SplitterWorkRequestCommon common{
+      .train_dataset = train_dataset,
+      .selected_examples = selected_examples,
+      .parent = parent,
+      .label_stats = label_stats,
+      .constraints = constraints,
+      .weights = weights,
+      .config = config,
+      .config_link = config_link,
+      .dt_config = dt_config,
+      .internal_config = internal_config,
+  };
+
+  // Computes the number of oblique projections to evaluate and how to group
+  // them into requests.
+  int num_oblique_jobs = 0;
+  int num_oblique_projections;
+  int num_oblique_projections_per_oblique_job;
+
+  if (config_link.numerical_features_size() > 0) {
+    if (dt_config.split_axis_case() ==
+            proto::DecisionTreeTrainingConfig::kSparseObliqueSplit ||
+        dt_config.split_axis_case() ==
+            proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit) {
+      num_oblique_projections =
+          GetNumProjections(dt_config, config_link.numerical_features_size());
+
+      if (num_oblique_projections > 0) {
+        // Arbitrary minimum number of oblique projections to test in each job.
+        // Because oblique jobs are expensive (more than non oblique jobs), it
+        // is not efficient to create a request with too little work to do.
+        //
+        // In most real cases, this parameter does not matter as the limit is
+        // effectively constraint by the number of threads.
+        const int min_projections_per_request = 10;
+
+        DCHECK_GE(num_threads, 1);
+        num_oblique_jobs = std::min(
+            num_threads,
+            (num_oblique_projections + min_projections_per_request - 1) /
+                min_projections_per_request);
+        num_oblique_projections_per_oblique_job =
+            (num_oblique_projections + num_oblique_jobs - 1) / num_oblique_jobs;
+      }
+    } else if (dt_config.split_axis_case() ==
+               proto::DecisionTreeTrainingConfig::kMhldObliqueSplit) {
+      num_oblique_projections = 1;
+      num_oblique_projections_per_oblique_job = 1;
+      num_oblique_jobs = 1;
+    }
+  }
+
+  // Prepare caches.
+  cache->splitter_cache_list.resize(num_threads);
+
+  // Get the ordered indices of the attributes to test.
+  int min_num_jobs_to_test;
+  std::vector<int32_t>& candidate_attributes = cache->candidate_attributes;
+  GetCandidateAttributes(config, config_link, dt_config, &min_num_jobs_to_test,
+                         &candidate_attributes, random);
+
+  const int num_jobs = candidate_attributes.size() + num_oblique_jobs;
+  // All the oblique jobs need to be done.
+  // Note: When do look for oblique splits, we also run the classical numerical
+  // splitter.
+  min_num_jobs_to_test += num_oblique_jobs;
+
+  cache->durable_response_list.resize(num_jobs);
+
+  // Marks all the caches "available".
+  cache->available_cache_idxs.resize(cache->splitter_cache_list.size());
+  std::iota(cache->available_cache_idxs.begin(),
+            cache->available_cache_idxs.end(), 0);
+
+  // Marks all the duration responses as "non set".
+  for (auto& s : cache->durable_response_list) {
+    s.set = false;
+  }
+
+  // Score and value of the best found condition.
+  std::atomic<float> best_split_score = best_condition->split_score();
+  std::unique_ptr<proto::NodeCondition> best_condition_ptr;
+
+  // Get Channel readers and writers.
+  auto& processor = *(internal_config.split_finder_processor);
+
+  // Number of jobs currently scheduled.
+  int num_in_flight = 0;
+
+  // Helper function to create a WorkRequest.
+  //
+  // If attribute_idx is != -1 create a request for an axis-aligned split.
+  //
+  // If attribute_idx is == -1 and num_oblique_projections_to_run != -1, create
+  // a request for an oblique split.
+  //
+  auto build_request =
+      [&](const int job_idx, const int attribute_idx,
+          const int num_oblique_projections_to_run) -> SplitterWorkRequest {
+    DCHECK_NE(attribute_idx != -1, num_oblique_projections_to_run != -1);
+    DCHECK(!cache->available_cache_idxs.empty());
+    const int32_t cache_idx = cache->available_cache_idxs.back();
+    cache->available_cache_idxs.pop_back();
+    num_in_flight++;
+    return SplitterWorkRequest(
+        /*manager_data=*/
+        {
+            .cache_idx = cache_idx,
+            .job_idx = job_idx,
+        },
+        /*best_score=*/best_split_score,
+        /*attribute_idx=*/attribute_idx,
+        /*splitter_cache=*/&cache->splitter_cache_list[cache_idx],
+        /*common=*/&common,
+        /*seed=*/(*random)(),
+        /*num_oblique_projections_to_run=*/num_oblique_projections_to_run);
+  };
+
+  // Schedule all the oblique jobs.
+  int next_job_to_schedule = 0;
+  for (int oblique_job_idx = 0; oblique_job_idx < num_oblique_jobs;
+       oblique_job_idx++) {
+    int num_projections_in_request;
+    if (oblique_job_idx == num_oblique_jobs - 1) {
+      num_projections_in_request =
+          num_oblique_projections -
+          oblique_job_idx * num_oblique_projections_per_oblique_job;
+    } else {
+      num_projections_in_request = num_oblique_projections_per_oblique_job;
+    }
+
+    processor.Submit(build_request(
+        next_job_to_schedule++,
+        /*attribute_idx=*/-1,
+        /*num_oblique_projections_to_run=*/num_projections_in_request));
+  }
+
+  // Schedule some non-oblique jobs if threads are still available.
+  while (next_job_to_schedule < std::min(num_threads, num_jobs) &&
+         !cache->available_cache_idxs.empty()) {
+    DCHECK_GE(next_job_to_schedule, num_oblique_jobs);
+    const int attribute_idx =
+        candidate_attributes[next_job_to_schedule - num_oblique_jobs];
+
+    processor.Submit(build_request(next_job_to_schedule,
+                                   /*attribute_idx=*/attribute_idx,
+                                   /*num_oblique_projections_to_run=*/-1));
+    next_job_to_schedule++;
+  }
+
+  int num_valid_job_tested = 0;
+  int next_job_to_process = 0;
+
+  absl::Status status;
+
+  while (true) {
+    // Get a new result from a worker splitter.
+    auto maybe_response = processor.GetResult();
+    if (!maybe_response.has_value()) {
+      break;
+    }
+
+    num_in_flight--;
+    DCHECK_GE(num_in_flight, 0);
+
+    {
+      // Record, but do not process, the worker response.
+      auto response_or = std::move(maybe_response).value();
+      if (!response_or.ok()) {
+        status.Update(response_or.status());
+        break;
+      }
+      auto response = std::move(response_or).value();
+      // Release the cache immediately to be reused by other workers.
+      cache->available_cache_idxs.push_back(response.manager_data.cache_idx);
+
+      // Record response for further processing.
+      auto& durable_response =
+          cache->durable_response_list[response.manager_data.job_idx];
+      durable_response.status = response.status;
+      durable_response.set = true;
+      if (response.status == SplitSearchResult::kBetterSplitFound) {
+        // The worker found a potentially better solution.
+        durable_response.condition = std::move(response.condition);
+      }
+    }
+
+    // Process new responses that can be processed.
+    while (next_job_to_process < next_job_to_schedule &&
+           num_valid_job_tested < min_num_jobs_to_test &&
+           cache->durable_response_list[next_job_to_process].set) {
+      // Something to process.
+      auto durable_response =
+          &cache->durable_response_list[next_job_to_process];
+      next_job_to_process++;
+
+      if (durable_response->status != SplitSearchResult::kInvalidAttribute) {
+        num_valid_job_tested++;
+      }
+      if (durable_response->status == SplitSearchResult::kBetterSplitFound) {
+        const float split_score = durable_response->condition->split_score();
+        if (split_score > best_split_score) {
+          best_condition_ptr = std::move(durable_response->condition);
+          best_split_score = split_score;
+        }
+      }
+    }
+
+    if (num_valid_job_tested >= min_num_jobs_to_test) {
+      // Enough jobs have been tested to take a decision.
+      break;
+    }
+
+    if (next_job_to_process >= num_jobs) {
+      // We have processed all the jobs.
+      break;
+    }
+
+    // Schedule the testing of more conditions.
+    while (!cache->available_cache_idxs.empty() &&
+           next_job_to_schedule < num_jobs) {
+      processor.Submit(build_request(
+          next_job_to_schedule,
+          /*attribute_idx=*/
+          candidate_attributes[next_job_to_schedule - num_oblique_jobs],
+          /*num_oblique_projections_to_run=*/-1));
+      next_job_to_schedule++;
+    }
+  }
+
+  // Drain the response channel.
+  for (int i = 0; i < num_in_flight; i++) {
+    auto maybe_response = processor.GetResult();
+    if (!maybe_response.has_value()) {
+      // The channel was closed.
+      break;
+    }
+    auto response_or = std::move(maybe_response).value();
+    status.Update(response_or.status());
+  }
+
+  // Move the random generator state to make the behavior deterministic.
+  random->discard(num_jobs - next_job_to_schedule);
+
+  if (!status.ok()) {
+    return status;
+  }
+
+  if (best_condition_ptr) {
+    *best_condition = std::move(*best_condition_ptr);
+    return true;
+  }
+  return false;
+}
+
+absl::StatusOr<bool> FindBestConditionManager(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const LabelStats& label_stats, const NodeConstraints& constraints,
+    proto::NodeCondition* best_condition, utils::RandomEngine* random,
+    PerThreadCache* cache) {
+  if (internal_config.split_finder_processor != nullptr) {
+    return FindBestConditionConcurrentManager(
+        train_dataset, selected_examples, weights, config, config_link,
+        dt_config, parent, internal_config, label_stats, constraints,
+        best_condition, random, cache);
+  }
+
+  // Single thread.
+  return FindBestConditionSingleThreadManager(
+      train_dataset, selected_examples, weights, config, config_link, dt_config,
+      parent, internal_config, label_stats, constraints, best_condition, random,
+      cache);
+}
+
+absl::StatusOr<bool> FindBestCondition(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const proto::Node& parent, const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* best_condition,
+    utils::RandomEngine* random, PerThreadCache* cache) {
+  switch (config.task()) {
+    case model::proto::Task::CLASSIFICATION: {
+      STATUS_CHECK(!internal_config.hessian_score);
+      ASSIGN_OR_RETURN(const auto labels,
+                       train_dataset.ColumnWithCastWithStatus<
+                           dataset::VerticalDataset::CategoricalColumn>(
+                           config_link.label()));
+      ClassificationLabelStats label_stat(labels->values());
+
+      const auto& label_column_spec =
+          train_dataset.data_spec().columns(config_link.label());
+      label_stat.num_label_classes =
+          label_column_spec.categorical().number_of_unique_values();
+
+      label_stat.label_distribution.Load(parent.classifier().distribution());
+
+      if (label_stat.label_distribution.NumClasses() >= 1 &&
+          label_stat.label_distribution.count(
+              dataset::kOutOfDictionaryItemIndex) > 0) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "The categorical training label column \"", config.label(),
+            "\" contains out-of-dictionary values. This is not allowed. "
+            "Most likely, the subset of the training dataset used to compute "
+            "the label dictionary did not contain some label values found in "
+            "the remaining of the training dataset. To solve this issue, "
+            "increase the number of training examples used to compute "
+            "dictionnaries with "
+            "`max_num_scanned_rows_to_compute_statistics=100000` (or a larger "
+            "value). To use all the training examples to build the dictionary, "
+            "use `max_num_scanned_rows_to_compute_statistics=-1` (Warning: "
+            "this can be slow on large datasets)."));
+      }
+
+      return FindBestConditionManager(train_dataset, selected_examples, weights,
+                                      config, config_link, dt_config, parent,
+                                      internal_config, label_stat, constraints,
+                                      best_condition, random, cache);
+    } break;
+
+    case model::proto::Task::REGRESSION: {
+      if (internal_config.hessian_score) {
+        STATUS_CHECK_NE(internal_config.gradient_col_idx, -1);
+        STATUS_CHECK_NE(internal_config.hessian_col_idx, -1);
+        STATUS_CHECK_EQ(internal_config.gradient_col_idx, config_link.label());
+
+        ASSIGN_OR_RETURN(const auto gradients,
+                         train_dataset.ColumnWithCastWithStatus<
+                             dataset::VerticalDataset::NumericalColumn>(
+                             internal_config.gradient_col_idx));
+        ASSIGN_OR_RETURN(const auto hessians,
+                         train_dataset.ColumnWithCastWithStatus<
+                             dataset::VerticalDataset::NumericalColumn>(
+                             internal_config.hessian_col_idx));
+
+        RegressionHessianLabelStats label_stat(gradients->values(),
+                                               hessians->values());
+
+        STATUS_CHECK(parent.regressor().has_sum_gradients());
+        label_stat.sum_gradient = parent.regressor().sum_gradients();
+        label_stat.sum_hessian = parent.regressor().sum_hessians();
+        label_stat.sum_weights = parent.regressor().sum_weights();
+
+        return FindBestConditionManager(
+            train_dataset, selected_examples, weights, config, config_link,
+            dt_config, parent, internal_config, label_stat, constraints,
+            best_condition, random, cache);
+      } else {
+        ASSIGN_OR_RETURN(const auto labels,
+                         train_dataset.ColumnWithCastWithStatus<
+                             dataset::VerticalDataset::NumericalColumn>(
+                             config_link.label()));
+        RegressionLabelStats label_stat(labels->values());
+
+        STATUS_CHECK(parent.regressor().has_distribution());
+        label_stat.label_distribution.Load(parent.regressor().distribution());
+
+        return FindBestConditionManager(
+            train_dataset, selected_examples, weights, config, config_link,
+            dt_config, parent, internal_config, label_stat, constraints,
+            best_condition, random, cache);
+      }
+    } break;
+
+    case model::proto::Task::CATEGORICAL_UPLIFT: {
+      STATUS_CHECK(!internal_config.hessian_score);
+      const auto& outcome_spec =
+          train_dataset.data_spec().columns(config_link.label());
+      const auto& treatment_spec =
+          train_dataset.data_spec().columns(config_link.uplift_treatment());
+
+      ASSIGN_OR_RETURN(const auto labels,
+                       train_dataset.ColumnWithCastWithStatus<
+                           dataset::VerticalDataset::CategoricalColumn>(
+                           config_link.label()));
+
+      ASSIGN_OR_RETURN(const auto treatments,
+                       train_dataset.ColumnWithCastWithStatus<
+                           dataset::VerticalDataset::CategoricalColumn>(
+                           config_link.uplift_treatment()));
+
+      CategoricalUpliftLabelStats label_stat(
+          labels->values(),
+          outcome_spec.categorical().number_of_unique_values(),
+          treatments->values(),
+          treatment_spec.categorical().number_of_unique_values());
+
+      UpliftLeafToLabelDist(parent.uplift(), &label_stat.label_distribution);
+
+      return FindBestConditionManager(train_dataset, selected_examples, weights,
+                                      config, config_link, dt_config, parent,
+                                      internal_config, label_stat, constraints,
+                                      best_condition, random, cache);
+    } break;
+
+    case model::proto::Task::NUMERICAL_UPLIFT: {
+      STATUS_CHECK(!internal_config.hessian_score);
+      const auto& treatment_spec =
+          train_dataset.data_spec().columns(config_link.uplift_treatment());
+
+      ASSIGN_OR_RETURN(
+          const auto labels,
+          train_dataset.ColumnWithCastWithStatus<
+              dataset::VerticalDataset::NumericalColumn>(config_link.label()));
+
+      ASSIGN_OR_RETURN(const auto treatments,
+                       train_dataset.ColumnWithCastWithStatus<
+                           dataset::VerticalDataset::CategoricalColumn>(
+                           config_link.uplift_treatment()));
+
+      NumericalUpliftLabelStats label_stat(
+          labels->values(), treatments->values(),
+          treatment_spec.categorical().number_of_unique_values());
+
+      UpliftLeafToLabelDist(parent.uplift(), &label_stat.label_distribution);
+
+      return FindBestConditionManager(train_dataset, selected_examples, weights,
+                                      config, config_link, dt_config, parent,
+                                      internal_config, label_stat, constraints,
+                                      best_condition, random, cache);
+    } break;
+
+    default:
+      return absl::UnimplementedError("Non implemented");
+  }
+  return false;
+}
+
+// Returns the index k of the last equal-width threshold <= a
+// (or –1 when a is smaller than the first threshold).
+static inline int EqualWidthThresholdIndex(const float attribute,
+                                           const float min_value,
+                                           const float max_value,
+                                           const int num_splits) {
+  if (num_splits <= 0) return -1;
+
+  const float range = max_value - min_value;
+  if (range <= 0.0f) return -1;
+
+  // Fast bucketing via Bin Width arithmetic
+  const float width = range / static_cast<float>(num_splits);
+  const float x = (attribute - min_value) / width - 0.5f;
+  int idx = static_cast<int>(floorf(x));
+
+  // Clamp to the nominal range (with "below first threshold" as -1)
+  if (idx < 0) return -1;
+  if (idx >= num_splits) idx = num_splits - 1;
+
+  // Sometimes above is off-by-one vs. std::upper_bound due to floating point
+  // arithmetic Below's a 1-step correction to match std::upper_bound() on the
+  // actual thresholds. Compute thresholds using the exact same arithmetic as in
+  // GenHistogramBins: T[j] = min_value + (range * (j + 0.5f)) / num_splits;
+  const float Nf = static_cast<float>(num_splits);
+  const float jf = static_cast<float>(idx);
+  const float Tj = min_value + (range * (jf + 0.5f)) / Nf;
+
+  if (attribute <
+      Tj) {  // attribute falls before this bin's threshold: move left by one
+    --idx;
+    return (idx >= 0) ? idx : -1;
+  }
+
+  if (idx + 1 < num_splits) {
+    // Next threshold: j+1 -> (j + 1.5f)
+    const float Tnext = min_value + (range * (jf + 1.5f)) / Nf;
+    if (attribute >= Tnext) {
+      // a reaches past next threshold; move right by one
+      ++idx;
+    }
+  }
+  return idx;
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureNumericalHistogram(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<int32_t>& labels, const int32_t num_label_classes,
+    float na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition) {
+  DCHECK(condition != nullptr);
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+  // Determine the minimum and maximum values of the attribute.
+  float min_value, max_value;
+  if (!MinMaxNumericalAttribute(selected_examples, attributes, &min_value,
+                                &max_value)) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+  // There should be at least two different unique values.
+  if (min_value == max_value) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+  // Randomly select some threshold values.
+  struct CandidateSplit {
+    float threshold;
+    utils::IntegerDistributionDouble pos_label_distribution;
+    int64_t num_positive_examples_without_weights = 0;
+    bool operator<(const CandidateSplit& other) const {
+      return threshold < other.threshold;
+    }
+  };
+
+  ASSIGN_OR_RETURN(
+      const auto bins,
+      internal::GenHistogramBins(dt_config.numerical_split().type(),
+                                 dt_config.numerical_split().num_candidates(),
+                                 attributes, min_value, max_value, random));
+
+  std::vector<CandidateSplit> candidate_splits(bins.size());
+  for (int split_idx = 0; split_idx < candidate_splits.size(); split_idx++) {
+    auto& candidate_split = candidate_splits[split_idx];
+    candidate_split.pos_label_distribution.SetNumClasses(num_label_classes);
+    candidate_split.threshold = bins[split_idx];
+  }
+
+  const bool use_equal_width_fast_path =
+      (dt_config.numerical_split().type() ==
+       proto::NumericalSplit::HISTOGRAM_EQUAL_WIDTH);
+
+  // Compute the split score of each threshold.
+  for (const auto example_idx : selected_examples) {
+    const int32_t label = labels[example_idx];
+    const float weight = weights.empty() ? 1.f : weights[example_idx];
+    float attribute = attributes[example_idx];
+    if (std::isnan(attribute)) {
+      attribute = na_replacement;
+    }
+
+    if (use_equal_width_fast_path) {
+      const int idx =
+          EqualWidthThresholdIndex(attribute, min_value, max_value,
+                                   static_cast<int>(candidate_splits.size()));
+
+      // Matches the original behavior when upper_bound(...) == begin()
+      if (idx < 0) {
+        continue;
+      }
+
+      auto& it_split = candidate_splits[idx];
+
+// Check fast binning choice against std::upper_bound()
+#ifndef NDEBUG
+      auto it_ref = std::upper_bound(
+          candidate_splits.begin(), candidate_splits.end(), attribute,
+          [](float a, const CandidateSplit& b) { return a < b.threshold; });
+
+      int idx_ref = (it_ref == candidate_splits.begin())
+                        ? -1
+                        : static_cast<int>(std::distance(
+                              candidate_splits.begin(), --it_ref));
+      DCHECK_EQ(idx, idx_ref)
+          << "Fast equal-width binning disagrees with std::upper_bound at "
+          << idx;
+#endif
+
+      it_split.num_positive_examples_without_weights++;
+      it_split.pos_label_distribution.Add(label, weight);
+    } else {
+      auto it_split = std::upper_bound(
+          candidate_splits.begin(), candidate_splits.end(), attribute,
+          [](const float a, const CandidateSplit& b) {
+            return a < b.threshold;
+          });
+      if (it_split == candidate_splits.begin()) {
+        continue;
+      }
+      --it_split;
+      it_split->num_positive_examples_without_weights++;
+      it_split->pos_label_distribution.Add(label, weight);
+    }
+  }
+
+  for (int split_idx = candidate_splits.size() - 2; split_idx >= 0;
+       split_idx--) {
+    const auto& src = candidate_splits[split_idx + 1];
+    auto& dst = candidate_splits[split_idx];
+    dst.num_positive_examples_without_weights +=
+        src.num_positive_examples_without_weights;
+    dst.pos_label_distribution.Add(src.pos_label_distribution);
+  }
+
+  const double initial_entropy = label_distribution.Entropy();
+  utils::BinaryToIntegerConfusionMatrixDouble confusion;
+  confusion.SetNumClassesIntDim(num_label_classes);
+
+  // Select the best threshold.
+  bool found_split = false;
+  for (auto& candidate_split : candidate_splits) {
+    if (selected_examples.size() -
+                candidate_split.num_positive_examples_without_weights <
+            min_num_obs ||
+        candidate_split.num_positive_examples_without_weights < min_num_obs) {
+      continue;
+    }
+
+    confusion.mutable_neg()->Set(label_distribution);
+    confusion.mutable_neg()->Sub(candidate_split.pos_label_distribution);
+    confusion.mutable_pos()->Set(candidate_split.pos_label_distribution);
+
+    const double final_entropy = confusion.FinalEntropy();
+    const double information_gain = initial_entropy - final_entropy;
+    if (information_gain > condition->split_score()) {
+      condition->set_split_score(information_gain);
+      condition->mutable_condition()->mutable_higher_condition()->set_threshold(
+          candidate_split.threshold);
+      condition->set_attribute(attribute_idx);
+      condition->set_num_training_examples_without_weight(
+          selected_examples.size());
+      condition->set_num_training_examples_with_weight(
+          confusion.NumObservations());
+      condition->set_num_pos_training_examples_without_weight(
+          candidate_split.num_positive_examples_without_weights);
+      condition->set_num_pos_training_examples_with_weight(
+          confusion.pos().NumObservations());
+      condition->set_na_value(na_replacement >= candidate_split.threshold);
+      found_split = true;
+    }
+  }
+  return found_split ? SplitSearchResult::kBetterSplitFound
+                     : SplitSearchResult::kNoBetterSplitFound;
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<int32_t>& labels, const int32_t num_label_classes,
+    float na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, const InternalTrainConfig& internal_config,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+
+  FeatureNumericalBucket::Filler feature_filler(selected_examples.size(),
+                                                na_replacement, attributes);
+
+  const auto sorting_strategy =
+      EffectiveStrategy(dt_config, selected_examples.size(), internal_config);
+
+  // "Why ==3" ?
+  // Categorical attributes always have one class reserved for
+  // "out-of-vocabulary" items. The "num_label_classes" takes into account this
+  // class. In case of binary classification, "num_label_classes" is 3 (OOB,
+  // False, True).
+  if (num_label_classes == 3) {
+    // Binary classification.
+    if (weights.empty()) {
+      LabelBinaryCategoricalOneValueBucket</*weighted=*/false>::Filler
+          label_filler(labels, weights);
+      LabelBinaryCategoricalOneValueBucket</*weighted=*/false>::Initializer
+          initializer(label_distribution);
+
+      if (sorting_strategy ==
+          proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+        const auto& sorted_attributes =
+            internal_config.preprocessing
+                ->presorted_numerical_features()[attribute_idx];
+        return ScanSplitsPresortedSparse<
+            FeatureNumericalLabelUnweightedBinaryCategoricalOneValue,
+            LabelBinaryCategoricalScoreAccumulator>(
+            internal_config.preprocessing->num_examples(), selected_examples,
+            sorted_attributes.items, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx,
+            internal_config.duplicated_selected_examples, condition,
+            &cache->cache_v2);
+      } else if (sorting_strategy ==
+                 proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+        return FindBestSplit_LabelUnweightedBinaryClassificationFeatureNumerical(
+            selected_examples, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx, condition, &cache->cache_v2);
+      } else {
+        return absl::InvalidArgumentError("Non supported strategy.");
+      }
+    } else {
+      LabelBinaryCategoricalOneValueBucket</*weighted=*/true>::Filler
+          label_filler(labels, weights);
+      LabelBinaryCategoricalOneValueBucket</*weighted=*/true>::Initializer
+          initializer(label_distribution);
+      if (sorting_strategy ==
+          proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+        const auto& sorted_attributes =
+            internal_config.preprocessing
+                ->presorted_numerical_features()[attribute_idx];
+        return ScanSplitsPresortedSparse<
+            FeatureNumericalLabelBinaryCategoricalOneValue,
+            LabelBinaryCategoricalScoreAccumulator>(
+            internal_config.preprocessing->num_examples(), selected_examples,
+            sorted_attributes.items, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx,
+            internal_config.duplicated_selected_examples, condition,
+            &cache->cache_v2);
+      } else if (sorting_strategy ==
+                 proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+        return FindBestSplit_LabelBinaryClassificationFeatureNumerical(
+            selected_examples, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx, condition, &cache->cache_v2);
+      } else {
+        return absl::InvalidArgumentError("Non supported strategy");
+      }
+    }
+  } else {
+    // Multi-class classification.
+    if (weights.empty()) {
+      LabelCategoricalOneValueBucket</*weighted=*/false>::Filler label_filler(
+          labels, weights);
+      LabelCategoricalOneValueBucket</*weighted=*/false>::Initializer
+          initializer(label_distribution);
+
+      if (sorting_strategy ==
+          proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+        const auto& sorted_attributes =
+            internal_config.preprocessing
+                ->presorted_numerical_features()[attribute_idx];
+        return ScanSplitsPresortedSparse<
+            FeatureNumericalLabelUnweightedCategoricalOneValue,
+            LabelCategoricalScoreAccumulator>(
+            internal_config.preprocessing->num_examples(), selected_examples,
+            sorted_attributes.items, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx,
+            internal_config.duplicated_selected_examples, condition,
+            &cache->cache_v2);
+      } else if (sorting_strategy ==
+                 proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+        return FindBestSplit_LabelUnweightedClassificationFeatureNumerical(
+            selected_examples, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx, condition, &cache->cache_v2);
+      } else {
+        return absl::InvalidArgumentError("Non supported strategy");
+      }
+    } else {
+      LabelCategoricalOneValueBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights);
+      LabelCategoricalOneValueBucket</*weighted=*/true>::Initializer
+          initializer(label_distribution);
+
+      if (sorting_strategy ==
+          proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+        const auto& sorted_attributes =
+            internal_config.preprocessing
+                ->presorted_numerical_features()[attribute_idx];
+        return ScanSplitsPresortedSparse<
+            FeatureNumericalLabelCategoricalOneValue,
+            LabelCategoricalScoreAccumulator>(
+            internal_config.preprocessing->num_examples(), selected_examples,
+            sorted_attributes.items, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx,
+            internal_config.duplicated_selected_examples, condition,
+            &cache->cache_v2);
+      } else if (sorting_strategy ==
+                 proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+        return FindBestSplit_LabelClassificationFeatureNumerical(
+            selected_examples, feature_filler, label_filler, initializer,
+            min_num_obs, attribute_idx, condition, &cache->cache_v2);
+      } else {
+        return absl::InvalidArgumentError("Non supported strategy");
+      }
+    }
+  }
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureDiscretizedNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    const int num_bins, const std::vector<int32_t>& labels,
+    const int32_t num_label_classes,
+    const dataset::DiscretizedNumericalIndex na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+  FeatureDiscretizedNumericalBucket::Filler feature_filler(
+      num_bins, na_replacement, attributes);
+  if (num_label_classes == 3) {
+    // Binary classification.
+    if (weights.empty()) {
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedBinaryClassificationFeatureDiscretizedNumerical(  // NOLINT(whitespace/line_length)
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelBinaryClassificationFeatureDiscretizedNumerical(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  } else {
+    // Multi-class classification.
+    if (weights.empty()) {
+      LabelCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedClassificationFeatureDiscretizedNumerical(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelClassificationFeatureDiscretizedNumerical(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureNumericalHistogram<true>(
+    absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureNumericalHistogram<false>(
+    absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureNumericalHistogram(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition) {
+  DCHECK(condition != nullptr);
+  if constexpr (weighted) {
+    DCHECK_EQ(weights.size(), labels.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+  // Determine the minimum and maximum values of the attribute.
+  float min_value, max_value;
+  if (!MinMaxNumericalAttribute(selected_examples, attributes, &min_value,
+                                &max_value)) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+
+  // There should be at least two different unique values.
+  if (min_value == max_value) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+  // Randomly select some threshold values.
+  struct CandidateSplit {
+    float threshold;
+    utils::NormalDistributionDouble pos_label_dist;
+    int64_t num_positive_examples_without_weights = 0;
+    bool operator<(const CandidateSplit& other) const {
+      return threshold < other.threshold;
+    }
+  };
+  ASSIGN_OR_RETURN(
+      const auto bins,
+      internal::GenHistogramBins(dt_config.numerical_split().type(),
+                                 dt_config.numerical_split().num_candidates(),
+                                 attributes, min_value, max_value, random));
+
+  std::vector<CandidateSplit> candidate_splits(bins.size());
+  for (int split_idx = 0; split_idx < candidate_splits.size(); split_idx++) {
+    auto& candidate_split = candidate_splits[split_idx];
+    candidate_split.threshold = bins[split_idx];
+  }
+
+  // Compute the split score of each threshold.
+  for (const auto example_idx : selected_examples) {
+    const float label = labels[example_idx];
+    float attribute = attributes[example_idx];
+    if (std::isnan(attribute)) {
+      attribute = na_replacement;
+    }
+
+    auto it_split = std::upper_bound(
+        candidate_splits.begin(), candidate_splits.end(), attribute,
+        [](const float a, const CandidateSplit& b) { return a < b.threshold; });
+    if (it_split == candidate_splits.begin()) {
+      continue;
+    }
+    --it_split;
+    it_split->num_positive_examples_without_weights++;
+    if constexpr (weighted) {
+      it_split->pos_label_dist.Add(label, weights[example_idx]);
+    } else {
+      it_split->pos_label_dist.Add(label);
+    }
+  }
+
+  for (int split_idx = candidate_splits.size() - 2; split_idx >= 0;
+       split_idx--) {
+    const auto& src = candidate_splits[split_idx + 1];
+    auto& dst = candidate_splits[split_idx];
+    dst.num_positive_examples_without_weights +=
+        src.num_positive_examples_without_weights;
+    dst.pos_label_dist.Add(src.pos_label_dist);
+  }
+
+  // Select the best threshold.
+  const double initial_variance = label_distribution.Var();
+  int best_candidate_split_idx = -1;
+  double best_variance_reduction = condition->split_score();
+  utils::NormalDistributionDouble neg_label_dist;
+  for (int candidate_split_idx = 0;
+       candidate_split_idx < candidate_splits.size(); candidate_split_idx++) {
+    const auto& candidate_split = candidate_splits[candidate_split_idx];
+    if (selected_examples.size() -
+                candidate_split.num_positive_examples_without_weights <
+            min_num_obs ||
+        candidate_split.num_positive_examples_without_weights < min_num_obs) {
+      continue;
+    }
+    neg_label_dist = label_distribution;
+    neg_label_dist.Sub(candidate_split.pos_label_dist);
+    const double frac_pos = candidate_split.pos_label_dist.NumObservations() /
+                            (candidate_split.pos_label_dist.NumObservations() +
+                             neg_label_dist.NumObservations());
+    const double final_variance =
+        frac_pos * candidate_split.pos_label_dist.Var() +
+        (1 - frac_pos) * neg_label_dist.Var();
+    const double variance_reduction = initial_variance - final_variance;
+    if (variance_reduction > best_variance_reduction) {
+      best_variance_reduction = variance_reduction;
+      best_candidate_split_idx = candidate_split_idx;
+    }
+  }
+
+  if (best_candidate_split_idx == -1) {
+    return SplitSearchResult::kNoBetterSplitFound;
+  } else {
+    const auto& candidate_split = candidate_splits[best_candidate_split_idx];
+    condition->set_split_score(best_variance_reduction);
+    condition->mutable_condition()->mutable_higher_condition()->set_threshold(
+        candidate_split.threshold);
+    condition->set_attribute(attribute_idx);
+    condition->set_num_training_examples_without_weight(
+        selected_examples.size());
+    condition->set_num_training_examples_with_weight(
+        candidate_split.pos_label_dist.NumObservations() +
+        neg_label_dist.NumObservations());
+    condition->set_num_pos_training_examples_without_weight(
+        candidate_split.num_positive_examples_without_weights);
+    condition->set_num_pos_training_examples_with_weight(
+        candidate_split.pos_label_dist.NumObservations());
+    condition->set_na_value(na_replacement >= candidate_split.threshold);
+    return SplitSearchResult::kBetterSplitFound;
+  }
+}
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    float na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, const int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+
+  const auto sorting_strategy =
+      EffectiveStrategy(dt_config, selected_examples.size(), internal_config);
+
+  FeatureNumericalBucket::Filler feature_filler(selected_examples.size(),
+                                                na_replacement, attributes);
+
+  typename LabelHessianNumericalOneValueBucket<weighted>::Filler label_filler(
+      gradients, hessians, weights);
+
+  typename LabelHessianNumericalOneValueBucket<weighted>::Initializer
+      initializer(sum_gradient, sum_hessian, sum_weights,
+                  internal_config.hessian_l1,
+                  internal_config.hessian_l2_numerical,
+                  dt_config.internal().hessian_split_score_subtract_parent(),
+                  monotonic_direction, constraints);
+
+  if (sorting_strategy ==
+      proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+    const auto& sorted_attributes =
+        internal_config.preprocessing
+            ->presorted_numerical_features()[attribute_idx];
+    return ScanSplitsPresortedSparse<
+        FeatureNumericalLabelHessianNumericalOneValue<weighted>,
+        LabelHessianNumericalScoreAccumulator>(
+        internal_config.preprocessing->num_examples(), selected_examples,
+        sorted_attributes.items, feature_filler, label_filler, initializer,
+        min_num_obs, attribute_idx,
+        internal_config.duplicated_selected_examples, condition,
+        &cache->cache_v2);
+  } else if (sorting_strategy ==
+             proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+    return FindBestSplit_LabelHessianRegressionFeatureNumerical<weighted>(
+        selected_examples, feature_filler, label_filler, initializer,
+        min_num_obs, attribute_idx, condition, &cache->cache_v2);
+  } else {
+    return absl::InvalidArgumentError("Non supported strategy");
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureNumericalCart<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    float na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureNumericalCart<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    float na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureDiscretizedNumericalCart<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    int num_bins, const std::vector<float>& gradients,
+    const std::vector<float>& hessians, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureDiscretizedNumericalCart<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    int num_bins, const std::vector<float>& gradients,
+    const std::vector<float>& hessians, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureDiscretizedNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    int num_bins, const std::vector<float>& gradients,
+    const std::vector<float>& hessians, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, double sum_gradient,
+    double sum_hessian, double sum_weights, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, int8_t monotonic_direction,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  FeatureDiscretizedNumericalBucket::Filler feature_filler(
+      num_bins, na_replacement, attributes);
+
+  typename LabelHessianNumericalBucket<weighted>::Filler label_filler(
+      gradients, hessians, weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical);
+
+  typename LabelHessianNumericalBucket<weighted>::Initializer initializer(
+      sum_gradient, sum_hessian, sum_weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical,
+      dt_config.internal().hessian_split_score_subtract_parent(),
+      monotonic_direction, constraints);
+
+  return FindBestSplit_LabelHessianRegressionFeatureDiscretizedNumerical<
+      weighted>(selected_examples, feature_filler, label_filler, initializer,
+                min_num_obs, attribute_idx, condition, &cache->cache_v2);
+}
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult> FindSplitLabelRegressionFeatureNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, const InternalTrainConfig& internal_config,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+
+  const auto sorting_strategy =
+      EffectiveStrategy(dt_config, selected_examples.size(), internal_config);
+
+  FeatureNumericalBucket::Filler feature_filler(selected_examples.size(),
+                                                na_replacement, attributes);
+
+  typename LabelNumericalOneValueBucket<weighted>::Filler label_filler(labels,
+                                                                       weights);
+
+  typename LabelNumericalOneValueBucket<weighted>::Initializer initializer(
+      label_distribution);
+
+  if (sorting_strategy ==
+      proto::DecisionTreeTrainingConfig::Internal::FORCE_PRESORTED) {
+    const auto& sorted_attributes =
+        internal_config.preprocessing
+            ->presorted_numerical_features()[attribute_idx];
+    return ScanSplitsPresortedSparse<
+        FeatureNumericalLabelNumericalOneValue<weighted>,
+        LabelNumericalScoreAccumulator>(
+        internal_config.preprocessing->num_examples(), selected_examples,
+        sorted_attributes.items, feature_filler, label_filler, initializer,
+        min_num_obs, attribute_idx,
+        internal_config.duplicated_selected_examples, condition,
+        &cache->cache_v2);
+  } else if (sorting_strategy ==
+             proto::DecisionTreeTrainingConfig::Internal::IN_NODE) {
+    return FindBestSplit_LabelRegressionFeatureNumerical<weighted>(
+        selected_examples, feature_filler, label_filler, initializer,
+        min_num_obs, attribute_idx, condition, &cache->cache_v2);
+  } else {
+    return absl::InvalidArgumentError("Non supported strategy");
+  }
+}
+
+absl::StatusOr<SplitStats> EvaluateGreaterThanSplitOnLabelRegression(
+    const UnsignedExampleIdx num_examples,
+    const absl::Span<const float> attributes, const std::vector<float>& labels,
+    const std::vector<float>& weights,
+    const utils::NormalDistributionDouble& label_distribution,
+    const UnsignedExampleIdx min_num_obs, const float threshold,
+    SplitterPerThreadCache* cache) {
+  if (weights.empty()) {
+    typename LabelNumericalOneValueBucket<false>::Filler label_filler(labels,
+                                                                      weights);
+    typename LabelNumericalOneValueBucket<false>::Initializer initializer(
+        label_distribution);
+
+    return EvalSplit_LabelRegressionFeatureNumerical<false>(
+        num_examples, attributes, label_filler, initializer, min_num_obs,
+        threshold, &cache->cache_v2);
+  } else {
+    typename LabelNumericalOneValueBucket<true>::Filler label_filler(labels,
+                                                                     weights);
+    typename LabelNumericalOneValueBucket<true>::Initializer initializer(
+        label_distribution);
+
+    return EvalSplit_LabelRegressionFeatureNumerical<true>(
+        num_examples, attributes, label_filler, initializer, min_num_obs,
+        threshold, &cache->cache_v2);
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureNumericalCart<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, const InternalTrainConfig& internal_config,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureNumericalCart<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const std::vector<float>& labels, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, const InternalTrainConfig& internal_config,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureDiscretizedNumericalCart<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    const int num_bins, const std::vector<float>& labels,
+    const dataset::DiscretizedNumericalIndex na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureDiscretizedNumericalCart<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    const int num_bins, const std::vector<float>& labels,
+    const dataset::DiscretizedNumericalIndex na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureDiscretizedNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const std::vector<dataset::DiscretizedNumericalIndex>& attributes,
+    const int num_bins, const std::vector<float>& labels,
+    const dataset::DiscretizedNumericalIndex na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  FeatureDiscretizedNumericalBucket::Filler feature_filler(
+      num_bins, na_replacement, attributes);
+
+  typename LabelNumericalBucket<weighted>::Filler label_filler(labels, weights);
+
+  typename LabelNumericalBucket<weighted>::Initializer initializer(
+      label_distribution);
+
+  return FindBestSplit_LabelRegressionFeatureDiscretizedNumerical<weighted>(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+absl::StatusOr<SplitSearchResult> FindSplitLabelClassificationFeatureNA(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::AbstractColumn* attributes,
+    const std::vector<int32_t>& labels, const int32_t num_label_classes,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+  FeatureIsMissingBucket::Filler feature_filler(attributes);
+  if (num_label_classes == 3) {
+    // Binary classification.
+    if (weights.empty()) {
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, {}, label_distribution);
+
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedBinaryClassificationFeatureNACart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelBinaryClassificationFeatureNACart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  } else {
+    // Multi-class classification.
+    if (weights.empty()) {
+      LabelCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedClassificationFeatureNACart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+      LabelCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelClassificationFeatureNACart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureNA<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::AbstractColumn* attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureNA<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::AbstractColumn* attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult> FindSplitLabelHessianRegressionFeatureNA(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::AbstractColumn* attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  FeatureIsMissingBucket::Filler feature_filler(attributes);
+
+  typename LabelHessianNumericalBucket<weighted>::Filler label_filler(
+      gradients, hessians, weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical);
+
+  typename LabelHessianNumericalBucket<weighted>::Initializer initializer(
+      sum_gradient, sum_hessian, sum_weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical,
+      dt_config.internal().hessian_split_score_subtract_parent(),
+      /*monotonic_direction=*/0, constraints);
+
+  return FindBestSplit_LabelHessianRegressionFeatureNACart<weighted>(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+absl::StatusOr<SplitSearchResult> FindSplitLabelClassificationFeatureBoolean(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<int32_t>& labels, const int32_t num_label_classes,
+    bool na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForBooleanAttribute(selected_examples, weights, attributes,
+                                       &na_replacement);
+  }
+
+  FeatureBooleanBucket::Filler feature_filler(na_replacement, attributes);
+
+  if (num_label_classes == 3) {
+    // Binary classification.
+    if (weights.empty()) {
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, {}, label_distribution);
+
+      LabelBinaryCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedBinaryClassificationFeatureBooleanCart(  // NOLINT(whitespace/line_length)
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+
+      LabelBinaryCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelBinaryClassificationFeatureBooleanCart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  } else {
+    // Multi-class classification.
+    if (weights.empty()) {
+      LabelCategoricalBucket</*weighted=*/false>::Filler label_filler(
+          labels, weights, label_distribution);
+
+      LabelCategoricalBucket</*weighted=*/false>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelUnweightedClassificationFeatureBooleanCart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    } else {
+      LabelCategoricalBucket</*weighted=*/true>::Filler label_filler(
+          labels, weights, label_distribution);
+
+      LabelCategoricalBucket</*weighted=*/true>::Initializer initializer(
+          label_distribution);
+
+      return FindBestSplit_LabelClassificationFeatureBooleanCart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+    }
+  }
+}
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult> FindSplitLabelRegressionFeatureBoolean(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& labels, bool na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForBooleanAttribute(selected_examples, weights, attributes,
+                                       &na_replacement);
+  }
+
+  FeatureBooleanBucket::Filler feature_filler(na_replacement, attributes);
+  typename LabelNumericalBucket<weighted>::Filler label_filler(labels, weights);
+  typename LabelNumericalBucket<weighted>::Initializer initializer(
+      label_distribution);
+
+  return FindBestSplit_LabelRegressionFeatureBooleanCart<weighted>(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureBoolean<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& labels, bool na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureBoolean<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& labels, bool na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureBoolean<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    bool na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureBoolean<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    bool na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult> FindSplitLabelHessianRegressionFeatureBoolean(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int8_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    bool na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForBooleanAttribute(selected_examples, weights, attributes,
+                                       &na_replacement);
+  }
+
+  FeatureBooleanBucket::Filler feature_filler(na_replacement, attributes);
+  typename LabelHessianNumericalBucket<weighted>::Filler label_filler(
+      gradients, hessians, weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical);
+
+  typename LabelHessianNumericalBucket<weighted>::Initializer initializer(
+      sum_gradient, sum_hessian, sum_weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_numerical,
+      dt_config.internal().hessian_split_score_subtract_parent(),
+      /*monotonic_direction=*/0, constraints);
+
+  return FindBestSplit_LabelHessianRegressionFeatureBooleanCart<weighted>(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureCategorical<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const int32_t num_attribute_classes, int32_t na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureCategorical<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const int32_t num_attribute_classes, int32_t na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelHessianRegressionFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& gradients, const std::vector<float>& hessians,
+    const int32_t num_attribute_classes, int32_t na_replacement,
+    const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const double sum_gradient, const double sum_hessian,
+    const double sum_weights, const int32_t attribute_idx,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForCategoricalAttribute(selected_examples, weights,
+                                           attributes, num_attribute_classes,
+                                           &na_replacement);
+  }
+
+  FeatureCategoricalBucket::Filler feature_filler(num_attribute_classes,
+                                                  na_replacement, attributes);
+  typename LabelHessianNumericalBucket<weighted>::Filler label_filler(
+      gradients, hessians, weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_categorical);
+
+  typename LabelHessianNumericalBucket<weighted>::Initializer initializer(
+      sum_gradient, sum_hessian, sum_weights, internal_config.hessian_l1,
+      internal_config.hessian_l2_categorical,
+      dt_config.internal().hessian_split_score_subtract_parent(),
+      /*monotonic_direction=*/0, constraints);
+
+  const auto algorithm =
+      (num_attribute_classes < dt_config.categorical().arity_limit_for_random())
+          ? dt_config.categorical().algorithm_case()
+          : proto::Categorical::kRandom;
+
+  switch (algorithm) {
+    case proto::Categorical::ALGORITHM_NOT_SET:
+    case proto::Categorical::kCart:
+      return FindBestSplit_LabelHessianRegressionFeatureCategoricalCart<
+          weighted>(selected_examples, feature_filler, label_filler,
+                    initializer, min_num_obs, attribute_idx, condition,
+                    &cache->cache_v2);
+
+    case proto::Categorical::kRandom:
+      return FindBestSplit_LabelHessianRegressionFeatureCategoricalRandom<
+          weighted>(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx,
+          NumTrialsForRandomCategoricalSplit(dt_config.categorical().random()),
+          condition, &cache->cache_v2, random);
+
+    default:
+      return absl::InvalidArgumentError("Non supported");
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureCategorical<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& labels, const int32_t num_attribute_classes,
+    int32_t na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureCategorical<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& labels, const int32_t num_attribute_classes,
+    int32_t na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult> FindSplitLabelRegressionFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<float>& labels, const int32_t num_attribute_classes,
+    int32_t na_replacement, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random) {
+  if constexpr (weighted) {
+    DCHECK_GE(weights.size(), selected_examples.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForCategoricalAttribute(selected_examples, weights,
+                                           attributes, num_attribute_classes,
+                                           &na_replacement);
+  }
+
+  FeatureCategoricalBucket::Filler feature_filler(num_attribute_classes,
+                                                  na_replacement, attributes);
+  typename LabelNumericalBucket<weighted>::Filler label_filler(labels, weights);
+
+  typename LabelNumericalBucket<weighted>::Initializer initializer(
+      label_distribution);
+
+  const auto algorithm =
+      (num_attribute_classes < dt_config.categorical().arity_limit_for_random())
+          ? dt_config.categorical().algorithm_case()
+          : proto::Categorical::kRandom;
+
+  switch (algorithm) {
+    case proto::Categorical::ALGORITHM_NOT_SET:
+    case proto::Categorical::kCart:
+      return FindBestSplit_LabelRegressionFeatureCategoricalCart<weighted>(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+
+    case proto::Categorical::kRandom:
+      return FindBestSplit_LabelRegressionFeatureCategoricalRandom<weighted>(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx,
+          NumTrialsForRandomCategoricalSplit(dt_config.categorical().random()),
+          condition, &cache->cache_v2, random);
+
+    default:
+      return absl::InvalidArgumentError("Non supported");
+  }
+}
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureCategoricalSetGreedyForward(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<int32_t>& labels, const int32_t num_attribute_classes,
+    const int32_t num_label_classes, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    utils::RandomEngine* random) {
+  // TODO: `min_num_obs`is currently ignored.
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+
+  const int max_iterations =
+      dt_config.categorical_set_greedy_forward().max_selected_items();
+  // Bitmap of available attribute values. During the course of the algorithm,
+  // an attribute value is available if:
+  //  - It is selected by the initial random sampling of candidate attribute
+  //  values.
+  //  - It is not (yet) selected in the positive set.
+  //  - It is not pure in the negative examples i.e. it is not present in all
+  //  or in none of the non-selected examples (ps: Initially, all the examples
+  //  are non-selected).
+  std::vector<bool> candidate_attributes_bitmap(num_attribute_classes, true);
+  // The "positive attribute set" are the attribute values that, if present
+  // in the example, evaluates the node condition as true.
+  std::vector<int> positive_attributes_vector;
+  // Bitmap of the example that are already in the positive set i.e. for which
+  // the condition defined by "positive_attributes_vector" is positive.
+  // Instead of being indexed by the example_idx, this bitmap is indexed by
+  // "selected_examples" i.e. "positive_selected_example_bitmap[i]==true"
+  // means that "selected_examples[i]" is selected.
+  std::vector<bool> positive_selected_example_bitmap(selected_examples.size(),
+                                                     false);
+  // Weighted and non weighted distribution of the labels in the positive and
+  // negative sets.
+  utils::BinaryToIntegerConfusionMatrixDouble split_label_distribution;
+  utils::BinaryToIntegerConfusionMatrixInt64
+      split_label_distribution_no_weights;
+  split_label_distribution.SetNumClassesIntDim(num_label_classes);
+  split_label_distribution_no_weights.SetNumClassesIntDim(num_label_classes);
+  // All the examples are initially in the negative set.
+  *split_label_distribution.mutable_neg() = label_distribution;
+  // Number of example (with weights) where the attribute value (an attribute
+  // value is a set of categorical items) that contains the i-th  categorical
+  // items.
+  std::vector<int64_t> count_examples_without_weights_by_attribute_class(
+      num_attribute_classes);
+  // Count per categorical item value.
+  const auto& attribute_values = attributes.values();
+  const auto& attribute_bank = attributes.bank();
+  for (const auto example_idx : selected_examples) {
+    for (auto bank_idx = attribute_values[example_idx].first;
+         bank_idx < attribute_values[example_idx].second; bank_idx++) {
+      const auto value = attribute_bank[bank_idx];
+      count_examples_without_weights_by_attribute_class[value]++;
+    }
+    split_label_distribution_no_weights.Add(false, labels[example_idx]);
+  }
+  // Sample-out items.
+  // TODO: Add proper support for candidate_attributes_list.
+  std::vector<int> candidate_attributes_list;
+  candidate_attributes_list.reserve(num_attribute_classes);
+  if (!internal::
+          MaskPureSampledOrPrunedAttributeValuesForCategoricalSetGreedySelection(
+              dt_config, num_attribute_classes, selected_examples,
+              count_examples_without_weights_by_attribute_class,
+              &candidate_attributes_bitmap, &candidate_attributes_list,
+              random)) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+
+  // TODO: Cache this variable.
+  auto per_attribute_value_distributions =
+      InitializeClassificationAttributeDistributions<weighted>(
+          selected_examples, labels, weights, attribute_values, attribute_bank,
+          label_distribution, candidate_attributes_bitmap);
+
+  // Contains, for each example, the index in the "attribute_bank"
+  // corresponding to the next candidate attribute value
+  // "candidate_attr_value".
+  //
+  // When initialized, this corresponds to the index of the first values for
+  // this particular example: i.e. running_attr_bank_idx[select_idx] ==
+  // attribute_values[selected_examples[select_idx]].first.
+  std::vector<UnsignedExampleIdx> running_attr_bank_idx(
+      selected_examples.size());
+
+  const double initial_entropy = split_label_distribution.InitEntropy();
+  // Information gain of the current condition i.e.
+  // "positive_attributes_vector".
+  double information_gain = 0;
+  while (true) {
+    double best_information_gain = information_gain;
+    int best_attr_value = -1;
+    for (int attr_idx = 0; attr_idx < num_attribute_classes; ++attr_idx) {
+      if (!candidate_attributes_bitmap[attr_idx]) {
+        continue;
+      }
+      const auto& cur_attr_value_dist =
+          per_attribute_value_distributions[attr_idx];
+      if (cur_attr_value_dist.neg().NumObservations() == 0) {
+        candidate_attributes_bitmap[attr_idx] = false;
+        continue;
+      }
+      double candidate_information_gain =
+          initial_entropy - cur_attr_value_dist.FinalEntropy();
+      if (candidate_information_gain > best_information_gain) {
+        // Best score so far.
+        best_information_gain = candidate_information_gain;
+        best_attr_value = attr_idx;
+      }
+    }
+    if (best_attr_value == -1) {
+      // No attribute value improves the current state.
+      break;
+    }
+    // Fix the attribute value found to be for the positive side.
+    positive_attributes_vector.push_back(best_attr_value);
+    information_gain = best_information_gain;
+    // Update the attribute value distributions.
+    for (size_t select_idx = 0; select_idx < selected_examples.size();
+         select_idx++) {
+      // Does this example already belong to a side?
+      if (positive_selected_example_bitmap[select_idx]) {
+        continue;
+      }
+      const auto example_idx = selected_examples[select_idx];
+      const auto attr_values_range = attribute_values[example_idx];
+      // Check if the attribute is missing.
+      if (attr_values_range.first > attr_values_range.second) {
+        continue;
+      }
+      // Since second >= first, this is reasonable even if both are unsigned.
+      const auto attr_values_list_size =
+          attr_values_range.second - attr_values_range.first;
+      bool match;
+      // Profiling shows that std::binary_search is quite slow for small ranges,
+      // common for CatSet splits. The threshold 100 has not been optimized.
+      constexpr int binary_search_threshold = 100;
+      if (attr_values_list_size <= binary_search_threshold) {
+        // Linear search.
+        match = std::find(attribute_bank.begin() + attr_values_range.first,
+                          attribute_bank.begin() + attr_values_range.second,
+                          best_attr_value) !=
+                attribute_bank.begin() + attr_values_range.second;
+      } else {
+        match = std::binary_search(
+            attribute_bank.begin() + attr_values_range.first,
+            attribute_bank.begin() + attr_values_range.second, best_attr_value);
+      }
+      if (!match) {
+        // The example does not contain `best_attr_value` and therefore does not
+        // change side in any distribution.
+        continue;
+      }
+      const auto label = labels[example_idx];
+      positive_selected_example_bitmap[select_idx] = true;
+      // Update the distribution of the result.
+      if constexpr (weighted) {
+        const auto weight = weights[example_idx];
+        split_label_distribution.mutable_pos()->Add(label, weight);
+        split_label_distribution.mutable_neg()->Sub(label, weight);
+      } else {
+        split_label_distribution.mutable_pos()->Add(label);
+        split_label_distribution.mutable_neg()->Sub(label);
+      }
+      split_label_distribution_no_weights.mutable_pos()->Add(label);
+      split_label_distribution_no_weights.mutable_neg()->Sub(label);
+      candidate_attributes_bitmap[best_attr_value] = false;
+
+      const auto attr_bank_begin =
+          attribute_bank.begin() + attribute_values[example_idx].first;
+      const auto attr_bank_end =
+          attribute_bank.begin() + attribute_values[example_idx].second;
+      auto current_attr_bank_iter = attr_bank_begin;
+
+      // Update the distributions of the other attribute values: Since the
+      // current example has been moved irrevocably to the positive side of
+      // the result, it has to be moved to the positive of every attribute
+      // value distribution. For the attribute values present in this example,
+      // this is already the case. Find the remaining ones and move it for
+      // them as well.
+      // attr_bank is sorted, so moving with two pointers ensures that this
+      // loop is linear in num_attribute_classes.
+      for (int current_attr_val = 0; current_attr_val < num_attribute_classes;
+           ++current_attr_val) {
+        if (!candidate_attributes_bitmap[current_attr_val]) {
+          // This attribute is already selected in the mask.
+          continue;
+        }
+        while (current_attr_bank_iter != attr_bank_end &&
+               *current_attr_bank_iter < current_attr_val) {
+          ++current_attr_bank_iter;
+        }
+        bool current_attr_val_is_in_bank =
+            (current_attr_bank_iter != attr_bank_end &&
+             *current_attr_bank_iter == current_attr_val);
+
+        if (current_attr_val_is_in_bank) {
+          // The value is already on the positive side.
+          continue;
+        }
+        auto& cur_split_stats =
+            per_attribute_value_distributions[current_attr_val];
+        if constexpr (weighted) {
+          const auto weight = weights[example_idx];
+          cur_split_stats.mutable_pos()->Add(label, weight);
+          cur_split_stats.mutable_neg()->Sub(label, weight);
+        } else {
+          cur_split_stats.mutable_pos()->Add(label);
+          cur_split_stats.mutable_neg()->Sub(label);
+        }
+      }
+    }
+    // If the maximum number of iterations is reached, stop.
+    if (max_iterations > 0 &&
+        positive_attributes_vector.size() >= max_iterations) {
+      break;
+    }
+  }
+
+  if (information_gain > condition->split_score()) {
+    condition->set_na_value(false);
+    SetConditionHelper(information_gain, attribute_idx,
+                       split_label_distribution,
+                       split_label_distribution_no_weights, condition);
+    // Assign the positive set to the condition.
+    std::sort(positive_attributes_vector.begin(),
+              positive_attributes_vector.end());
+    SetPositiveAttributeSetOfCategoricalContainsCondition(
+        positive_attributes_vector, num_attribute_classes, condition);
+    return SplitSearchResult::kBetterSplitFound;
+  } else {
+    return SplitSearchResult::kNoBetterSplitFound;
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureCategoricalSetGreedyForward<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<int32_t>& labels, const int32_t num_attribute_classes,
+    const int32_t num_label_classes, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    utils::RandomEngine* random);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureCategoricalSetGreedyForward<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<int32_t>& labels, const int32_t num_attribute_classes,
+    const int32_t num_label_classes, const UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    const int32_t attribute_idx, proto::NodeCondition* condition,
+    utils::RandomEngine* random);
+
+template <bool weighted>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureCategoricalSetGreedyForward(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<float>& labels, int32_t num_attribute_classes,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random) {
+  // TODO: `min_num_obs`is currently ignored.
+  if constexpr (weighted) {
+    DCHECK_EQ(weights.size(), labels.size());
+  } else {
+    DCHECK(weights.empty());
+  }
+
+  const int max_iterations =
+      dt_config.categorical_set_greedy_forward().max_selected_items();
+  // Bitmap of available attribute values. During the course of the algorithm,
+  // an attribute value is available if:
+  //  - It is selected by the initial random sampling of candidate attribute
+  //  values.
+  //  - It is not (yet) selected in the positive set.
+  //  - It is not pure in the negative examples i.e. it is not present in all
+  //  or in none of the non-selected examples (ps: Initially, all the examples
+  //  are non-selected).
+  //
+  // To maximize performance, candidate attributes are both stored as a flat
+  // list (for quick iteration) and as a bitmap (for quick indexing).
+  std::vector<bool>& candidate_attributes_bitmap =
+      cache->catset_candidate_attributes_bitmap;
+  candidate_attributes_bitmap.assign(num_attribute_classes, true);
+  std::vector<int>& candidate_attributes_list =
+      cache->catset_candidate_attributes_list;
+  candidate_attributes_list.clear();
+  // This vector stores the attributes that make up the eventual split condition
+  // found by this function. The vector is sorted and does not contain
+  // duplicates.
+  std::vector<int>& positive_attributes_vector =
+      cache->catset_positive_attributes_vector;
+  positive_attributes_vector.clear();
+  // Bitmap of the examples that are already in the positive set i.e. for which
+  // the condition defined by "positive_attributes_vector" is positive.
+  // Instead of being indexed by the example_idx, this bitmap is indexed by
+  // "selected_examples" i.e. "positive_selected_example_bitmap[i]==true"
+  // means that "selected_examples[i]" is selected.
+  std::vector<bool>& positive_selected_example_bitmap =
+      cache->catset_positive_selected_example_bitmap;
+  positive_selected_example_bitmap.assign(selected_examples.size(), false);
+
+  // Weighted and non weighted distribution of the labels in the positive and
+  // negative sets.
+  utils::BinaryToNormalDistributionDouble split_label_distribution;
+  utils::BinaryToNormalDistributionDouble split_label_distribution_no_weights;
+  // All the examples are initially in the negative set.
+  *split_label_distribution.mutable_neg() = label_distribution;
+  // Number of examples (with weights) where the attribute value (an attribute
+  // value is a set of categorical items) that contains the i-th  categorical
+  // items.
+  std::vector<int64_t>& count_examples_without_weights_by_attribute_class =
+      cache->catset_count_examples_without_weights_by_attribute_class;
+  count_examples_without_weights_by_attribute_class.assign(
+      num_attribute_classes, 0);
+
+  // Count per categorical item value.
+  const auto& attribute_values = attributes.values();
+  const auto& attribute_bank = attributes.bank();
+  for (const auto example_idx : selected_examples) {
+    for (auto bank_idx = attribute_values[example_idx].first;
+         bank_idx < attribute_values[example_idx].second; bank_idx++) {
+      const auto value = attribute_bank[bank_idx];
+      count_examples_without_weights_by_attribute_class[value]++;
+    }
+    split_label_distribution_no_weights.Add(false, labels[example_idx]);
+  }
+
+  // Sample-out items.
+  if (!internal::
+          MaskPureSampledOrPrunedAttributeValuesForCategoricalSetGreedySelection(
+              dt_config, num_attribute_classes, selected_examples,
+              count_examples_without_weights_by_attribute_class,
+              &candidate_attributes_bitmap, &candidate_attributes_list,
+              random)) {
+    return SplitSearchResult::kInvalidAttribute;
+  }
+
+  // For each attribute value, store the uncommitted examples.
+  // Note that examples_by_candidate stores the indices in selected_examples.
+  std::vector<std::vector<UnsignedExampleIdx>>& examples_by_candidate =
+      cache->catset_examples_by_candidate;
+  if (examples_by_candidate.size() < num_attribute_classes) {
+    examples_by_candidate.resize(num_attribute_classes);
+  }
+  for (const auto attr_idx : candidate_attributes_list) {
+    examples_by_candidate[attr_idx].clear();
+    examples_by_candidate[attr_idx].reserve(
+        count_examples_without_weights_by_attribute_class[attr_idx]);
+  }
+  for (size_t select_idx = 0; select_idx < selected_examples.size();
+       select_idx++) {
+    const auto example_idx = selected_examples[select_idx];
+    const auto attr_values_range = attribute_values[example_idx];
+    for (auto bank_idx = attr_values_range.first;
+         bank_idx < attr_values_range.second; ++bank_idx) {
+      const int value = attribute_bank[bank_idx];
+      if (candidate_attributes_bitmap[value]) {
+        examples_by_candidate[value].push_back(select_idx);
+      }
+    }
+  }
+
+  std::vector<utils::BinaryToNormalDistributionDouble>&
+      per_attribute_value_distributions =
+          cache->catset_attribute_distributions_regression;
+  InitializeRegressionAttributeDistributions<weighted>(
+      selected_examples, labels, weights, label_distribution,
+      candidate_attributes_list, examples_by_candidate,
+      &per_attribute_value_distributions);
+
+  const double initial_variance = label_distribution.Var();
+
+  // Variance reduction of the current condition i.e.
+  // "positive_attributes_vector".
+  double variance_reduction = 0.0;
+
+  std::vector<utils::NormalDistributionDouble>&
+      stats_examples_containing_attr_value =
+          cache->catset_stats_examples_containing_attr_value;
+  stats_examples_containing_attr_value.assign(
+      num_attribute_classes, utils::NormalDistributionDouble());
+
+  while (true) {
+    // Find which attribute value currently achieves the best variance
+    // reduction.
+    double best_variance_reduction = variance_reduction;
+    int best_attr_value = -1;
+    int best_active_candidate_idx = -1;
+
+    // Note: This loop modifies candidate_attributes_list.
+    for (size_t candidate_attr_idx = 0;
+         candidate_attr_idx < candidate_attributes_list.size();) {
+      const int attr_idx = candidate_attributes_list[candidate_attr_idx];
+      const auto& cur_attr_value_dist =
+          per_attribute_value_distributions[attr_idx];
+      if (cur_attr_value_dist.neg().NumObservations() == 0) {
+        candidate_attributes_bitmap[attr_idx] = false;
+        // Quick delete: Move the last item to position `candidate_attr_idx`
+        // (destroying its current contents), then remove the end. Don't
+        // increment `candidate_attr_idx`, since there's a new element at this
+        // position now.
+        candidate_attributes_list[candidate_attr_idx] =
+            candidate_attributes_list.back();
+        candidate_attributes_list.pop_back();
+        continue;
+      }
+      double candidate_variance_reduction =
+          initial_variance - cur_attr_value_dist.FinalVariance();
+      if (candidate_variance_reduction > best_variance_reduction) {
+        best_variance_reduction = candidate_variance_reduction;
+        best_attr_value = attr_idx;
+        best_active_candidate_idx = candidate_attr_idx;
+      }
+      // No deletion happened, move to the next element.
+      candidate_attr_idx++;
+    }
+    if (best_attr_value == -1) {
+      // No attribute value improves the current state. Stop the search.
+      break;
+    }
+    // Move best_attr_value permanently to the positive side.
+    positive_attributes_vector.push_back(best_attr_value);
+    variance_reduction = best_variance_reduction;
+    candidate_attributes_bitmap[best_attr_value] = false;
+    candidate_attributes_list[best_active_candidate_idx] =
+        candidate_attributes_list.back();
+    candidate_attributes_list.pop_back();
+
+    // Track total statistics of all examples moving to the positive side this
+    // iteration.
+    utils::NormalDistributionDouble moved_example_stats_total;
+    for (const auto select_idx : examples_by_candidate[best_attr_value]) {
+      // Does this example already belong to a side?
+      if (positive_selected_example_bitmap[select_idx]) {
+        continue;
+      }
+      positive_selected_example_bitmap[select_idx] = true;
+      const auto example_idx = selected_examples[select_idx];
+      const auto label = labels[example_idx];
+
+      // Update the result distribution and the distribution of moved examples.
+      if constexpr (weighted) {
+        const auto weight = weights[example_idx];
+        split_label_distribution.mutable_pos()->Add(label, weight);
+        split_label_distribution.mutable_neg()->Sub(label, weight);
+        moved_example_stats_total.Add(label, weight);
+      } else {
+        split_label_distribution.mutable_pos()->Add(label);
+        split_label_distribution.mutable_neg()->Sub(label);
+        moved_example_stats_total.Add(label);
+      }
+      split_label_distribution_no_weights.mutable_pos()->Add(label);
+      split_label_distribution_no_weights.mutable_neg()->Sub(label);
+
+      // For all attribute values of the current example, move the current
+      // example to the positive side.
+      const auto attr_values_range = attribute_values[example_idx];
+      for (auto bank_idx = attr_values_range.first;
+           bank_idx < attr_values_range.second; ++bank_idx) {
+        const int current_attr_val = attribute_bank[bank_idx];
+        if (candidate_attributes_bitmap[current_attr_val]) {
+          if constexpr (weighted) {
+            stats_examples_containing_attr_value[current_attr_val].Add(
+                label, weights[example_idx]);
+          } else {
+            stats_examples_containing_attr_value[current_attr_val].Add(label);
+          }
+        }
+      }
+    }
+
+    // At this point, we have identified the set S of examples that moved to the
+    // positive side. We know the total (label) distribution of S and, for each
+    // individual attribute i, the distribution of S_i, the set of examples in S
+    // containing attribute i.
+    //
+    // For any attribute i, stats_examples_containing_attr_value[i] stores the
+    // full distribution **if i was moved to the positive side**, i.e. with all
+    // examples containing i on the positive side. To update this, we need to
+    // move every example that has been moved by the current change **and does
+    // not contain i** (otherwise it's already on the positive side) and  to
+    // the positive side of stats_examples_containing_attr_value[i]. In other
+    // words, the net update is S \ S_i.
+    if (moved_example_stats_total.NumObservations() > 0) {
+      // Apply batched complement updates to remaining active candidates
+      for (const int attr_idx : candidate_attributes_list) {
+        auto& cur_split_stats = per_attribute_value_distributions[attr_idx];
+
+        // Net stats of moved examples missing attr_idx is: Total Moved - Moved
+        // Containing attr_idx.
+        utils::NormalDistributionDouble net_update = moved_example_stats_total;
+        net_update.Sub(stats_examples_containing_attr_value[attr_idx]);
+
+        cur_split_stats.mutable_pos()->Add(net_update);
+        cur_split_stats.mutable_neg()->Sub(net_update);
+
+        // Reset the stats accumulators.
+        stats_examples_containing_attr_value[attr_idx] =
+            utils::NormalDistributionDouble();
+      }
+    }
+
+    if (max_iterations > 0 &&
+        positive_attributes_vector.size() >= max_iterations) {
+      break;
+    }
+  }
+
+  if (variance_reduction > condition->split_score()) {
+    condition->set_na_value(false);
+    SetConditionHelper(variance_reduction, attribute_idx,
+                       split_label_distribution,
+                       split_label_distribution_no_weights, condition);
+    // Assign the positive set to the condition.
+    std::sort(positive_attributes_vector.begin(),
+              positive_attributes_vector.end());
+    SetPositiveAttributeSetOfCategoricalContainsCondition(
+        positive_attributes_vector, num_attribute_classes, condition);
+    return SplitSearchResult::kBetterSplitFound;
+  } else {
+    return SplitSearchResult::kNoBetterSplitFound;
+  }
+}
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureCategoricalSetGreedyForward<true>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<float>& labels, int32_t num_attribute_classes,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template absl::StatusOr<SplitSearchResult>
+FindSplitLabelRegressionFeatureCategoricalSetGreedyForward<false>(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights,
+    const dataset::VerticalDataset::CategoricalSetColumn& attributes,
+    const std::vector<float>& labels, int32_t num_attribute_classes,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::NormalDistributionDouble& label_distribution,
+    int32_t attribute_idx, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random);
+
+template <typename LabelBucket, typename ExampleBucketSet,
+          typename LabelScoreAccumulator>
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<int32_t>& labels, int32_t num_attribute_classes,
+    int32_t num_label_classes, int32_t na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  FeatureCategoricalBucket::Filler feature_filler(num_attribute_classes,
+                                                  na_replacement, attributes);
+  typename LabelBucket::Filler label_filler(labels, weights,
+                                            label_distribution);
+
+  typename LabelBucket::Initializer initializer(label_distribution);
+
+  // Create buckets.
+  ExampleBucketSet& example_set_accumulator =
+      *GetCachedExampleBucketSet<ExampleBucketSet>(&cache->cache_v2);
+  FillExampleBucketSet<ExampleBucketSet, /*require_label_sorting=*/false>(
+      selected_examples, feature_filler, label_filler, &example_set_accumulator,
+      &cache->cache_v2);
+
+  // Scanner for the "one label value vs others".
+  const auto one_vs_other_scan = [&]() -> SplitSearchResult {
+    // Value and index of the buckets.
+    auto& bucket_order = cache->cache_v2.bucket_order;
+    bucket_order.resize(example_set_accumulator.items.size());
+
+    SplitSearchResult split_status = SplitSearchResult::kInvalidAttribute;
+    for (int32_t positive_label_value = 0;
+         positive_label_value < num_label_classes; positive_label_value++) {
+      if (label_distribution.count(positive_label_value) == 0) {
+        // Never observed label value.
+        continue;
+      }
+      if (num_label_classes == 3 && positive_label_value == 1) {
+        // "True vs others" or "False vs others" are equivalent for binary
+        // classification.
+        continue;
+      }
+
+      // Order value of the buckets.
+      for (int bucket_idx = 0; bucket_idx < bucket_order.size(); bucket_idx++) {
+        const auto& bucket = example_set_accumulator.items[bucket_idx];
+        const float ratio_positive_label =
+            bucket.label.SafeProportionOrMinusInfinity(positive_label_value);
+        DCHECK(!std::isnan(ratio_positive_label));
+        bucket_order[bucket_idx] = {ratio_positive_label, bucket_idx};
+      }
+
+      // Sort the bucket indices.
+      std::sort(bucket_order.begin(), bucket_order.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+
+      // Scan the buckets in order.
+      const auto scan_result =
+          ScanSplitsCustomOrder<ExampleBucketSet, LabelScoreAccumulator>(
+              bucket_order, feature_filler, initializer,
+              example_set_accumulator, selected_examples.size(), min_num_obs,
+              attribute_idx, condition, &cache->cache_v2);
+      if (scan_result < split_status) {
+        split_status = scan_result;
+      }
+    }
+    return split_status;
+  };
+
+  // Scanner for the "one hot" type condition i.e. conditions of the type:
+  // "attribute == value".
+  //
+  // Note: In the majority of cases, one-hot (on attribute value) is worst that
+  // "one class vs others". This is however a common solution, and this code is
+  // present for comparison purpose.
+  const auto one_hot_scan = [&]() -> absl::StatusOr<SplitSearchResult> {
+    STATUS_CHECK_EQ(example_set_accumulator.items.size(),
+                    num_attribute_classes);
+
+    std::uniform_real_distribution<float> sampling_dist;
+
+    auto& neg = *GetCachedLabelScoreAccumulator<LabelScoreAccumulator>(
+        false, &cache->cache_v2);
+    auto& pos = *GetCachedLabelScoreAccumulator<LabelScoreAccumulator>(
+        true, &cache->cache_v2);
+
+    initializer.InitFull(&pos);
+    const double weighted_num_examples = pos.WeightedNumExamples();
+
+    double best_score = condition->split_score();
+    bool tried_one_split = false;
+    int best_bucket_idx = -1;
+
+    for (int attribute_value = 0; attribute_value < num_attribute_classes;
+         attribute_value++) {
+      if (dt_config.categorical().one_hot().sampling() < 1.f &&
+          sampling_dist(*random) >
+              dt_config.categorical().one_hot().sampling()) {
+        continue;
+      }
+      const auto bucket_idx = attribute_value;
+      const auto& item = example_set_accumulator.items[bucket_idx];
+
+      const int64_t num_pos_examples = item.label.count;
+      const int64_t num_neg_examples =
+          selected_examples.size() - item.label.count;
+
+      // Enough examples?
+      if (num_pos_examples < min_num_obs || num_neg_examples < min_num_obs) {
+        continue;
+      }
+
+      initializer.InitFull(&neg);
+      initializer.InitEmpty(&pos);
+
+      item.label.SubToScoreAcc(&neg);
+      item.label.AddToScoreAcc(&pos);
+
+      const auto score = Score<>(initializer, weighted_num_examples, pos, neg);
+      tried_one_split = true;
+
+      if (score > best_score) {
+        // Memorize the split.
+        best_bucket_idx = bucket_idx;
+        best_score = score;
+        condition->set_num_pos_training_examples_without_weight(
+            num_pos_examples);
+        condition->set_num_pos_training_examples_with_weight(
+            pos.WeightedNumExamples());
+      }
+    }
+
+    if (best_bucket_idx != -1) {
+      // Finalize the best found split.
+      condition->set_na_value(na_replacement == best_bucket_idx);
+      SetPositiveAttributeSetOfCategoricalContainsCondition(
+          {best_bucket_idx}, num_attribute_classes, condition);
+
+      condition->set_attribute(attribute_idx);
+      condition->set_num_training_examples_without_weight(
+          selected_examples.size());
+      condition->set_num_training_examples_with_weight(weighted_num_examples);
+      condition->set_split_score(best_score);
+      return SplitSearchResult::kBetterSplitFound;
+    } else {
+      return tried_one_split ? SplitSearchResult::kNoBetterSplitFound
+                             : SplitSearchResult::kInvalidAttribute;
+    }
+    return absl::OkStatus();
+  };
+
+  const auto algorithm =
+      (num_attribute_classes < dt_config.categorical().arity_limit_for_random())
+          ? dt_config.categorical().algorithm_case()
+          : proto::Categorical::kRandom;
+
+  switch (algorithm) {
+    case proto::Categorical::ALGORITHM_NOT_SET:
+    case proto::Categorical::kCart:
+      return one_vs_other_scan();
+
+    case proto::Categorical::kOneHot:
+      return one_hot_scan();
+      break;
+
+    case proto::Categorical::kRandom:
+      return ScanSplitsRandomBuckets<ExampleBucketSet, LabelScoreAccumulator>(
+          feature_filler, label_filler, initializer, example_set_accumulator,
+          selected_examples.size(), min_num_obs, attribute_idx,
+          NumTrialsForRandomCategoricalSplit(dt_config.categorical().random()),
+          condition, &cache->cache_v2, random);
+  }
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelClassificationFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const std::vector<int32_t>& labels, int32_t num_attribute_classes,
+    int32_t num_label_classes, int32_t na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const utils::IntegerDistributionDouble& label_distribution,
+    int32_t attribute_idx, utils::RandomEngine* random,
+    proto::NodeCondition* condition, SplitterPerThreadCache* cache) {
+  if (!weights.empty()) {
+    DCHECK_EQ(weights.size(), labels.size());
+  }
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForCategoricalAttribute(selected_examples, weights,
+                                           attributes, num_attribute_classes,
+                                           &na_replacement);
+  }
+
+  if (num_label_classes == 3) {
+    // Binary classification.
+    if (weights.empty()) {
+      return FindSplitLabelClassificationFeatureCategorical<
+          LabelBinaryCategoricalBucket</*weighted=*/false>,
+          FeatureCategoricalLabelUnweightedBinaryCategorical,
+          LabelBinaryCategoricalScoreAccumulator>(
+          selected_examples, weights, attributes, labels, num_attribute_classes,
+          num_label_classes, na_replacement, min_num_obs, dt_config,
+          label_distribution, attribute_idx, random, condition, cache);
+    } else {
+      return FindSplitLabelClassificationFeatureCategorical<
+          LabelBinaryCategoricalBucket</*weighted=*/true>,
+          FeatureCategoricalLabelBinaryCategorical,
+          LabelBinaryCategoricalScoreAccumulator>(
+          selected_examples, weights, attributes, labels, num_attribute_classes,
+          num_label_classes, na_replacement, min_num_obs, dt_config,
+          label_distribution, attribute_idx, random, condition, cache);
+    }
+  } else {
+    // Multi-class classification.
+    if (weights.empty()) {
+      return FindSplitLabelClassificationFeatureCategorical<
+          LabelCategoricalBucket</*weighted=*/false>,
+          FeatureCategoricalLabelUnweightedCategorical,
+          LabelCategoricalScoreAccumulator>(
+          selected_examples, weights, attributes, labels, num_attribute_classes,
+          num_label_classes, na_replacement, min_num_obs, dt_config,
+          label_distribution, attribute_idx, random, condition, cache);
+    } else {
+      return FindSplitLabelClassificationFeatureCategorical<
+          LabelCategoricalBucket</*weighted=*/true>,
+          FeatureCategoricalLabelCategorical, LabelCategoricalScoreAccumulator>(
+          selected_examples, weights, attributes, labels, num_attribute_classes,
+          num_label_classes, na_replacement, min_num_obs, dt_config,
+          label_distribution, attribute_idx, random, condition, cache);
+    }
+  }
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelUpliftCategoricalFeatureNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const CategoricalUpliftLabelStats& label_stats, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  DCHECK(!weights.empty());
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+
+  FeatureNumericalBucket::Filler feature_filler(selected_examples.size(),
+                                                na_replacement, attributes);
+
+  LabelUpliftCategoricalOneValueBucket::Initializer initializer(
+      label_stats.label_distribution,
+      dt_config.uplift().min_examples_in_treatment(),
+      dt_config.uplift().split_score());
+  LabelUpliftCategoricalOneValueBucket::Filler label_filler(
+      label_stats.outcome_values, label_stats.treatment_values, weights);
+
+  // TODO: Add support for-presorted splitting.
+
+  return FindBestSplit_LabelUpliftClassificationFeatureNumerical(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelUpliftNumericalFeatureNumericalCart(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const absl::Span<const float> attributes,
+    const NumericalUpliftLabelStats& label_stats, float na_replacement,
+    UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache) {
+  DCHECK(!weights.empty());
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForNumericalAttribute(selected_examples, weights, attributes,
+                                         &na_replacement);
+  }
+
+  FeatureNumericalBucket::Filler feature_filler(selected_examples.size(),
+                                                na_replacement, attributes);
+
+  LabelUpliftNumericalOneValueBucket::Initializer initializer(
+      label_stats.label_distribution,
+      dt_config.uplift().min_examples_in_treatment(),
+      dt_config.uplift().split_score());
+  LabelUpliftNumericalOneValueBucket::Filler label_filler(
+      label_stats.outcome_values, label_stats.treatment_values, weights);
+
+  // TODO: Add support for pre-sorted splitting.
+
+  return FindBestSplit_LabelUpliftNumericalFeatureNumerical(
+      selected_examples, feature_filler, label_filler, initializer, min_num_obs,
+      attribute_idx, condition, &cache->cache_v2);
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelUpliftCategoricalFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const CategoricalUpliftLabelStats& label_stats, int num_attribute_classes,
+    int32_t na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random) {
+  DCHECK(!weights.empty());
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForCategoricalAttribute(selected_examples, weights,
+                                           attributes, num_attribute_classes,
+                                           &na_replacement);
+  }
+
+  FeatureCategoricalBucket::Filler feature_filler(num_attribute_classes,
+                                                  na_replacement, attributes);
+
+  LabelUpliftCategoricalBucket::Initializer initializer(
+      label_stats.label_distribution,
+      dt_config.uplift().min_examples_in_treatment(),
+      dt_config.uplift().split_score());
+  LabelUpliftCategoricalBucket::Filler label_filler(
+      label_stats.label_distribution, label_stats.outcome_values,
+      label_stats.treatment_values, weights,
+      dt_config.uplift().empty_bucket__ordering());
+
+  // TODO: Add support for pre-sorted splitting.
+
+  const auto algorithm =
+      (num_attribute_classes < dt_config.categorical().arity_limit_for_random())
+          ? dt_config.categorical().algorithm_case()
+          : proto::Categorical::kRandom;
+
+  switch (algorithm) {
+    case proto::Categorical::ALGORITHM_NOT_SET:
+    case proto::Categorical::kCart:
+      return FindBestSplit_LabelUpliftClassificationFeatureCategoricalCart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+
+    case proto::Categorical::kRandom:
+      return FindBestSplit_LabelUpliftClassificationFeatureCategoricalRandom(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx,
+          NumTrialsForRandomCategoricalSplit(dt_config.categorical().random()),
+          condition, &cache->cache_v2, random);
+
+    default:
+      return absl::InvalidArgumentError("Non supported");
+  }
+}
+
+absl::StatusOr<SplitSearchResult>
+FindSplitLabelUpliftNumericalFeatureCategorical(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<float>& weights, const std::vector<int32_t>& attributes,
+    const NumericalUpliftLabelStats& label_stats, int num_attribute_classes,
+    int32_t na_replacement, UnsignedExampleIdx min_num_obs,
+    const proto::DecisionTreeTrainingConfig& dt_config, int32_t attribute_idx,
+    const InternalTrainConfig& internal_config, proto::NodeCondition* condition,
+    SplitterPerThreadCache* cache, utils::RandomEngine* random) {
+  DCHECK(!weights.empty());
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::LOCAL_IMPUTATION) {
+    LocalImputationForCategoricalAttribute(selected_examples, weights,
+                                           attributes, num_attribute_classes,
+                                           &na_replacement);
+  }
+
+  FeatureCategoricalBucket::Filler feature_filler(num_attribute_classes,
+                                                  na_replacement, attributes);
+
+  LabelUpliftNumericalBucket::Initializer initializer(
+      label_stats.label_distribution,
+      dt_config.uplift().min_examples_in_treatment(),
+      dt_config.uplift().split_score());
+  LabelUpliftNumericalBucket::Filler label_filler(
+      label_stats.label_distribution, label_stats.outcome_values,
+      label_stats.treatment_values, weights,
+      dt_config.uplift().empty_bucket__ordering());
+
+  // TODO: Add support for pre-sorted splitting.
+
+  const auto algorithm =
+      (num_attribute_classes < dt_config.categorical().arity_limit_for_random())
+          ? dt_config.categorical().algorithm_case()
+          : proto::Categorical::kRandom;
+
+  switch (algorithm) {
+    case proto::Categorical::ALGORITHM_NOT_SET:
+    case proto::Categorical::kCart:
+      return FindBestSplit_LabelUpliftNumericalFeatureCategoricalCart(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx, condition, &cache->cache_v2);
+
+    case proto::Categorical::kRandom:
+      return FindBestSplit_LabelUpliftNumericalFeatureCategoricalRandom(
+          selected_examples, feature_filler, label_filler, initializer,
+          min_num_obs, attribute_idx,
+          NumTrialsForRandomCategoricalSplit(dt_config.categorical().random()),
+          condition, &cache->cache_v2, random);
+
+    default:
+      return absl::InvalidArgumentError("Non supported");
+  }
+}
+
+int NumAttributesToTest(const proto::DecisionTreeTrainingConfig& dt_config,
+                        const int num_attributes,
+                        const model::proto::Task task) {
+  int num_attributes_to_test;
+  // User specified number of candidate attributes.
+  if (dt_config.has_num_candidate_attributes_ratio() &&
+      dt_config.num_candidate_attributes_ratio() >= 0) {
+    if (dt_config.has_num_candidate_attributes() &&
+        dt_config.num_candidate_attributes() > 0) {
+      LOG(WARNING) << "Both \"num_candidate_attributes\" and "
+                      "\"num_candidate_attributes_ratio\" are specified. "
+                      "Ignoring \"num_candidate_attributes\".";
+    }
+    num_attributes_to_test = static_cast<int>(
+        std::ceil(dt_config.num_candidate_attributes_ratio() * num_attributes));
+  } else {
+    num_attributes_to_test = dt_config.num_candidate_attributes();
+  }
+
+  // Automatic number of attribute selection logic.
+  if (num_attributes_to_test == 0) {
+    switch (task) {
+      default:
+      case model::proto::Task::CATEGORICAL_UPLIFT:
+      case model::proto::Task::CLASSIFICATION:
+        num_attributes_to_test = static_cast<int>(
+            ceil(std::sqrt(static_cast<double>(num_attributes))));
+        break;
+      case model::proto::Task::REGRESSION:
+        num_attributes_to_test =
+            static_cast<int>(ceil(static_cast<double>(num_attributes) / 3));
+        break;
+    }
+  }
+
+  // Special value to use all the available attributes.
+  if (num_attributes_to_test == -1) {
+    num_attributes_to_test = static_cast<int>(num_attributes);
+  }
+
+  // Make sure we don't select more than the available attributes.
+  num_attributes_to_test =
+      std::min(num_attributes_to_test, static_cast<int>(num_attributes));
+
+  return num_attributes_to_test;
+}
+
+void GetCandidateAttributes(
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    int* num_attributes_to_test, std::vector<int32_t>* candidate_attributes,
+    utils::RandomEngine* random) {
+  candidate_attributes->assign(config_link.features().begin(),
+                               config_link.features().end());
+  std::shuffle(candidate_attributes->begin(), candidate_attributes->end(),
+               *random);
+
+  *num_attributes_to_test = NumAttributesToTest(
+      dt_config, candidate_attributes->size(), config.task());
+}
+
+absl::Status GenerateRandomImputation(
+    const dataset::VerticalDataset& src, const std::vector<int>& attributes,
+    const absl::Span<const UnsignedExampleIdx> examples,
+    dataset::VerticalDataset* dst, utils::RandomEngine* random) {
+  STATUS_CHECK_EQ(dst->ncol(), 0);
+  dst->set_data_spec(src.data_spec());
+  RETURN_IF_ERROR(dst->CreateColumnsFromDataspec());
+  dst->set_nrow(examples.size());
+  for (const auto col_idx : attributes) {
+    RETURN_IF_ERROR(GenerateRandomImputationOnColumn(
+        src.column(col_idx), examples, dst->mutable_column(col_idx), random));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status GenerateRandomImputationOnColumn(
+    const dataset::VerticalDataset::AbstractColumn* src,
+    const absl::Span<const UnsignedExampleIdx> examples,
+    dataset::VerticalDataset::AbstractColumn* dst,
+    utils::RandomEngine* random) {
+  STATUS_CHECK_EQ(src->type(), dst->type());
+  // Extract the indices of the example with non-na values i.e. the candidate
+  // for sampling.
+  std::vector<UnsignedExampleIdx> non_na_examples;
+  for (const auto example_idx : examples) {
+    if (!src->IsNa(example_idx)) {
+      non_na_examples.push_back(example_idx);
+    }
+  }
+
+  if (non_na_examples.empty()) {
+    return src->ExtractAndAppend(examples, dst);
+  }
+
+  std::uniform_int_distribution<SignedExampleIdx> non_na_example_dist(
+      0, std::max(static_cast<SignedExampleIdx>(0),
+                  static_cast<SignedExampleIdx>(non_na_examples.size()) - 1));
+
+  std::vector<SignedExampleIdx> source_indices;
+  source_indices.resize(examples.size());
+
+  UnsignedExampleIdx local_example_idx = 0;
+  for (const auto example_idx : examples) {
+    if (src->IsNa(example_idx)) {
+      // Sample a random non-na value.
+      source_indices[local_example_idx] =
+          non_na_examples[non_na_example_dist(*random)];
+    } else {
+      source_indices[local_example_idx] = example_idx;
+    }
+    local_example_idx++;
+  }
+  return src->ExtractAndAppend(source_indices, dst);
+}
+
+void SetInternalDefaultHyperParameters(
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& link_config,
+    const dataset::proto::DataSpecification& data_spec,
+    proto::DecisionTreeTrainingConfig* dt_config) {}
+
+void SetDefaultHyperParameters(proto::DecisionTreeTrainingConfig* config) {
+  // Emulation of histogram splits.
+  if (!config->numerical_split().has_num_candidates()) {
+    switch (config->numerical_split().type()) {
+      case proto::NumericalSplit::HISTOGRAM_RANDOM:
+        config->mutable_numerical_split()->set_num_candidates(1);
+        break;
+      case proto::NumericalSplit::HISTOGRAM_EQUAL_WIDTH:
+        config->mutable_numerical_split()->set_num_candidates(255);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // By default, use axis aligned splits.
+  if (config->split_axis_case() ==
+      proto::DecisionTreeTrainingConfig::SPLIT_AXIS_NOT_SET) {
+    config->mutable_axis_aligned_split();
+  }
+
+  // By default, use the cart categorical algorithm for categorical features.
+  if (config->categorical().algorithm_case() ==
+      proto::Categorical::ALGORITHM_NOT_SET) {
+    config->mutable_categorical()->mutable_cart();
+  }
+
+  // By default, use the local growing strategy i.e. divide and conquer.
+  if (config->growing_strategy_case() ==
+      proto::DecisionTreeTrainingConfig::GROWING_STRATEGY_NOT_SET) {
+    config->mutable_growing_strategy_local();
+  }
+
+  // Change the pre-sorting strategy if not supported by the splitter.
+  using Internal = proto::DecisionTreeTrainingConfig::Internal;
+  auto sorting_strategy = config->internal().sorting_strategy();
+
+  // If possible, use presorting by default.
+  if (sorting_strategy == Internal::AUTO) {
+    sorting_strategy = Internal::PRESORTED;
+  }
+
+  if (sorting_strategy == Internal::PRESORTED ||
+      sorting_strategy == Internal::FORCE_PRESORTED) {
+    switch (config->split_axis_case()) {
+      case proto::DecisionTreeTrainingConfig::kSparseObliqueSplit:
+      case proto::DecisionTreeTrainingConfig::kMhldObliqueSplit:
+      case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit:
+        sorting_strategy = Internal::IN_NODE;
+        break;
+      case proto::DecisionTreeTrainingConfig::kAxisAlignedSplit:
+      case proto::DecisionTreeTrainingConfig::SPLIT_AXIS_NOT_SET:
+        if (config->missing_value_policy() !=
+            proto::DecisionTreeTrainingConfig::GLOBAL_IMPUTATION) {
+          sorting_strategy = Internal::IN_NODE;
+        }
+        break;
+    }
+  }
+
+  config->mutable_internal()->set_sorting_strategy(sorting_strategy);
+
+  // The binary weight hyperparameter is deprecated for the more general weights
+  // hyperparameter.
+  if (config->sparse_oblique_split().has_binary_weight()) {
+    if (config->sparse_oblique_split().binary_weight()) {
+      config->mutable_sparse_oblique_split()->mutable_binary();
+    } else {
+      config->mutable_sparse_oblique_split()->mutable_continuous();
+    }
+    config->mutable_sparse_oblique_split()->clear_binary_weight();
+  }
+
+  // By default, we use binary weights.
+  if (config->has_sparse_oblique_split() &&
+      config->sparse_oblique_split().weights_case() ==
+          proto::DecisionTreeTrainingConfig::SparseObliqueSplit::
+              WEIGHTS_NOT_SET) {
+    config->mutable_sparse_oblique_split()->mutable_binary();
+  }
+}
+
+void SplitHonestExamples(
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const float leaf_rate, utils::RandomEngine* random_engine,
+    std::vector<UnsignedExampleIdx>& leaf_examples,
+    std::vector<UnsignedExampleIdx>& working_selected_examples) {
+  DCHECK(std::is_sorted(selected_examples.begin(), selected_examples.end()));
+
+  // Reduce the risk of std::vector re-allocations.
+  const float error_margin = 1.1f;
+
+  // Reserve total size to avoid reallocations.
+  const size_t N = selected_examples.size();
+  leaf_examples.reserve(N * leaf_rate * error_margin);
+  working_selected_examples.reserve(N * (1.0f - leaf_rate) * error_margin);
+
+  size_t U = 0;
+  if (!selected_examples.empty()) {
+    U = 1;
+    for (size_t i = 1; i < selected_examples.size(); ++i) {
+      if (selected_examples[i] != selected_examples[i - 1]) {
+        ++U;
+      }
+    }
+  }
+
+  size_t k_needed = static_cast<size_t>(U * leaf_rate);
+  size_t n_remaining = U;
+  std::uniform_real_distribution<float> dist_01;
+
+  if (selected_examples.empty()) return;
+
+  // Reservoir sampling
+  bool send_to_leaf = false;
+  for (size_t i = 0; i < selected_examples.size(); ++i) {
+    if (i == 0 || selected_examples[i] != selected_examples[i - 1]) {
+      if (n_remaining > 0) {
+        if (dist_01(*random_engine) <
+            static_cast<float>(k_needed) / n_remaining) {
+          send_to_leaf = true;
+          if (k_needed > 0) {
+            --k_needed;
+          }
+        } else {
+          send_to_leaf = false;
+        }
+        --n_remaining;
+      }
+    }
+    if (send_to_leaf) {
+      leaf_examples.push_back(selected_examples[i]);
+    } else {
+      working_selected_examples.push_back(selected_examples[i]);
+    }
+  }
+}
+
+absl::Status GrowTreeBestFirstGlobal(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights,
+    const InternalTrainConfig& internal_config, NodeWithChildren* root,
+    utils::RandomEngine* random,
+    SelectedExamplesRollingBuffer selected_examples,
+    std::optional<SelectedExamplesRollingBuffer> leaf_examples) {
+  if (config.monotonic_constraints_size() > 0) {
+    return absl::InvalidArgumentError(
+        "Global growth of decision trees (i.e. "
+        "growing_strategy=kGrowingStrategyBestFirstGlobal) does not support "
+        "monotonic constraints.");
+  }
+
+  if (leaf_examples.has_value()) {
+    return absl::InvalidArgumentError(
+        "honest trees are not (yet) supported with "
+        "growing_strategy_best_first_global strategy.");
+  }
+
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::RANDOM_LOCAL_IMPUTATION) {
+    return absl::InvalidArgumentError(
+        "Random local imputation not supported in best first global "
+        "tree growth.");
+  }
+  if (config_link.per_columns_size() > 0) {
+    for (const auto feature : config_link.features()) {
+      if (config_link.per_columns(feature).has_monotonic_constraint()) {
+        return absl::InvalidArgumentError(
+            "GBT with growing_strategy_best_first_global does not support "
+            "monotonic constraints.");
+      }
+    }
+  }
+
+  PerThreadCache cache;
+
+  struct CandidateSplit {
+    // Split.
+    proto::NodeCondition condition;
+    // Indices of examples in the node.
+    SelectedExamplesRollingBuffer example_idxs;
+    // Global score of the split.
+    float score;
+    // The currently leaf node.
+    NodeWithChildren* node;
+    // Depth of the node.
+    int depth;
+
+    bool operator<(const CandidateSplit& other) const {
+      return score < other.score;
+    }
+  };
+
+  // List of candidate splits.
+  std::priority_queue<CandidateSplit> candidate_splits;
+
+  // Initialize a node and update the list of candidate splits with a given
+  // node.
+  const auto ingest_node = [&](const SelectedExamplesRollingBuffer example_idxs,
+                               NodeWithChildren* node,
+                               const int depth) -> absl::Status {
+    node->mutable_node()->set_num_pos_training_examples_without_weight(
+        example_idxs.size());
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, example_idxs.active, weights, config, config_link,
+        node));
+
+    if (example_idxs.size() < dt_config.min_examples() ||
+        (dt_config.max_depth() >= 0 && depth >= dt_config.max_depth())) {
+      // Stop the grow of the branch.
+      node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+      return absl::OkStatus();
+    }
+    proto::NodeCondition condition;
+    ASSIGN_OR_RETURN(
+        const auto has_better_condition,
+        FindBestCondition(train_dataset, example_idxs.active, weights, config,
+                          config_link, dt_config, node->node(), internal_config,
+                          {}, &condition, random, &cache));
+    if (!has_better_condition) {
+      // No good condition found. Close the branch.
+      node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+      return absl::OkStatus();
+    }
+
+    const float score = condition.split_score() * example_idxs.size();
+    candidate_splits.push({/*.condition =*/std::move(condition),
+                           /*.example_idxs =*/example_idxs,
+                           /*.score =*/score,
+                           /*.node =*/node,
+                           /*.depth =*/depth});
+    return absl::OkStatus();
+  };
+
+  RETURN_IF_ERROR(ingest_node(selected_examples, root, /*depth=*/0));
+
+  // Total number of nodes in the tree.
+  int num_nodes = 1;
+
+  const int max_num_nodes =
+      dt_config.growing_strategy_best_first_global().max_num_nodes();
+
+  while (!candidate_splits.empty() &&
+         (max_num_nodes < 0 || num_nodes < max_num_nodes) &&
+         (!internal_config.timeout.has_value() ||
+          internal_config.timeout >= absl::Now())) {
+    // Ensure the candidate set is not larger than  "max_num_nodes". Note:
+    // There is not need for mode than "max_num_nodes" candidate splits.
+    while (max_num_nodes >= 0 && candidate_splits.size() > max_num_nodes) {
+      candidate_splits.top().node->FinalizeAsLeaf(
+          dt_config.store_detailed_label_distribution());
+      candidate_splits.pop();
+    }
+
+    // Split the node.
+    auto split = candidate_splits.top();
+    candidate_splits.pop();
+
+    *split.node->mutable_node()->mutable_condition() = split.condition;
+    split.node->CreateChildren();
+    split.node->FinalizeAsNonLeaf(
+        dt_config.keep_non_leaf_label_distribution(),
+        dt_config.store_detailed_label_distribution());
+
+    const auto& condition = split.node->node().condition();
+
+    // Add new candidate splits for children.
+
+    ASSIGN_OR_RETURN(
+        auto exemple_split,
+        internal::SplitExamplesInPlace(
+            train_dataset, split.example_idxs, condition,
+            /*dataset_is_dense=*/false,
+            dt_config.internal_error_on_wrong_splitter_statistics()));
+
+    RETURN_IF_ERROR(ingest_node(exemple_split.positive_examples,
+                                split.node->mutable_pos_child(),
+                                split.depth + 1));
+    RETURN_IF_ERROR(ingest_node(exemple_split.negative_examples,
+                                split.node->mutable_neg_child(),
+                                split.depth + 1));
+    num_nodes++;
+  }
+
+  // Finalize the remaining candidates.
+  while (!candidate_splits.empty()) {
+    candidate_splits.top().node->FinalizeAsLeaf(
+        dt_config.store_detailed_label_distribution());
+    candidate_splits.pop();
+  }
+  return absl::OkStatus();
+}
+
+absl::Status DecisionTreeTrain(
+    const dataset::VerticalDataset& train_dataset,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights, utils::RandomEngine* random,
+    DecisionTree* dt, const InternalTrainConfig& internal_config) {
+  // Note: This function is the entry point of all decision tree learning.
+
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+  // Check the sorting strategy.
+  if (dt_config.internal().has_ensure_effective_sorting_strategy() &&
+      (dt_config.internal().ensure_effective_sorting_strategy() !=
+       dt_config.internal().sorting_strategy())) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Non expected effective sorting strategy:",
+        proto::DecisionTreeTrainingConfig::Internal::SortingStrategy_Name(
+            dt_config.internal().ensure_effective_sorting_strategy()),
+        "(expected) != ",
+        proto::DecisionTreeTrainingConfig::Internal::SortingStrategy_Name(
+            dt_config.internal().sorting_strategy()),
+        "(actual)"));
+  }
+
+  // Decide if execution should happen in single-thread or concurrent mode.
+
+  std::optional<std::vector<UnsignedExampleIdx>> leaf_examples;
+  std::vector<UnsignedExampleIdx> working_selected_examples;
+
+  // Fail if the data spec has invalid columns.
+  for (const auto feature_idx : config_link.features()) {
+    const auto& data_spec_columns = train_dataset.data_spec().columns();
+    const auto column_type = data_spec_columns[feature_idx].type();
+    if (column_type != dataset::proto::NUMERICAL &&
+        column_type != dataset::proto::CATEGORICAL &&
+        column_type != dataset::proto::CATEGORICAL_SET &&
+        column_type != dataset::proto::BOOLEAN &&
+        column_type != dataset::proto::DISCRETIZED_NUMERICAL &&
+        column_type != dataset::proto::NUMERICAL_VECTOR_SEQUENCE) {
+      return absl::InvalidArgumentError(
+          absl::Substitute("Column $0 has type $1, which is not supported "
+                           "for decision tree training.",
+                           data_spec_columns[feature_idx].name(),
+                           dataset::proto::ColumnType_Name(column_type)));
+    }
+  }
+
+  // Check monotonic constraints
+  if (config.monotonic_constraints_size() > 0 &&
+      !dt_config.keep_non_leaf_label_distribution()) {
+    return absl::InvalidArgumentError(
+        "keep_non_leaf_label_distribution=false is not compatible with "
+        "monotonic constraints. To minimize the size of your serving model "
+        "(with or without monotonic constraints), use "
+        "pure_serving_model=true.");
+  }
+
+  // Check if oblique splits are correctly specified
+  if (dt_config.has_sparse_oblique_split()) {
+    if (dt_config.sparse_oblique_split().has_binary_weight() &&
+        dt_config.sparse_oblique_split().weights_case() !=
+            dt_config.sparse_oblique_split().WEIGHTS_NOT_SET) {
+      return absl::InvalidArgumentError(
+          "Both sparse_oblique_split.binary_weights and "
+          "sparse_oblique_split.weights are set. Setting "
+          "sparse_oblique_split.binary_weights is deprecated and replaced by "
+          "just setting sparse_oblique_split.weights.");
+    }
+    if (dt_config.sparse_oblique_split().power_of_two().max_exponent() > 31) {
+      return absl::InvalidArgumentError(
+          "The maximum exponent for sparse oblique power-of-two weights cannot "
+          "be larger than 31.");
+    }
+    if (dt_config.sparse_oblique_split().power_of_two().min_exponent() < -31) {
+      return absl::InvalidArgumentError(
+          "The minimum exponent for sparse oblique power-of-two weights cannot "
+          "be smaller than -31.");
+    }
+    if (dt_config.sparse_oblique_split().power_of_two().min_exponent() >
+        dt_config.sparse_oblique_split().power_of_two().max_exponent()) {
+      return absl::InvalidArgumentError(absl::Substitute(
+          "The minimum exponent for sparse oblique power-of-two weights cannot "
+          "be larger than the maximum exponent. Got minimum: $0, maximum: $1",
+          dt_config.sparse_oblique_split().power_of_two().min_exponent(),
+          dt_config.sparse_oblique_split().power_of_two().max_exponent()));
+    }
+    if (dt_config.sparse_oblique_split().integer().minimum() >
+        dt_config.sparse_oblique_split().integer().maximum()) {
+      return absl::InvalidArgumentError(absl::Substitute(
+          "The minimum value for sparse oblique integer weights cannot "
+          "be larger than the maximum value. Got minimum: $0, maximum: $1",
+          dt_config.sparse_oblique_split().integer().minimum(),
+          dt_config.sparse_oblique_split().integer().maximum()));
+    }
+  }
+
+  if (dt_config.has_honest()) {
+    // Split the examples in two parts. One ("selected_examples_buffer")
+    // will be used to infer the structure of the trees while the second
+    // ("leaf_examples_buffer") will be used to determine the leaf values
+    // (i.e. the predictions).
+    leaf_examples = std::vector<UnsignedExampleIdx>();
+    // If the internal training config provides a special seed for the random
+    // split, use this seed with a new random engine. Otherwise, just use the
+    // default random engine.
+    if (internal_config.honest_split_seed.has_value()) {
+      utils::RandomEngine honest_split_random(
+          *internal_config.honest_split_seed);
+      SplitHonestExamples(selected_examples,
+                          dt_config.honest().ratio_leaf_examples(),
+                          &honest_split_random, leaf_examples.value(),
+                          working_selected_examples);
+    } else {
+      SplitHonestExamples(selected_examples,
+                          dt_config.honest().ratio_leaf_examples(), random,
+                          leaf_examples.value(), working_selected_examples);
+    }
+  } else {
+    working_selected_examples.assign(selected_examples.begin(),
+                                     selected_examples.end());
+  }
+
+  if (!(dt_config.numerical_vector_sequence()
+            .enable_projected_more_than_conditions() ||
+        dt_config.numerical_vector_sequence()
+            .enable_closer_than_conditions())) {
+    return absl::InvalidArgumentError(
+        "No condition types for vector sequences are enabled. Enable "
+        "projected-more-than conditions, closer-than conditions or both.");
+  }
+
+  auto leaf_example_span = leaf_examples.has_value()
+                               ? std::optional<absl::Span<UnsignedExampleIdx>>(
+                                     absl::MakeSpan(leaf_examples.value()))
+                               : std::nullopt;
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  // Grayed out for 100 trees
+  // std::cerr << "honest=" << dt_config.has_honest()
+  //           << " features=" << config_link.features_size()
+  //           << " examples=" << selected_examples.size() << "\n";
+  // std::cerr << "Decision tree train set up time: " << duration.count() << " ms\n";
+  return DecisionTreeCoreTrain(train_dataset, config, config_link, dt_config,
+                               deployment, weights, random, internal_config, dt,
+                               absl::MakeSpan(working_selected_examples),
+                               leaf_example_span);
+}
+
+std::unique_ptr<SplitterFinderStreamProcessor>
+CreateSplitterFinderStreamProcessor(int num_threads) {
+  if (num_threads <= 1) {
+    return nullptr;
+  }
+  LOG(INFO) << "Create processor with " << num_threads
+            << " threads for split computation";
+  auto find_condition =
+      [](SplitterWorkRequest request) -> absl::StatusOr<SplitterWorkResponse> {
+    const auto& common = *(request.common);
+    if (common.dt_config.internal().generate_fake_error_in_splitter()) {
+      return absl::InternalError("Fake error");
+    }
+    return FindBestConditionFromSplitterWorkRequest(
+        common.weights, common.config, common.config_link, common.dt_config,
+        common.internal_config, request);
+  };
+  auto split_finder_processor = std::make_unique<SplitterFinderStreamProcessor>(
+      "SplitFinder", num_threads, find_condition);
+  split_finder_processor->StartWorkers();
+
+  return split_finder_processor;
+}
+
+absl::Status DecisionTreeCoreTrain(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights, utils::RandomEngine* random,
+    const InternalTrainConfig& internal_config, DecisionTree* dt,
+    absl::Span<UnsignedExampleIdx> selected_examples,
+    std::optional<absl::Span<UnsignedExampleIdx>> leaf_examples) {
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();    
+  dt->CreateRoot();
+  PerThreadCache cache;
+
+  auto selected_examples_rb = SelectedExamplesRollingBuffer::Create(
+      selected_examples, &cache.selected_example_buffer);
+  std::optional<SelectedExamplesRollingBuffer> leaf_examples_rb;
+  if (leaf_examples.has_value()) {
+    leaf_examples_rb = SelectedExamplesRollingBuffer::Create(
+        leaf_examples.value(), &cache.leaf_example_buffer);
+  }
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+  // Grayed out for 100 trees
+  // std::cerr << "Decision tree core train set up time: " << duration.count() << " ms\n"; 
+
+  switch (dt_config.growing_strategy_case()) {
+    case proto::DecisionTreeTrainingConfig::kGrowingStrategyLocal: {
+      const auto constraints = NodeConstraints::CreateNodeConstraints();
+
+      // ADDED BY JY
+      #if defined(BFS_ONLY) 
+        std::cout << "BFS_ONLY Defined. " << std::endl;
+        return GrowTreeLocalBFS(train_dataset, config, config_link, dt_config,
+                           deployment, weights, 1, internal_config, constraints,
+                           false, dt->mutable_root(), random, &cache,
+                           selected_examples_rb, leaf_examples_rb);
+      #else 
+        std::cout << "BFS_ONLY Not Defined. " << std::endl;
+        return GrowTreeLocal(train_dataset, config, config_link, dt_config,
+                           deployment, weights, 1, internal_config, constraints,
+                           false, dt->mutable_root(), random, &cache,
+                           selected_examples_rb, leaf_examples_rb);
+      #endif
+    } break;
+    case proto::DecisionTreeTrainingConfig::kGrowingStrategyBestFirstGlobal:
+      return GrowTreeBestFirstGlobal(
+          train_dataset, config, config_link, dt_config, deployment, weights,
+          internal_config, dt->mutable_root(), random, selected_examples_rb,
+          leaf_examples_rb);
+      break;
+    default:
+      return absl::InvalidArgumentError("Grow strategy not set");
+  }
+}
+
+ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights,
+    const InternalTrainConfig& internal_config, utils::RandomEngine* random,
+    PerThreadCache* cache, internal::NodeAndExamples node_and_examples,
+    // All changed from vector to deque    
+    std::deque<internal::NodeAndExamples>& node_stack) {
+  auto& selected_examples = node_and_examples.selected_examples;
+  auto& leaf_examples = node_and_examples.leaf_examples;
+  const auto depth = node_and_examples.depth;
+  const auto& constraints = node_and_examples.constraints;
+  const auto set_leaf_already_set = node_and_examples.set_leaf_already_set;
+  auto node = node_and_examples.node;
+
+  #define best_condition_only 0
+
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+  #ifdef NO_D2H
+  if (node_and_examples.d_sel_count == 0) {
+  #else
+  if (selected_examples.empty()) {
+  #endif
+    return absl::InternalError("No examples fed to the node trainer");
+  }
+  node->mutable_node()->set_num_pos_training_examples_without_weight(
+  #ifdef NO_D2H
+      node_and_examples.d_sel_count);
+  #else
+      selected_examples.size());
+  #endif
+
+  // std::cout << "set_leaf_already_set: " << set_leaf_already_set << std::endl;
+  // set_leaf_already_set: 0 at the root node, 1 at the child nodes
+  if (!set_leaf_already_set) {
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, selected_examples.active, weights, config, config_link,
+        node));
+    RETURN_IF_ERROR(ApplyConstraintOnNode(constraints, node));
+  }
+
+  auto finalize_as_leaf = [&]() -> absl::Status {
+    if (leaf_examples.has_value()) {
+      // Override the leaf values.
+      RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+          train_dataset, leaf_examples->active, weights, config, config_link,
+          node));
+      RETURN_IF_ERROR(ApplyConstraintOnNode(constraints, node));
+    }
+    // Stop the growth of the branch.
+    node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+    return absl::OkStatus();
+  };
+
+  #ifdef NO_D2H
+  if (node_and_examples.d_sel_count < dt_config.min_examples() ||
+  #else
+  if (selected_examples.size() < dt_config.min_examples() ||
+  #endif
+      (dt_config.max_depth() >= 0 && depth >= dt_config.max_depth()) ||
+      (internal_config.timeout.has_value() &&
+       internal_config.timeout < absl::Now())) {
+    ++early_leaf_count;
+    return finalize_as_leaf();
+  }
+
+  // Dataset used to train this node.
+  const dataset::VerticalDataset* train_dataset_for_splitter;
+  absl::Span<const UnsignedExampleIdx> selected_examples_for_splitter;
+  // If true, the entire dataset "local_train_dataset" is composed of training
+  // examples for this node. If false, only the subset of
+  // "local_train_dataset" indexed by "selected_examples" are to be considered
+  // for this node i.e. local_train_dataset[selected_examples[i]].
+  bool splitter_dataset_is_compact;
+
+  // Extract the random local imputation.
+  dataset::VerticalDataset random_local_imputation_train_dataset;
+  std::vector<UnsignedExampleIdx> random_local_imputation_selected_examples;
+  // std::cout << "Missing value policy: " << dt_config.missing_value_policy() << std::endl;
+  // Missing value policy: 0
+  if (dt_config.missing_value_policy() ==
+      proto::DecisionTreeTrainingConfig::RANDOM_LOCAL_IMPUTATION) {
+    std::vector<int> label_and_input_features(config_link.features().begin(),
+                                              config_link.features().end());
+    label_and_input_features.push_back(config_link.label());
+    RETURN_IF_ERROR(GenerateRandomImputation(
+        train_dataset, label_and_input_features, selected_examples.active,
+        &random_local_imputation_train_dataset, random));
+    random_local_imputation_selected_examples.resize(selected_examples.size());
+    std::iota(random_local_imputation_selected_examples.begin(),
+              random_local_imputation_selected_examples.end(), 0);
+
+    train_dataset_for_splitter = &random_local_imputation_train_dataset;
+    selected_examples_for_splitter =
+        absl::MakeConstSpan(random_local_imputation_selected_examples);
+    splitter_dataset_is_compact = true;
+  } else {
+    selected_examples_for_splitter =
+        absl::MakeConstSpan(selected_examples.active);
+    splitter_dataset_is_compact = false;
+    train_dataset_for_splitter = &train_dataset;
+  }
+  // std::cout << "splitter_dataset_is_compact: " << splitter_dataset_is_compact << std::endl;
+  // splitter_dataset_is_compact: 0
+  // Determine the best split.
+  #ifdef NO_D2H
+  if (node_and_examples.d_sel_count == 0) {
+  #else
+  if (selected_examples_for_splitter.empty()) {
+  #endif
+    return absl::InternalError("No examples fed to the splitter");
+  }
+  double setup_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start_time).count();
+  total_node_setup_ms += setup_ms;
+
+  // if (internal_config.precomputed_projected_values.empty() &&
+  //     internal_config.depthwise_projection_defs == nullptr &&
+  //     internal_config.best_condition == nullptr) {
+  //   std::cerr << "NodeTrain: no GPU data, depth=" << depth
+  //             << " examples=" << selected_examples.size() << "\n";
+  // }
+  auto t_find_best_start = std::chrono::steady_clock::now();
+  ASSIGN_OR_RETURN(
+      const auto has_better_condition,
+      FindBestCondition(*train_dataset_for_splitter,
+                        selected_examples_for_splitter, weights, config,
+                        config_link, dt_config, node->node(), internal_config,
+                        constraints, node->mutable_node()->mutable_condition(),
+                        random, cache));
+  total_find_best_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_find_best_start).count();
+  if (!has_better_condition) {
+    ++no_split_leaf_count;
+    total_node_train_count++;
+    return finalize_as_leaf();
+  }
+  #ifdef NO_D2H
+  STATUS_CHECK_EQ(
+      node_and_examples.d_sel_count,
+      node->node().condition().num_training_examples_without_weight());
+  #else
+  STATUS_CHECK_EQ(
+      selected_examples.size(),
+      node->node().condition().num_training_examples_without_weight());
+  #endif
+  node->CreateChildren();
+  node->FinalizeAsNonLeaf(dt_config.keep_non_leaf_label_distribution(),
+                          dt_config.store_detailed_label_distribution());
+
+  // Separate the positive and negative examples.
+  auto t_split_start = std::chrono::steady_clock::now();
+  // std::cout << "splitter_dataset_is_compact: " << splitter_dataset_is_compact << std::endl;
+  // splitter_dataset_is_compact: 0
+  //  SelectedExamplesRollingBuffer selected_examples;
+  // Type of selected_examples.active: absl::Span<const UnsignedExampleIdx>
+  // Type of example_split: ExampleSplitRollingBuffer
+  // Type of example_split.positive_examples: SelectedExamplesRollingBuffer
+  // Type of example_split.negative_examples: SelectedExamplesRollingBuffer
+  // the below two matter the most
+  // Type of example_split.positive_examples.active: absl::Span<const UnsignedExampleIdx>
+  // Type of example_split.negative_examples.active: absl::Span<const UnsignedExampleIdx>
+
+  // #if defined(USE_GPU) && (best_condition_only != 1)
+  // ASSIGN_OR_RETURN(
+  //     auto example_split, SplitExamplesInPlaceKernel_wrap(
+  //     internal_config.gpu_projected_data,
+  //     node->node().condition().condition().oblique_condition().threshold(),
+  //     selected_examples,
+  //     internal_config.rows_start,
+  //     internal_config.rows_node,
+  //     internal_config.best_projection_index,
+  //     internal_config.num_proj
+  //     ));
+  // #else
+  // ASSIGN_OR_RETURN(
+  //   auto example_split,
+  //   internal::SplitExamplesInPlace(
+  //       *train_dataset_for_splitter, selected_examples,
+  //       node->node().condition(), splitter_dataset_is_compact,
+  //       dt_config.internal_error_on_wrong_splitter_statistics()));
+  // #endif
+
+  ExampleSplitRollingBuffer example_split;
+  if (internal_config.skip_set_leaf_on_children) {
+    example_split = internal_config.example_split;
+  } else {
+    ASSIGN_OR_RETURN(
+      example_split,
+      internal::SplitExamplesInPlace(
+          *train_dataset_for_splitter, selected_examples,
+          node->node().condition(), splitter_dataset_is_compact,
+          dt_config.internal_error_on_wrong_splitter_statistics()));
+  }
+
+  // ASSIGN_OR_RETURN(
+  // auto example_split,
+  // internal::SplitExamplesInPlace(
+  //     *train_dataset_for_splitter, selected_examples,
+  //     node->node().condition(), splitter_dataset_is_compact,
+  //     dt_config.internal_error_on_wrong_splitter_statistics()));
+
+  // After splitting examples by the chosen condition, one side might end up empty,
+  // Meaning the split doesn't actually separate anything in practice.
+  // If so, revert to a leaf.
+  #ifdef NO_D2H
+  if (internal_config.gpu_pos_count == 0 || internal_config.gpu_neg_count == 0) {
+  #else
+  if (example_split.positive_examples.empty() ||
+      example_split.negative_examples.empty()) {
+  #endif
+    // The splitter statistics don't match exactly the condition evaluation and
+    // one of the children is pure.
+    node->ClearChildren();
+    return finalize_as_leaf();
+  }
+  total_split_examples_ms += std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - t_split_start).count();
+
+  // Separate the positive and negative examples used only to determine the node
+  // value.
+  // only used for honest trees
+  std::optional<ExampleSplitRollingBuffer> node_only_example_split;
+  if (leaf_examples.has_value()) {
+    ASSIGN_OR_RETURN(
+        node_only_example_split,
+        internal::SplitExamplesInPlace(
+            train_dataset, *leaf_examples, node->node().condition(), false,
+            dt_config.internal_error_on_wrong_splitter_statistics(),
+            /*examples_are_training_examples=*/false));
+    if (node_only_example_split->positive_examples.empty() ||
+        node_only_example_split->negative_examples.empty()) {
+      node->ClearChildren();
+      return finalize_as_leaf();
+    }
+  }
+
+  // Set leaf outputs
+  auto t_set_leaf_start = std::chrono::steady_clock::now();
+  #if defined(USE_GPU) && (best_condition_only != 1)
+  if (internal_config.skip_set_leaf_on_children) {
+    const int nc = internal_config.gpu_num_classes;
+    utils::IntegerDistributionDouble dist_pos;
+    utils::IntegerDistributionDouble dist_neg;
+    dist_pos.SetNumClasses(nc);
+    dist_neg.SetNumClasses(nc);
+    for (int c = 0; c < nc; ++c) {
+      dist_pos.Add(c, internal_config.gpu_pos_class_counts[c]);
+      dist_neg.Add(c, internal_config.gpu_neg_class_counts[c]);
+    }
+    dist_pos.Save(node->mutable_pos_child()->mutable_node()->mutable_classifier()->mutable_distribution());
+    node->mutable_pos_child()->mutable_node()->mutable_classifier()->set_top_value(dist_pos.TopClass());
+    dist_neg.Save(node->mutable_neg_child()->mutable_node()->mutable_classifier()->mutable_distribution());
+    node->mutable_neg_child()->mutable_node()->mutable_classifier()->set_top_value(dist_neg.TopClass());
+  } else {
+  #endif
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, example_split.positive_examples.active, weights, config,
+        config_link, node->mutable_pos_child()));
+    RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+        train_dataset, example_split.negative_examples.active, weights, config,
+        config_link, node->mutable_neg_child()));
+  #if defined(USE_GPU) && (best_condition_only != 1)
+  }
+  #endif
+
+  // RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+  //     train_dataset, example_split.positive_examples.active, weights, config,
+  //     config_link, node->mutable_pos_child()));
+  // RETURN_IF_ERROR(internal_config.set_leaf_value_functor(
+  //     train_dataset, example_split.negative_examples.active, weights, config,
+  //     config_link, node->mutable_neg_child()));
+
+  total_set_leaf_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_set_leaf_start).count();
+
+  auto t_apply_constraint_start = std::chrono::steady_clock::now();
+  RETURN_IF_ERROR(
+      ApplyConstraintOnNode(constraints, node->mutable_pos_child()));
+  RETURN_IF_ERROR(
+      ApplyConstraintOnNode(constraints, node->mutable_neg_child()));
+  total_apply_constraint_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_apply_constraint_start).count();
+
+  // Children constraints
+  auto t_constraints_start = std::chrono::steady_clock::now();
+  auto pos_constraints = constraints;
+  auto neg_constraints = constraints;
+  const int monotonic_constraint_sign = MonotonicConstraintSign(
+      config_link, node->node().condition().attribute());
+  if (monotonic_constraint_sign != 0) {
+    RETURN_IF_ERROR(DivideMonotonicConstraintToChildren(
+        constraints, monotonic_constraint_sign == 1,
+        dt_config.internal().check_monotonic_constraints(), node,
+        node->mutable_pos_child(), node->mutable_neg_child(), &pos_constraints,
+        &neg_constraints));
+  }
+  total_constraints_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_constraints_start).count();
+
+  // Negative child.
+  auto t_push_start = std::chrono::steady_clock::now();
+  node_stack.push_back(
+      {node->mutable_neg_child(), std::move(example_split.negative_examples),
+       node_only_example_split.has_value()
+           ? std::optional<SelectedExamplesRollingBuffer>(
+                 std::move(node_only_example_split->negative_examples))
+           : std::nullopt,
+       depth + 1, neg_constraints, true});
+  #ifdef NO_D2H
+  node_stack.back().d_sel_count = internal_config.gpu_neg_count;
+  #endif
+  // Positive child.
+  node_stack.push_back(
+      {node->mutable_pos_child(), std::move(example_split.positive_examples),
+       node_only_example_split.has_value()
+           ? std::optional<SelectedExamplesRollingBuffer>(
+                 std::move(node_only_example_split->positive_examples))
+           : std::nullopt,
+       depth + 1, pos_constraints, true});
+  #ifdef NO_D2H
+  node_stack.back().d_sel_count = internal_config.gpu_pos_count;
+  #endif
+  total_node_push_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t_push_start).count();
+
+  total_node_train_count++;
+  return absl::OkStatus();
+}
+
+absl::Status GrowTreeLocal(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights, const int32_t depth,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, bool set_leaf_already_set,
+    NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
+    SelectedExamplesRollingBuffer selected_examples,
+    std::optional<SelectedExamplesRollingBuffer> leaf_examples) {
+
+  // All changed from vector to deque    
+  std::deque<internal::NodeAndExamples> node_stack;
+  node_stack.push_back({root, std::move(selected_examples),
+                        std::move(leaf_examples), depth, constraints,
+                        set_leaf_already_set});
+  
+  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+  while (!node_stack.empty()) {
+    auto current_node = std::move(node_stack.back());
+    node_stack.pop_back();
+
+    RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                              deployment, weights, internal_config, random,
+                              cache, std::move(current_node), node_stack));
+  }
+
+  std::chrono::steady_clock::time_point end_time = std::chrono::steady_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_time = end_time - start_time;
+  std::cout << "Time taken for GrowTreeLocal DFS: " << elapsed_time.count() << " ms." << std::endl;
+
+  internal::PrintAndResetDfsTimers();
+  if (total_node_train_count > 0) {
+    std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+              << " find_best=" << total_find_best_ms << "ms"
+              << " split_examples=" << total_split_examples_ms << "ms"
+              << " set_leaf=" << total_set_leaf_ms << "ms"
+              << " apply_constraint=" << total_apply_constraint_ms << "ms"
+              << " constraints=" << total_constraints_ms << "ms"
+              << " push=" << total_node_push_ms << "ms"
+              << " nodes=" << total_node_train_count << "\n";
+  }
+  total_find_best_ms = 0;
+  total_split_examples_ms = 0;
+  total_node_setup_ms = 0;
+  total_set_leaf_ms = 0;
+  total_apply_constraint_ms = 0;
+  total_constraints_ms = 0;
+  total_node_push_ms = 0;
+  total_node_train_count = 0;
+  return absl::OkStatus();
+}
+
+absl::Status GrowTreeLocalBFS(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights, const int32_t depth,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, bool set_leaf_already_set,
+    NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
+    SelectedExamplesRollingBuffer selected_examples,
+    std::optional<SelectedExamplesRollingBuffer> leaf_examples) {
+
+  const bool combined = absl::GetFlag(FLAGS_combined);
+  const float* d_flat_data = internal_config.d_flat_data;
+  const int* d_labels = internal_config.d_labels;
+  const int num_rows = train_dataset.nrow();
+  const int32_t num_classes = train_dataset.data_spec()
+                                  .columns(config_link.label())
+                                  .categorical()
+                                  .number_of_unique_values();
+
+  // Build mapping from YDF attribute index to flat data column position.
+  // d_flat_data is laid out as flat[c * num_rows + r] where c is the position
+  // in config_link.numerical_features(), NOT the YDF attribute index.
+  // Projections store YDF attribute indices, so we must remap before GPU use.
+  const int num_attrs = train_dataset.data_spec().columns_size();
+  std::vector<int> attr_to_flat_col(num_attrs, -1);
+  for (int c = 0; c < config_link.numerical_features_size(); ++c) {
+    attr_to_flat_col[config_link.numerical_features(c)] = c;
+  }
+
+  // Pre-allocate reusable GPU buffers sized for worst case (root level).
+  std::chrono::steady_clock::time_point start_time_malloc = std::chrono::steady_clock::now();
+  const int max_num_proj = GetNumProjections(
+      dt_config, config_link.numerical_features_size());
+
+  #ifdef NO_D2H
+  int* d_selected_examples = internal_config.d_selected_examples;
+  #else
+  int* d_selected_examples = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_selected_examples, static_cast<size_t>(num_rows) * sizeof(int)));
+  #endif
+
+  float* d_col_add_projected = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_col_add_projected,
+             static_cast<size_t>(num_rows) * max_num_proj * sizeof(float)));
+
+  // DRSW: pre-allocate node_ids/node_offsets once at max size (num_rows),
+  // reused across all BFS depth levels to avoid per-depth cudaMalloc/cudaFree.
+  int* d_node_ids = nullptr;
+  int* d_node_offsets = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_node_ids, static_cast<size_t>(num_rows) * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_node_offsets, static_cast<size_t>(num_rows) * sizeof(int)));
+
+  std::chrono::steady_clock::time_point end_time_malloc = std::chrono::steady_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_time_malloc = end_time_malloc - start_time_malloc;
+  // Grayed out for 100 trees
+  //std::cout << "Time taken for Selected examples and col add projected GPU memory allocation: " << elapsed_time_malloc.count() << " ms." << std::endl;
+  
+  #ifndef NO_D2H
+  std::vector<UnsignedExampleIdx> flat_sel(num_rows);
+  #endif
+
+  // Only using pinned memory for projected data to copy from GPU to CPU for split finding
+  float* pinned_projected = nullptr;
+  if (!combined) {
+    std::chrono::steady_clock::time_point start_time_pinned_malloc = std::chrono::steady_clock::now();
+    const size_t pinned_projected_bytes =
+        static_cast<size_t>(num_rows) * max_num_proj * sizeof(float);
+    CUDA_CHECK(cudaMallocHost(&pinned_projected, pinned_projected_bytes));
+    std::chrono::steady_clock::time_point end_time_pinned_malloc = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_pinned_malloc =  end_time_pinned_malloc - start_time_pinned_malloc;
+    std::cout << "Time taken for Pinned memory allocation: " << elapsed_time_pinned_malloc.count() << " ms." << std::endl;
+  }
+  
+
+  std::deque<internal::NodeAndExamples> node_queue;
+  #ifdef NO_D2H
+  const int root_sel_count = internal_config.gpu_root_sel_count;
+  #else
+  const int root_sel_count = static_cast<int>(selected_examples.size());
+  #endif
+  node_queue.push_back({root, std::move(selected_examples),
+                        std::move(leaf_examples), depth, constraints,
+                        set_leaf_already_set,
+                        internal_config.d_selected_examples,
+                        root_sel_count});
+
+  double total_node_train_ms = 0.0;
+  double total_kernel_ms = 0.0;
+  double total_gpu_hist_ms = 0.0;
+  double total_blockmm_ms = 0.0;
+  double total_finalmm_ms = 0.0;
+  double total_randbnd_ms = 0.0;
+  double total_buildhist_ms = 0.0;
+  double total_entropy_ms = 0.0;
+  double total_bestnode_ms = 0.0;
+  double total_d2h_hist_ms = 0.0;
+  double total_reorder_ms = 0.0;
+  double total_sample_ms = 0.0;
+  double total_flatten_sel_ms = 0.0;
+  double total_flatten_proj_ms = 0.0;
+  double total_malloc_ms = 0.0;
+  double total_h2d_ms = 0.0;
+  double total_d2h_ms = 0.0; // not combined
+  double total_free_ms = 0.0;
+  double total_split_all_depth_ms = 0.0;
+  double total_prefixsum_ms = 0.0;
+
+  // NO D2H 
+  // int* d_selected_examples = internal_config.d_selected_examples;
+
+  std::vector<int> node_row_offsets;
+  std::cout << "Starting BFS tree growth..." << std::endl;
+  while (!node_queue.empty()) {
+
+    std::chrono::steady_clock::time_point start_time_depth = std::chrono::steady_clock::now();
+    const int32_t current_depth = node_queue.front().depth;
+    // Grayed out for 100 trees
+    // std::cout << "Processing depth: " << current_depth << ", nodes in queue: " << node_queue.size() << std::endl;
+    if (dt_config.max_depth() >= 0 && current_depth >= dt_config.max_depth()) {
+      // std::cout << "Reached maximum depth, finalizing remaining nodes as leaves." << std::endl;
+      size_t total_rows_d16 = 0;
+      int num_nodes_d16 = 0;
+      while (!node_queue.empty()) {
+        auto& nae = node_queue.front();
+        #ifdef NO_D2H
+        total_rows_d16 += nae.d_sel_count;
+        #else
+        total_rows_d16 += nae.selected_examples.size();
+        #endif
+        num_nodes_d16++;
+        nae.node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+        node_queue.pop_front();
+      }
+      // std::cerr << "D" << current_depth
+      //           << " nodes=" << num_nodes_d16
+      //           << " rows=" << total_rows_d16
+      //           << " (finalized as leaves)\n";
+      std::chrono::steady_clock::time_point end_time_depth = std::chrono::steady_clock::now();
+      std::chrono::duration<double, std::milli> elapsed_time_depth = end_time_depth - start_time_depth;
+      // std::cout << "Time taken for depth " << current_depth << " processing: " << elapsed_time_depth.count() << " ms." << std::endl;
+      // std::cout << "All nodes finalized as leaves. BFS tree growth complete." << std::endl;
+      break;
+    }
+
+    std::vector<internal::NodeAndExamples> depth_batch;
+    // Not chrono'd: measured at <0.1 s for 3M rows — completely trivial.
+    while (!node_queue.empty() &&
+           node_queue.front().depth == current_depth) {
+      depth_batch.push_back(std::move(node_queue.front()));
+      node_queue.pop_front();
+    }
+    // Grayed out for 100 trees
+    // std::cerr << "BFS depth_batch built: " << depth_batch.size() << " nodes"
+    //           << ", has_sparse_oblique=" << dt_config.has_sparse_oblique_split()
+    //           << std::endl;
+    std::chrono::steady_clock::time_point end_time_depth = std::chrono::steady_clock::now();
+    std::chrono::duration<double, std::milli> elapsed_time_depth = end_time_depth - start_time_depth;
+    // Grayed out for 100 trees
+    // std::cout << "Time taken for depth " << current_depth << " processing: " << elapsed_time_depth.count() << " ms." << std::endl;
+    #ifdef USE_GPU
+    if (dt_config.has_sparse_oblique_split() && depth_batch.size() >= 1) {
+      auto t_proj_start = std::chrono::steady_clock::now();
+      const int num_proj = GetNumProjections(
+          dt_config, config_link.numerical_features_size());
+      const float projection_density = std::clamp(
+          dt_config.sparse_oblique_split().projection_density_factor() /
+              config_link.numerical_features_size(),
+          0.f, 1.f);
+
+      const int num_nodes = depth_batch.size();
+
+      // --- [1] Sample projections ---
+      auto t_sample_start = std::chrono::steady_clock::now();
+      std::vector<std::vector<internal::Projection>> all_node_projs(
+          num_nodes, std::vector<internal::Projection>(num_proj));
+      std::vector<std::vector<int8_t>> all_node_mono(
+          num_nodes, std::vector<int8_t>(num_proj));
+      for (int n = 0; n < num_nodes; ++n) {
+        for (int p = 0; p < num_proj; ++p) {
+          internal::SampleProjection(
+              config_link.numerical_features(), dt_config,
+              train_dataset.data_spec(), config_link, projection_density,
+              &all_node_projs[n][p], &all_node_mono[n][p], random);
+        }
+      }
+      auto t_sample_end = std::chrono::steady_clock::now();
+      double sample_ms = std::chrono::duration<double,std::milli>(t_sample_end - t_sample_start).count();
+      total_sample_ms += sample_ms;
+
+      // --- [2] Reorder projections ---
+      // Doesn't matter if option 0 selected
+      // int selected_features_count = 2;
+      int selected_features_count = 0;
+      auto t_reorder_start = std::chrono::steady_clock::now();
+      // 0 = no reorder, 6 = symmetric, 7 = Hungarian Iterative + Node Reorder
+      internal::ReorderProjections(all_node_projs, num_proj, num_nodes,
+                        selected_features_count,
+                        0, false);
+      auto t_reorder_end = std::chrono::steady_clock::now();
+      double reorder_ms = std::chrono::duration<double,std::milli>(t_reorder_end - t_reorder_start).count();
+      total_reorder_ms += reorder_ms;
+
+
+      //node_row_offsets
+      //total_rows
+      //max_rows_per_node
+      // --- [3] Flatten selected examples ---
+      auto t_flatten_sel_start = std::chrono::steady_clock::now();
+
+      #ifdef NO_D2H
+      node_row_offsets.resize(num_nodes + 1);
+      node_row_offsets[0] = 0;
+      size_t total_rows = 0;
+      int max_rows_per_node = 0;
+      for (int n = 0; n < num_nodes; ++n) {
+        node_row_offsets[n + 1] = node_row_offsets[n] + depth_batch[n].d_sel_count;
+        total_rows += depth_batch[n].d_sel_count;
+        if (depth_batch[n].d_sel_count > max_rows_per_node) {
+            max_rows_per_node = depth_batch[n].d_sel_count;
+        }
+      }
+      #else
+      auto flat_sel_result =
+          internal::FlattenSelectedExamples(depth_batch);
+      auto& sel_spans = flat_sel_result.sel_spans;
+      auto& inactive_spans = flat_sel_result.inactive_spans;
+      const size_t total_rows = flat_sel_result.total_rows;
+      const int max_rows_per_node = flat_sel_result.max_rows_per_node;
+
+      node_row_offsets = std::move(flat_sel_result.node_row_offsets);
+      for (int n = 0; n < num_nodes; ++n) {
+          const size_t span_bytes = sel_spans[n].size() * sizeof(UnsignedExampleIdx);
+          std::memcpy(flat_sel.data() + node_row_offsets[n],
+                      sel_spans[n].data(), span_bytes);
+      }
+      #endif
+
+      auto t_flatten_sel_end = std::chrono::steady_clock::now();
+      double flatten_sel_ms = std::chrono::duration<double,std::milli>(t_flatten_sel_end - t_flatten_sel_start).count();
+      total_flatten_sel_ms += flatten_sel_ms;
+
+      // --- [4] Flatten projections ---
+      auto t_flatten_proj_start = std::chrono::steady_clock::now();
+      auto flat_proj_result =
+          internal::FlattenProjections(all_node_projs, num_proj, num_nodes);
+      auto& flat_proj_col_idx = flat_proj_result.col_idx;
+      auto& flat_proj_weights = flat_proj_result.weights;
+      auto& proj_offsets = flat_proj_result.offsets;
+      const int num_segments = num_proj * num_nodes;
+
+      // Remap YDF attribute indices to flat data column positions.
+      for (auto& idx : flat_proj_col_idx) {
+        idx = attr_to_flat_col[idx];
+      }
+
+      auto t_flatten_proj_end = std::chrono::steady_clock::now();
+      double flatten_proj_ms = std::chrono::duration<double,std::milli>(t_flatten_proj_end - t_flatten_proj_start).count();
+      total_flatten_proj_ms += flatten_proj_ms;
+
+      // --- [5] cudaMalloc metadata buffers ---
+      auto t_malloc_start = std::chrono::steady_clock::now();
+      int* d_offset = nullptr;
+      int* d_flat_projection_col_idx = nullptr;
+      float* d_flat_projection_weights = nullptr;
+      int* d_node_row_off = nullptr;
+      CUDA_CHECK(cudaMalloc(&d_offset, (num_segments + 1) * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(&d_flat_projection_col_idx, flat_proj_col_idx.size() * sizeof(int)));
+      CUDA_CHECK(cudaMalloc(&d_flat_projection_weights, flat_proj_weights.size() * sizeof(float)));
+      CUDA_CHECK(cudaMalloc(&d_node_row_off, (num_nodes + 1) * sizeof(int)));
+      auto t_malloc_end = std::chrono::steady_clock::now();
+      double malloc_ms = std::chrono::duration<double,std::milli>(t_malloc_end - t_malloc_start).count();
+      total_malloc_ms += malloc_ms;
+
+      // --- [6] cudaMemcpy H→D (pinned flat_sel) ---
+      auto t_h2d_start = std::chrono::steady_clock::now();
+
+      #ifndef NO_D2H
+      CUDA_CHECK(cudaMemcpy(d_selected_examples, flat_sel.data(), total_rows * sizeof(int), cudaMemcpyHostToDevice));
+      #endif
+
+      CUDA_CHECK(cudaMemcpy(d_offset, proj_offsets.data(), (num_segments + 1) * sizeof(int), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_flat_projection_col_idx, flat_proj_col_idx.data(), flat_proj_col_idx.size() * sizeof(int), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_flat_projection_weights, flat_proj_weights.data(), flat_proj_weights.size() * sizeof(float), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_node_row_off, node_row_offsets.data(), (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+      auto t_h2d_end = std::chrono::steady_clock::now();
+      double h2d_ms = std::chrono::duration<double,std::milli>(t_h2d_end - t_h2d_start).count();
+      total_h2d_ms += h2d_ms;
+
+      // --- [7] Kernel ---
+      // Common to both combined and not combined
+      auto t_kernel_start = std::chrono::steady_clock::now();
+      const int num_block = 256;
+      const int blocks_per_node = (max_rows_per_node + num_block - 1) / num_block;
+
+      auto t_prefixsum_start = std::chrono::steady_clock::now();
+
+      std::vector<int> h_node_block_off(num_nodes + 1);
+      h_node_block_off[0] = 0;
+      for (int i = 0; i < num_nodes; ++i) {
+          int rows_i = node_row_offsets[i + 1] - node_row_offsets[i];
+          h_node_block_off[i + 1] = h_node_block_off[i] + (rows_i + num_block - 1) / num_block;
+      }
+      int total_node_blocks = h_node_block_off[num_nodes];
+
+      int* d_node_block_off = nullptr;
+      CUDA_CHECK(cudaMalloc(&d_node_block_off, (num_nodes + 1) * sizeof(int)));
+      CUDA_CHECK(cudaMemcpy(d_node_block_off, h_node_block_off.data(),
+                            (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+      std::vector<int> h_meta_block_off(num_nodes + 1);
+      h_meta_block_off[0] = 0;
+      for (int i = 0; i < num_nodes; ++i) {
+          int blocks_node = h_node_block_off[i + 1] - h_node_block_off[i];
+          h_meta_block_off[i + 1] = h_meta_block_off[i] + (blocks_node + 255) / 256;
+      }
+      int total_meta_blocks = h_meta_block_off[num_nodes];
+
+      int* d_meta_block_off = nullptr;
+      CUDA_CHECK(cudaMalloc(&d_meta_block_off, (num_nodes + 1) * sizeof(int)));
+      CUDA_CHECK(cudaMemcpy(d_meta_block_off, h_meta_block_off.data(),
+                            (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice));
+
+      auto t_prefixsum_end = std::chrono::steady_clock::now();
+      double prefixsum_ms = std::chrono::duration<double,std::milli>(t_prefixsum_end - t_prefixsum_start).count();
+      total_prefixsum_ms += prefixsum_ms;
+
+        // ColumnAddProjectionKernel_DRSW_1_wrap(d_flat_data,
+        //                                       d_selected_examples,
+        //                                       d_col_add_projected,
+        //                                       d_node_ids,
+        //                                       d_node_offsets,
+        //                                       d_offset,
+        //                                       d_flat_projection_col_idx,
+        //                                       d_flat_projection_weights,
+        //                                       d_node_row_off,
+        //                                       num_proj,
+        //                                       num_rows,
+        //                                       num_nodes,
+        //                                       total_rows);
+
+      // --- 2D compacted grid (no wasted blocks) --- (ACTIVE)
+      ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data,
+                                              d_selected_examples,
+                                              d_col_add_projected,
+                                              d_offset,
+                                              d_flat_projection_col_idx,
+                                              d_flat_projection_weights,
+                                              d_node_row_off,
+                                              d_node_block_off,
+                                              num_nodes,
+                                              num_proj,
+                                              num_rows,
+                                              total_rows,
+                                              total_node_blocks);
+
+
+      // --- VERIFY: Run DRSW_1 into a separate buffer and compare with SRDW ---
+      // {
+      //   const size_t proj_buf_bytes = static_cast<size_t>(total_rows) * num_proj * sizeof(float);
+      //   float* d_drsw_projected = nullptr;
+      //   CUDA_CHECK(cudaMalloc(&d_drsw_projected, proj_buf_bytes));
+
+      //   ColumnAddProjectionKernel_DRSW_1_wrap(d_flat_data,
+      //                                         d_selected_examples,
+      //                                         d_drsw_projected,
+      //                                         d_node_ids,
+      //                                         d_node_offsets,
+      //                                         d_offset,
+      //                                         d_flat_projection_col_idx,
+      //                                         d_flat_projection_weights,
+      //                                         d_node_row_off,
+      //                                         num_proj,
+      //                                         num_rows,
+      //                                         num_nodes,
+      //                                         total_rows);
+
+      //   std::vector<float> h_srdw(static_cast<size_t>(total_rows) * num_proj);
+      //   std::vector<float> h_drsw(static_cast<size_t>(total_rows) * num_proj);
+      //   CUDA_CHECK(cudaMemcpy(h_srdw.data(), d_col_add_projected, proj_buf_bytes, cudaMemcpyDeviceToHost));
+      //   CUDA_CHECK(cudaMemcpy(h_drsw.data(), d_drsw_projected, proj_buf_bytes, cudaMemcpyDeviceToHost));
+
+      //   int mismatches = 0;
+      //   float max_diff = 0.0f;
+      //   for (size_t i = 0; i < h_srdw.size(); ++i) {
+      //     float diff = std::abs(h_srdw[i] - h_drsw[i]);
+      //     if (diff > 1e-5f) {
+      //       if (mismatches < 5) {
+      //         std::cerr << "  MISMATCH idx=" << i
+      //                   << " SRDW=" << h_srdw[i]
+      //                   << " DRSW=" << h_drsw[i]
+      //                   << " diff=" << diff << "\n";
+      //       }
+      //       mismatches++;
+      //     }
+      //     if (diff > max_diff) max_diff = diff;
+      //   }
+      //   std::cerr << "VERIFY D" << current_depth
+      //             << " nodes=" << num_nodes
+      //             << " total_elems=" << h_srdw.size()
+      //             << " mismatches=" << mismatches
+      //             << " max_diff=" << max_diff << "\n";
+
+      //   CUDA_CHECK(cudaFree(d_drsw_projected));
+      // }
+
+      // --- 2D per-thread UpperBound (one thread per row) ---
+      // ColumnAddProjectionKernel_SRDW_1_2D_perthread_wrap(d_flat_data,
+      //                                         d_selected_examples,
+      //                                         d_col_add_projected,
+      //                                         d_offset,
+      //                                         d_flat_projection_col_idx,
+      //                                         d_flat_projection_weights,
+      //                                         d_node_row_off,
+      //                                         num_nodes,
+      //                                         num_proj,
+      //                                         num_rows,
+      //                                         total_rows);
+      // --- 3D grid based on max_rows_per_node (for comparison) ---
+      // ColumnAddProjectionKernel_SRDW_1_wrap(d_flat_data,
+      //                                         d_selected_examples,
+      //                                         d_col_add_projected,
+      //                                         d_offset,
+      //                                         d_flat_projection_col_idx,
+      //                                         d_flat_projection_weights,
+      //                                         d_node_row_off,
+      //                                         num_nodes,
+      //                                         num_proj,
+      //                                         num_rows,
+      //                                         total_rows,
+      //                                         blocks_per_node);
+
+
+      auto t_kernel_end = std::chrono::steady_clock::now();
+      double kernel_ms = std::chrono::duration<double,std::milli>(t_kernel_end - t_kernel_start).count();
+      total_kernel_ms += kernel_ms;
+
+
+        double d2h_ms = 0.0, free_ms = 0.0, node_train_ms = 0.0;
+        double gpu_hist_ms = 0.0;
+
+  
+        // // --- [7.5] Block Min/Max ---
+      if (combined) // BFS Only and GPU Apply Projection on Evaluate Projection
+      {
+        auto t_gpu_hist_start = std::chrono::steady_clock::now();
+        const int total_blocks = total_node_blocks * num_proj;
+        float *d_block_min = nullptr, *d_block_max = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_block_min, total_blocks * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_block_max, total_blocks * sizeof(float)));
+
+        auto t_blockmm_start = std::chrono::steady_clock::now();
+        // --- 2D compacted grid (no wasted blocks) ---
+        BlockMinMax_2D_wrap(
+                          d_col_add_projected,
+                          d_node_row_off,
+                          d_block_min,
+                          d_block_max,
+                          d_node_block_off,
+                          num_nodes,
+                          num_proj,
+                          total_node_blocks);
+        // --- 3D grid based on max_rows_per_node (for comparison) ---
+        // BlockMinMax_wrap(
+        //                   d_col_add_projected,
+        //                   d_node_row_off,
+        //                   d_block_min,
+        //                   d_block_max,
+        //                   d_node_block_off,
+        //                   num_nodes,
+        //                   num_proj,
+        //                   blocks_per_node);
+        auto t_blockmm_end = std::chrono::steady_clock::now();
+        double blockmm_ms = std::chrono::duration<double,std::milli>(t_blockmm_end - t_blockmm_start).count();
+
+        float *d_min_val = nullptr, *d_max_val = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_min_val, num_segments * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_max_val, num_segments * sizeof(float)));
+        {
+          std::vector<float> init_min(num_segments, std::numeric_limits<float>::infinity());
+          std::vector<float> init_max(num_segments, -std::numeric_limits<float>::infinity());
+          CUDA_CHECK(cudaMemcpy(d_min_val, init_min.data(), num_segments * sizeof(float), cudaMemcpyHostToDevice));
+          CUDA_CHECK(cudaMemcpy(d_max_val, init_max.data(), num_segments * sizeof(float), cudaMemcpyHostToDevice));
+        }
+
+        auto t_finalmm_start = std::chrono::steady_clock::now();
+        finalMinMaxReduceAtomic_2D_wrap(d_block_min,
+                                        d_block_max,
+                                        d_node_block_off,
+                                        d_meta_block_off,
+                                        d_min_val,
+                                        d_max_val,
+                                        num_nodes,
+                                        num_proj,
+                                        total_meta_blocks);
+
+        // finalMinMaxReduceAtomic_wrap(d_block_min,
+        //                             d_block_max,
+        //                             d_node_block_off,
+        //                             d_min_val,
+        //                             d_max_val,
+        //                             num_nodes,
+        //                             num_proj,
+        //                             blocks_per_node);
+
+        auto t_finalmm_end = std::chrono::steady_clock::now();
+        double finalmm_ms = std::chrono::duration<double,std::milli>(t_finalmm_end - t_finalmm_start).count();
+
+        const int num_bins = dt_config.numerical_split().num_candidates();
+        const int splits_per_segment = num_bins - 1;
+        float* d_sorted_candidate_splits = nullptr;
+        const int total_splits = num_segments * splits_per_segment;
+        CUDA_CHECK(cudaMalloc(&d_sorted_candidate_splits, total_splits * sizeof(float)));
+        int rng_seed = (*random)();
+
+        auto t_randbnd_start = std::chrono::steady_clock::now();
+        RandomBoundaries_wrap(splits_per_segment,
+                            d_min_val,
+                            d_max_val,
+                            d_sorted_candidate_splits,
+                            num_segments,
+                            rng_seed);
+        auto t_randbnd_end = std::chrono::steady_clock::now();
+        double randbnd_ms = std::chrono::duration<double,std::milli>(t_randbnd_end - t_randbnd_start).count();
+
+        // Device histograms   (#segments × num_bins)
+        const int hist_elems = num_segments * num_bins;
+        int *d_hist_class0, *d_hist_class1;
+        CUDA_CHECK(cudaMalloc(&d_hist_class0, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_hist_class1, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_hist_class0, 0, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_hist_class1, 0, hist_elems * sizeof(int)));
+
+        auto t_buildhist_start = std::chrono::steady_clock::now();
+        BuildHistogramRandomKernel_2D_wrap(d_col_add_projected,
+                                        d_selected_examples,
+                                        d_labels,
+                                        d_hist_class0,
+                                        d_hist_class1,
+                                        num_proj,
+                                        num_bins,
+                                        d_sorted_candidate_splits,
+                                        d_node_row_off,
+                                        d_node_block_off,
+                                        num_nodes,
+                                        total_node_blocks);
+
+        // --- 3D grid based on max_rows_per_node (for comparison) ---
+        // BuildHistogramRandomKernel_wrap(d_col_add_projected,
+        //                                 d_selected_examples,
+        //                                 d_labels,
+        //                                 d_hist_class0,
+        //                                 d_hist_class1,
+        //                                 num_proj,
+        //                                 num_bins,
+        //                                 d_sorted_candidate_splits,
+        //                                 d_node_row_off,
+        //                                 num_nodes,
+        //                                 blocks_per_node);
+
+        auto t_buildhist_end = std::chrono::steady_clock::now();
+        double buildhist_ms = std::chrono::duration<double,std::milli>(t_buildhist_end - t_buildhist_start).count();
+
+
+        // Inclusive scan by key  (key = segment id)
+        // hist_elem is num_segments * num_bins
+        float *d_best_gain_per_seg;
+        int *d_best_split_per_seg;
+        CUDA_CHECK(cudaMalloc(&d_best_gain_per_seg, num_segments * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_best_split_per_seg, num_segments * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_best_gain_per_seg, 0xFF, num_segments * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_best_split_per_seg, 0xFF, num_segments * sizeof(int)));
+
+        int* d_prefix_0;
+        int* d_prefix_1;
+        float* d_out_per_bin_per_proj;
+        CUDA_CHECK(cudaMalloc(&d_prefix_0, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_prefix_1, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_prefix_0, 0, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_prefix_1, 0, hist_elems * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_out_per_bin_per_proj, hist_elems * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_out_per_bin_per_proj, 0, hist_elems * sizeof(float)));
+
+        auto t_entropy_start = std::chrono::steady_clock::now();
+        // Note: grid is (1, num_nodes, num_proj) — already one block per segment,
+        // no wasted blocks to compact. 2D version would not improve this.
+        FindBestEntropySplitKernel_wrap(d_hist_class0,
+                                        d_hist_class1,
+                                        d_best_gain_per_seg,
+                                        d_best_split_per_seg,
+                                        num_segments,
+                                        num_bins,
+                                        num_nodes,
+                                        num_proj,
+                                        hist_elems,
+                                        d_prefix_0,
+                                        d_prefix_1,
+                                        d_out_per_bin_per_proj);
+
+        auto t_entropy_end = std::chrono::steady_clock::now();
+        double entropy_ms = std::chrono::duration<double,std::milli>(t_entropy_end - t_entropy_start).count();
+
+
+        float* d_best_gain_per_node;
+        int* d_best_proj_per_node;
+        int* d_best_split_per_node;
+        int* d_num_pos_per_node;
+        float* d_best_threshold_per_node;
+        CUDA_CHECK(cudaMalloc(&d_best_gain_per_node,      num_nodes * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_best_proj_per_node,      num_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_best_split_per_node,     num_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_num_pos_per_node,        num_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_best_threshold_per_node, num_nodes * sizeof(float)));
+
+        auto t_bestnode_start = std::chrono::steady_clock::now();
+        BestProjectionPerNodeKernel_wrap(d_best_gain_per_seg,
+                                          d_best_split_per_seg,
+                                          d_best_gain_per_node,
+                                          d_best_proj_per_node,
+                                          d_best_split_per_node,
+                                          d_num_pos_per_node,
+                                          d_best_threshold_per_node,
+                                          num_nodes,
+                                          num_proj,
+                                          num_bins,
+                                          d_prefix_0,
+                                          d_prefix_1,
+                                          d_sorted_candidate_splits);
+        auto t_bestnode_end = std::chrono::steady_clock::now();
+        double bestnode_ms = std::chrono::duration<double,std::milli>(t_bestnode_end - t_bestnode_start).count();
+
+        // D2H Best Projection and Condition Data Per Node
+        auto t_d2h_hist_start = std::chrono::steady_clock::now();
+        std::vector<int> best_projection_per_node_index(num_nodes);
+        std::vector<int> best_split_per_node(num_nodes);
+        std::vector<float> best_gain_per_node(num_nodes);
+        std::vector<int> num_pos_per_node(num_nodes);
+        std::vector<float> best_threshold_per_node(num_nodes);
+        CUDA_CHECK(cudaMemcpy(best_projection_per_node_index.data(), d_best_proj_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(best_split_per_node.data(), d_best_split_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(best_gain_per_node.data(), d_best_gain_per_node, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(num_pos_per_node.data(), d_num_pos_per_node, num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(best_threshold_per_node.data(), d_best_threshold_per_node, num_nodes * sizeof(float), cudaMemcpyDeviceToHost));
+        auto t_d2h_hist_end = std::chrono::steady_clock::now();
+        double d2h_hist_ms = std::chrono::duration<double,std::milli>(t_d2h_hist_end - t_d2h_hist_start).count();
+
+        // Populate the best projection per node
+        std::vector<internal::Projection> best_projection_per_node(num_nodes);
+        std::vector<proto::NodeCondition> best_condition_per_node(num_nodes);
+        std::vector<bool> node_has_split(num_nodes, false);
+        for (int n = 0; n < num_nodes; ++n) {
+          if (best_projection_per_node_index[n] < 0 ||
+              best_projection_per_node_index[n] >= num_proj) continue;
+          node_has_split[n] = true;
+          best_projection_per_node[n] = all_node_projs[n][best_projection_per_node_index[n]];
+          best_condition_per_node[n].set_attribute(best_projection_per_node[n].front().attribute_idx);
+          #ifdef NO_D2H
+          best_condition_per_node[n].set_num_training_examples_with_weight(depth_batch[n].d_sel_count);
+          best_condition_per_node[n].set_num_training_examples_without_weight(depth_batch[n].d_sel_count);
+          #else
+          best_condition_per_node[n].set_num_training_examples_with_weight(sel_spans[n].size());
+          best_condition_per_node[n].set_num_training_examples_without_weight(sel_spans[n].size());
+          #endif
+          best_condition_per_node[n].set_num_pos_training_examples_with_weight(num_pos_per_node[n]);
+          best_condition_per_node[n].set_num_pos_training_examples_without_weight(num_pos_per_node[n]);
+          best_condition_per_node[n].set_split_score(best_gain_per_node[n]);
+          best_condition_per_node[n].set_na_value(true);
+        }
+        auto t_gpu_hist_end = std::chrono::steady_clock::now();
+        gpu_hist_ms = std::chrono::duration<double,std::milli>(t_gpu_hist_end - t_gpu_hist_start).count();
+
+
+        // Grayed out for 100 trees
+        // std::cerr << "  D" << current_depth << " RHistSplit breakdown:"
+        //           << " BlockMM=" << blockmm_ms << "ms"
+        //           << " FinalMM=" << finalmm_ms << "ms"
+        //           << " RandBnd=" << randbnd_ms << "ms"
+        //           << " BuildHist=" << buildhist_ms << "ms"
+        //           << " Entropy=" << entropy_ms << "ms"
+        //           << " BestNode=" << bestnode_ms << "ms"
+        //           << " D2H=" << d2h_hist_ms << "ms"
+        //           << " TOTAL=" << gpu_hist_ms << "ms\n";
+
+        total_gpu_hist_ms += gpu_hist_ms;
+        total_blockmm_ms += blockmm_ms;
+        total_finalmm_ms += finalmm_ms;
+        total_randbnd_ms += randbnd_ms;
+        total_buildhist_ms += buildhist_ms;
+        total_entropy_ms += entropy_ms;
+        total_bestnode_ms += bestnode_ms;
+        total_d2h_hist_ms += d2h_hist_ms;
+
+        //d_col_add_projected, float*
+        //d_selected_examples, int*
+        //d_best_proj_per_node, int*
+        //d_best_threshold_per_node, float*
+        //d_node_row_off, int*
+        //num_proj, int
+        //num_nodes, y dim, int
+        //total_rows, int
+        //max_rows_per_node, int
+        
+        std::chrono::steady_clock::time_point t_split_examples_start = std::chrono::steady_clock::now();
+        std::vector<std::vector<int>> pos_class_counts;
+        std::vector<std::vector<int>> neg_class_counts;
+        std::vector<int> pos_counts;
+        std::vector<int> neg_counts;
+
+        // Gray this out for Best Condition only
+        #ifdef NO_D2H
+        std::vector<int> child_offsets;
+        ASSIGN_OR_RETURN(auto example_splits,
+          SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap(
+          // SplitExamplesInPlaceKernel_all_depth_No_D2H_wrap(
+                d_col_add_projected,
+                d_selected_examples,
+                d_best_proj_per_node,
+                d_best_threshold_per_node,
+                d_node_row_off,
+                node_row_offsets.data(),
+                d_node_block_off,
+                total_node_blocks,
+                num_proj,
+                num_nodes,
+                total_rows,
+                max_rows_per_node,
+                d_labels,
+                num_classes,
+                pos_class_counts,
+                neg_class_counts,
+                pos_counts,
+                neg_counts,
+                node_has_split,
+                child_offsets));
+        #else
+        ASSIGN_OR_RETURN(auto example_splits,
+          SplitExamplesInPlaceKernel_all_depth_wrap(
+                d_col_add_projected,
+                d_selected_examples,
+                d_best_proj_per_node,
+                d_best_threshold_per_node,
+                d_node_row_off,
+                node_row_offsets.data(),
+                d_node_block_off,
+                total_node_blocks,
+                sel_spans,
+                inactive_spans,
+                num_proj,
+                num_nodes,
+                total_rows,
+                max_rows_per_node,
+                d_labels,
+                num_classes,
+                pos_class_counts,
+                neg_class_counts));
+        #endif
+
+
+        // Grayed out for 100 trees
+        std::chrono::steady_clock::time_point t_split_examples_end = std::chrono::steady_clock::now();
+        double split_examples_ms = std::chrono::duration<double,std::milli>(t_split_examples_end - t_split_examples_start).count();
+        total_split_all_depth_ms += split_examples_ms;
+        // Grayed out for 100 trees
+        // PrintAndResetSplitAllDepthTimers(current_depth);
+
+      // --- [8] cudaFree metadata buffers ---
+        auto t_free_start_iter = std::chrono::steady_clock::now();
+
+        // Apply Projection
+        cudaFree(d_offset);
+        cudaFree(d_flat_projection_col_idx);
+        cudaFree(d_flat_projection_weights);
+        cudaFree(d_node_row_off); //reused in Block Min/Max and Histogram
+        cudaFree(d_node_block_off); //reused in Apply Projection and Block Min/Max
+        cudaFree(d_meta_block_off); //reused in finalMinMaxReduceAtomic 2D
+
+        //Block Min/Max
+        cudaFree(d_block_min); //reused in finalMinMaxReduceAtomic
+        cudaFree(d_block_max); //reused in finalMinMaxReduceAtomic
+
+        //Final Min/Max
+        cudaFree(d_min_val); //reused in Random Boundaries
+        cudaFree(d_max_val); //reused in Random Boundaries
+
+        // Random Boundaries
+        cudaFree(d_sorted_candidate_splits); //reused in Histogram
+
+        // Histogram
+        cudaFree(d_hist_class0); //reused in FindBestEntropySplit
+        cudaFree(d_hist_class1); //reused in FindBestEntropySplit
+
+        //Find Best Entropy Split
+        cudaFree(d_best_gain_per_seg); //reused in BestProjectionPerNode
+        cudaFree(d_best_split_per_seg); //reused in BestProjectionPerNode
+        cudaFree(d_prefix_0); //reused later
+        cudaFree(d_prefix_1); //reused later
+        cudaFree(d_out_per_bin_per_proj);
+
+        // Best Projection Per Node
+        cudaFree(d_best_gain_per_node);
+        cudaFree(d_best_proj_per_node);
+        cudaFree(d_best_split_per_node);
+        cudaFree(d_num_pos_per_node);
+        cudaFree(d_best_threshold_per_node);    
+
+        auto t_free_end_iter = std::chrono::steady_clock::now();
+        free_ms = std::chrono::duration<double,std::milli>(t_free_end_iter - t_free_start_iter).count();
+        total_free_ms += free_ms;
+
+        auto t_node_train_start = std::chrono::steady_clock::now();
+        for (int n = 0; n < num_nodes; ++n) {
+          if (!node_has_split[n]) {
+            depth_batch[n].node->FinalizeAsLeaf(dt_config.store_detailed_label_distribution());
+            continue;
+          }
+          auto node_config = internal_config;
+          node_config.best_threshold = best_threshold_per_node[n];
+          node_config.best_condition = &best_condition_per_node[n];
+          node_config.best_projection = &best_projection_per_node[n];
+          #ifdef NO_D2H
+          node_config.rows_start = child_offsets[n];
+          #else
+          node_config.rows_start = node_row_offsets[n];
+          #endif
+          #ifdef NO_D2H
+          node_config.rows_node = depth_batch[n].d_sel_count;
+          #else
+          node_config.rows_node = sel_spans[n].size();
+          #endif
+          node_config.best_projection_index = best_projection_per_node_index[n];
+          node_config.num_proj = num_proj;
+          if (n < pos_class_counts.size() && !pos_class_counts[n].empty()) {
+            node_config.skip_set_leaf_on_children = true;
+            node_config.gpu_num_classes = num_classes;
+            node_config.gpu_pos_class_counts = pos_class_counts[n];
+            node_config.gpu_neg_class_counts = neg_class_counts[n];
+            #if defined(NO_D2H)
+            node_config.gpu_pos_count = pos_counts[n];
+            node_config.gpu_neg_count = neg_counts[n];
+            #else
+            node_config.example_split = example_splits[n];
+            #endif
+          }
+          node_config.gpu_projected_data = d_col_add_projected;
+          RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                    deployment, weights, node_config, random,
+                                    cache, std::move(depth_batch[n]),
+                                    node_queue));
+        }
+
+
+        auto t_node_train_end = std::chrono::steady_clock::now();
+        node_train_ms = std::chrono::duration<double,std::milli>(t_node_train_end - t_node_train_start).count();
+        total_node_train_ms += node_train_ms;
+
+        auto t_depth_end = std::chrono::steady_clock::now();
+        // Grayed out for 100 trees
+        // std::cerr << "D" << current_depth
+        //           << " nodes=" << num_nodes
+        //           << " rows=" << total_rows
+        //           << " total=" << std::chrono::duration<double,std::milli>(t_depth_end - t_proj_start).count() << "ms"
+        //           << " SplitAllDepth=" << split_examples_ms << "ms"
+        //           << "\n";
+        // Grayed out for 100 trees
+        // std::cerr << "D" << current_depth
+        //           << " nodes=" << num_nodes
+        //           << " rows=" << total_rows
+        //           << " sample=" << sample_ms << "ms"
+        //           << " reorder=" << reorder_ms << "ms"
+        //           << " flat_sel=" << flatten_sel_ms << "ms"
+        //           << " flat_proj=" << flatten_proj_ms << "ms"
+        //           << " malloc=" << malloc_ms << "ms"
+        //           << " h2d=" << h2d_ms << "ms"
+        //           << " APkernel=" << kernel_ms << "ms"
+        //           << " RHistSplit=" << gpu_hist_ms << "ms"
+        //           << " free=" << free_ms << "ms"
+        //           << " NodeTrain=" << node_train_ms << "ms"
+        //           << "\n";
+      }
+
+      else // BFS Only and GPU Apply Projection only
+      {
+        // --- [9] cudaMemcpy D→H (pinned) ---
+        auto t_d2h_start = std::chrono::steady_clock::now();
+        const size_t d2h_bytes = total_rows * num_proj * sizeof(float);
+        CUDA_CHECK(cudaMemcpy(pinned_projected, d_col_add_projected,
+                  d2h_bytes, cudaMemcpyDeviceToHost));
+        auto t_d2h_end = std::chrono::steady_clock::now();
+        d2h_ms = std::chrono::duration<double,std::milli>(t_d2h_end - t_d2h_start).count();
+        total_d2h_ms += d2h_ms;
+
+        // --- [10] Memory cleanup ---
+        auto t_free_start_iter = std::chrono::steady_clock::now();
+        cudaFree(d_offset);
+        cudaFree(d_flat_projection_col_idx);
+        cudaFree(d_flat_projection_weights);
+        cudaFree(d_node_row_off);
+        cudaFree(d_node_block_off);
+        cudaFree(d_meta_block_off);
+
+        auto t_free_end_iter = std::chrono::steady_clock::now();
+        free_ms = std::chrono::duration<double,std::milli>(t_free_end_iter - t_free_start_iter).count();
+        total_free_ms += free_ms;
+
+        // --- [11] Split finding ---
+        auto t_node_train_start = std::chrono::steady_clock::now();
+        size_t gpu_offset = 0;
+        for (int n = 0; n < num_nodes; ++n) {
+          #ifdef NO_D2H
+          const size_t slab = num_proj * depth_batch[n].d_sel_count;
+          #else
+          const size_t slab = num_proj * sel_spans[n].size();
+          #endif
+          auto node_config = internal_config;
+          node_config.depthwise_projection_defs = &all_node_projs[n];
+          node_config.depthwise_monotonic = &all_node_mono[n];
+          node_config.precomputed_projected_values =
+              absl::MakeConstSpan(pinned_projected + gpu_offset, slab);
+          RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                    deployment, weights, node_config, random,
+                                    cache, std::move(depth_batch[n]),
+                                    node_queue));
+          gpu_offset += slab;
+        }
+        auto t_node_train_end = std::chrono::steady_clock::now();
+        node_train_ms = std::chrono::duration<double,std::milli>(t_node_train_end - t_node_train_start).count();
+        total_node_train_ms += node_train_ms;
+
+        // Grayed out for 100 trees
+        // std::cerr << "D" << current_depth
+        //           << " nodes=" << num_nodes
+        //           << " rows=" << total_rows
+        //           << " sample=" << sample_ms << "ms"
+        //           << " reorder=" << reorder_ms << "ms"
+        //           << " flat_sel=" << flatten_sel_ms << "ms"
+        //           << " flat_proj=" << flatten_proj_ms << "ms"
+        //           << " malloc=" << malloc_ms << "ms"
+        //           << " h2d=" << h2d_ms << "ms"
+        //           << " APkernel=" << kernel_ms << "ms"
+        //           << " d2h=" << d2h_ms << "ms"
+        //           << " free=" << free_ms << "ms"
+        //           << " NodeTrain(+EP)=" << node_train_ms << "ms"
+        //           << "\n";
+        // PrintAndResetSplitAllDepthTimers(current_depth);
+      }
+  }
+    #else
+    // CPU-only BFS path (no GPU)
+    for (size_t i = 0; i < depth_batch.size(); ++i) {
+      auto& nae = depth_batch[i];
+      RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                deployment, weights, internal_config, random,
+                                cache, std::move(nae), node_queue));
+    }
+    #endif
+    auto end_time_depth_all = std::chrono::steady_clock::now();
+    // std::cerr << "D" << current_depth << " TOTAL="
+    //           << std::chrono::duration<double, std::milli>(end_time_depth_all - start_time_depth).count()
+    //           << "ms" << std::endl;
+  }
+  #ifdef USE_GPU
+    if (combined) {
+      std::cerr << "TOTAL (COMBINED)"
+                << " sample=" << total_sample_ms << "ms"
+                << " reorder=" << total_reorder_ms << "ms"
+                << " flat_sel=" << total_flatten_sel_ms << "ms"
+                << " flat_proj=" << total_flatten_proj_ms << "ms"
+                << " malloc=" << total_malloc_ms << "ms"
+                << " h2d=" << total_h2d_ms << "ms"
+                << " APkernel=" << total_kernel_ms << "ms"
+                << " APTotal=" << total_reorder_ms + total_flatten_sel_ms + total_flatten_proj_ms + total_malloc_ms + total_h2d_ms + total_kernel_ms << "ms"
+                << " RHistSplit=" << total_gpu_hist_ms << "ms"
+                << " [BlockMM=" << total_blockmm_ms
+                << " FinalMM=" << total_finalmm_ms
+                << " RandBnd=" << total_randbnd_ms
+                << " BuildHist=" << total_buildhist_ms
+                << " Entropy=" << total_entropy_ms
+                << " BestNode=" << total_bestnode_ms
+                << " D2H=" << total_d2h_hist_ms
+                << " PrefixSum=" << total_prefixsum_ms << "]"
+                << " SplitAllDepth=" << total_split_all_depth_ms << "ms"
+                << " free=" << total_free_ms << "ms"
+                << " NodeTrain=" << total_node_train_ms << "ms\n";
+      std::cerr << "NodeTrain leaf exits: early_leaf=" << early_leaf_count
+                << " no_split_leaf=" << no_split_leaf_count << "\n";
+      early_leaf_count = 0;
+      no_split_leaf_count = 0;
+      if (total_node_train_count > 0) {
+        std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+                  << " find_best=" << total_find_best_ms << "ms"
+                  << " split_examples=" << total_split_examples_ms << "ms"
+                  << " set_leaf=" << total_set_leaf_ms << "ms"
+                  << " constraints=" << total_constraints_ms << "ms"
+                  << " push=" << total_node_push_ms << "ms"
+                  << " nodes=" << total_node_train_count << "\n";
+      }
+      total_find_best_ms = 0;
+      total_split_examples_ms = 0;
+      total_node_setup_ms = 0;
+      total_set_leaf_ms = 0;
+      total_constraints_ms = 0;
+      total_node_push_ms = 0;
+      total_node_train_count = 0;
+    } else {
+      std::cerr << "TOTAL (NOT COMBINED)"
+                << " sample=" << total_sample_ms << "ms"
+                << " reorder=" << total_reorder_ms << "ms"
+                << " flat_sel=" << total_flatten_sel_ms << "ms"
+                << " flat_proj=" << total_flatten_proj_ms << "ms"
+                << " malloc=" << total_malloc_ms << "ms"
+                << " h2d=" << total_h2d_ms << "ms"
+                << " APkernel=" << total_kernel_ms << "ms"
+                << " d2h=" << total_d2h_ms << "ms"
+                << " APtotal=" << total_reorder_ms + total_flatten_sel_ms + total_flatten_proj_ms + total_malloc_ms + total_h2d_ms + total_kernel_ms + total_d2h_ms << "ms"
+                << " free=" << total_free_ms << "ms"
+                << " NodeTrain(+EP)=" << total_node_train_ms << "ms\n";
+
+      std::cerr << "NodeTrain leaf exits: early_leaf=" << early_leaf_count
+                << " no_split_leaf=" << no_split_leaf_count << "\n";
+      early_leaf_count = 0;
+      no_split_leaf_count = 0;
+      internal::PrintAndResetDfsTimers();
+    if (total_node_train_count > 0) {
+      std::cerr << "NodeTrain TOTAL setup=" << total_node_setup_ms << "ms"
+                << " find_best=" << total_find_best_ms << "ms"
+                << " split_examples=" << total_split_examples_ms << "ms"
+                << " set_leaf=" << total_set_leaf_ms << "ms"
+                << " apply_constraint=" << total_apply_constraint_ms << "ms"
+                << " constraints=" << total_constraints_ms << "ms"
+                << " push=" << total_node_push_ms << "ms"
+                << " nodes=" << total_node_train_count << "\n";
+    }
+    total_find_best_ms = 0;
+    total_split_examples_ms = 0;
+    total_node_setup_ms = 0;
+    total_set_leaf_ms = 0;
+    total_apply_constraint_ms = 0;
+    total_constraints_ms = 0;
+    total_node_push_ms = 0;
+    total_node_train_count = 0;
+    }
+  #endif
+
+
+  auto t_free_start = std::chrono::steady_clock::now();
+  if (pinned_projected) cudaFreeHost(pinned_projected);
+  #ifndef NO_D2H
+  cudaFree(d_selected_examples);
+  #endif
+  cudaFree(d_col_add_projected);
+  cudaFree(d_node_ids);
+  cudaFree(d_node_offsets);
+  auto t_free_end = std::chrono::steady_clock::now();
+  // std::cerr << "CLEANUP free per tree="
+  //           << std::chrono::duration<double,std::milli>(t_free_end - t_free_start).count()
+  //           << "ms\n";
+  return absl::OkStatus();
+}
+
+absl::Status ApplyConstraintOnNode(const NodeConstraints& constraint,
+                                   NodeWithChildren* node) {
+  if (!constraint.min_max_output.has_value()) {
+    return absl::OkStatus();
+  }
+  auto* reg = node->mutable_node()->mutable_regressor();
+  STATUS_CHECK(reg->has_top_value());
+  reg->set_top_value(std::clamp(reg->top_value(),
+                                constraint.min_max_output.value().min,
+                                constraint.min_max_output.value().max));
+  return absl::OkStatus();
+}
+
+absl::Status DivideMonotonicConstraintToChildren(
+    const NodeConstraints& constraint, bool direction_increasing,
+    const bool check_monotonic, NodeWithChildren* parent_node,
+    NodeWithChildren* pos_node, NodeWithChildren* neg_node,
+    NodeConstraints* pos_constraint, NodeConstraints* neg_constraint) {
+  STATUS_CHECK(parent_node->node().regressor().has_top_value());
+  STATUS_CHECK(pos_node->node().regressor().has_top_value());
+  STATUS_CHECK(neg_node->node().regressor().has_top_value());
+
+  // TODO: Experiment with other ways to select limit.
+  float limit = parent_node->node().regressor().top_value();
+
+  if (check_monotonic) {
+    // A failure is indicative of an issue with the splitter i.e. the
+    // "FindCondition" function call just before.
+
+    const auto check = [direction_increasing](auto a, auto b) {
+      if (direction_increasing) {
+        STATUS_CHECK_GE(a, b);
+      } else {
+        STATUS_CHECK_LE(a, b);
+      }
+      return absl::OkStatus();
+    };
+
+    const float pos_value = pos_node->node().regressor().top_value();
+    const float neg_value = neg_node->node().regressor().top_value();
+    const float parent_value = parent_node->node().regressor().top_value();
+    RETURN_IF_ERROR(check(pos_value, neg_value));
+    RETURN_IF_ERROR(check(pos_value, parent_value));
+    RETURN_IF_ERROR(check(parent_value, neg_value));
+  }
+  if ((pos_node->node().regressor().top_value() <
+       neg_node->node().regressor().top_value()) == direction_increasing) {
+    const float center = (pos_node->node().regressor().top_value() +
+                          neg_node->node().regressor().top_value()) /
+                         2;
+    pos_node->mutable_node()->mutable_regressor()->set_top_value(center);
+    neg_node->mutable_node()->mutable_regressor()->set_top_value(center);
+    limit = center;
+  }
+
+  if (!pos_constraint->min_max_output.has_value()) {
+    pos_constraint->min_max_output = NodeConstraints::MinMax();
+  }
+  if (!neg_constraint->min_max_output.has_value()) {
+    neg_constraint->min_max_output = NodeConstraints::MinMax();
+  }
+
+  if (direction_increasing) {
+    pos_constraint->min_max_output.value().min = limit;
+    neg_constraint->min_max_output.value().max = limit;
+  } else {
+    pos_constraint->min_max_output.value().max = limit;
+    neg_constraint->min_max_output.value().min = limit;
+  }
+
+  return absl::OkStatus();
+}
+
+int8_t MonotonicConstraintSign(
+    const model::proto::TrainingConfigLinking& config_link,
+    const int attribute_idx) {
+  if (config_link.per_columns_size() == 0 || attribute_idx < 0 ||
+      attribute_idx >= config_link.per_columns_size()) {
+    return 0;
+  }
+  const auto& link_condition_attribute = config_link.per_columns(attribute_idx);
+  if (link_condition_attribute.has_monotonic_constraint()) {
+    const bool direction_increasing =
+        link_condition_attribute.monotonic_constraint().direction() ==
+        model::proto::MonotonicConstraint::INCREASING;
+    return direction_increasing ? +1 : -1;
+  }
+  return 0;
+}
+
+namespace internal {
+
+bool MaskPureSampledOrPrunedAttributeValuesForCategoricalSetGreedySelection(
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    int32_t num_attribute_classes,
+    const absl::Span<const UnsignedExampleIdx> selected_examples,
+    const std::vector<int64_t>&
+        count_examples_without_weights_by_attribute_class,
+    std::vector<bool>* candidate_attributes_bitmap,
+    std::vector<int>* candidate_attributes_list, utils::RandomEngine* random) {
+  std::uniform_real_distribution<float> sampling_dist;
+  const auto min_item_frequency =
+      dt_config.categorical_set_greedy_forward().min_item_frequency();
+  const auto sampling_rate =
+      dt_config.categorical_set_greedy_forward().sampling();
+  const auto max_num_items =
+      dt_config.categorical_set_greedy_forward().max_num_items();
+  candidate_attributes_list->reserve(num_attribute_classes *
+                                     (sampling_rate + 0.1));
+  for (int attr_value = 0; attr_value < num_attribute_classes; attr_value++) {
+    if (max_num_items >= 0 && attr_value >= max_num_items) {
+      // Too many candidate items.
+      (*candidate_attributes_bitmap)[attr_value] = false;
+    } else if (sampling_rate < 1.f && sampling_dist(*random) > sampling_rate) {
+      // Randomly masked item.
+      (*candidate_attributes_bitmap)[attr_value] = false;
+    } else if (count_examples_without_weights_by_attribute_class[attr_value] <
+                   min_item_frequency ||
+               count_examples_without_weights_by_attribute_class[attr_value] >
+                   selected_examples.size() - min_item_frequency) {
+      // Pure item.
+      (*candidate_attributes_bitmap)[attr_value] = false;
+    } else {
+      candidate_attributes_list->push_back(attr_value);
+    }
+  }
+  return !candidate_attributes_list->empty();
+}
+
+absl::StatusOr<std::vector<float>> GenHistogramBins(
+    const proto::NumericalSplit::Type type, const int num_splits,
+    const absl::Span<const float> attributes, const float min_value,
+    const float max_value, utils::RandomEngine* random) {
+  STATUS_CHECK_GE(num_splits, 0);
+  std::vector<float> candidate_splits(num_splits);
+  switch (type) {
+    case proto::NumericalSplit::HISTOGRAM_RANDOM: {
+      std::uniform_real_distribution<float> threshold_distribution(min_value,
+                                                                   max_value);
+      for (auto& candidate_split : candidate_splits) {
+        candidate_split = threshold_distribution(*random);
+      }
+    } break;
+    case proto::NumericalSplit::HISTOGRAM_EQUAL_WIDTH: {
+      for (int split_idx = 0; split_idx < candidate_splits.size();
+           split_idx++) {
+        candidate_splits[split_idx] = min_value + (max_value - min_value) *
+                                                      (split_idx + 0.5f) /
+                                                      candidate_splits.size();
+      }
+    } break;
+    default:
+      return absl::InvalidArgumentError("Numerical histogram not implemented");
+  }
+  hwy::VQSort(candidate_splits.data(), candidate_splits.size(),
+              hwy::SortAscending());
+  return candidate_splits;
+}
+
+absl::StatusOr<ExampleSplitRollingBuffer> SplitExamplesInPlace(
+    const dataset::VerticalDataset& dataset,
+    const SelectedExamplesRollingBuffer examples,
+    const proto::NodeCondition& condition, const bool dataset_is_dense,
+    const bool error_on_wrong_splitter_statistics,
+    const bool examples_are_training_examples) {
+  DCHECK(std::is_sorted(examples.active.begin(), examples.active.end()));
+
+  ExampleSplitRollingBuffer example_split;
+
+  // dataset_is_dense = 0
+  // examples_are_training_examples: 1
+  // error_on_wrong_splitter_statistics: 0
+  RETURN_IF_ERROR(EvalConditionOnDataset(dataset, examples, condition,
+                                         dataset_is_dense, &example_split));
+
+  DCHECK(std::is_sorted(example_split.positive_examples.active.begin(),
+                        example_split.positive_examples.active.end()));
+  DCHECK(std::is_sorted(example_split.negative_examples.active.begin(),
+                        example_split.negative_examples.active.end()));
+
+  // The following test ensure that the effective number of positive examples is
+  // equal to the expected number of positive examples. A miss alignment
+  // generally indicates that the splitter does not work correctly.
+  //
+  // Incorrectly working splitters can make the model worst than expected if
+  // the error happens often. If such error happen rarely, the impact is likely
+  // insignificant.
+  //
+  // This generates an error in unit testing and a warning otherwise.
+  if (examples_are_training_examples &&
+      ABSL_PREDICT_FALSE(
+          (example_split.num_positive() !=
+           condition.num_pos_training_examples_without_weight()) ||
+          (example_split.num_negative() !=
+           examples.size() -
+               condition.num_pos_training_examples_without_weight()))) {
+    const std::string message = absl::Substitute(
+        "[This message is only shown once] The effective split of examples "
+        "does not match the expected split "
+        "returned by the splitter algorithm. This problem can be caused by (1) "
+        "large floating point values (e.g. value>=10e30) or (2) a bug in the "
+        "software. You can turn this error in a warning with "
+        "internal_error_on_wrong_splitter_statistics=false.\n\nDetails:\n"
+        "Num examples: $0\n"
+        "Num positive examples (from split evaluation): $1\n"
+        "Num positive examples (from split learning): $4\n"
+        "Num negative examples (from split evaluation): $2\n"
+        "\n"
+        "Condition: $3\n"
+        "Attribute spec: $5",
+        /*$0*/ examples.size(),
+        /*$1*/ example_split.num_positive(),
+        /*$2*/ example_split.num_negative(),
+        /*$3*/ condition.DebugString(),
+        /*$4*/ condition.num_pos_training_examples_without_weight(),
+        /*$5*/
+        dataset.data_spec().columns(condition.attribute()).DebugString());
+    if (error_on_wrong_splitter_statistics) {
+      return absl::InternalError(message);
+    } else {
+      // Logging this message too often will crash.
+      LOG_FIRST_N(WARNING, 1) << message;
+    }
+  }
+  return example_split;
+}
+
+}  // namespace internal
+
+}  // namespace yggdrasil_decision_forests::model::decision_tree
