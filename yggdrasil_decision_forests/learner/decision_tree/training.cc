@@ -5469,9 +5469,8 @@ absl::Status GrowTreeLocalBFS(
     const char* csv_path = "per_depth_timing.csv";
     if (csv_tree_id == 0) {
       csv_file.open(csv_path, std::ios::out | std::ios::trunc);
-      csv_file << "tree,depth,nodes,rows,wall_ms,sample_ms,flat_sel_ms,flat_proj_ms,"
-               << "h2d_ms,prefixsum_ms,APkernel_ms,"
-               << "BlockMM_ms,FinalMM_ms,RandBnd_ms,BuildHist_ms,Entropy_ms,BestNode_ms,D2H_ms,"
+      csv_file << "tree,depth,nodes,rows,wall_ms,sample_ms,flat_proj_ms,"
+               << "h2d_ms,APkernel_ms,"
                << "RHistTotal_ms,SplitAllDepth_ms,NodeTrain_ms\n";
     } else {
       csv_file.open(csv_path, std::ios::out | std::ios::app);
@@ -6179,7 +6178,7 @@ absl::Status GrowTreeLocalBFS(
         double split_examples_ms = std::chrono::duration<double,std::milli>(t_split_examples_end - t_split_examples_start).count();
         total_split_all_depth_ms += split_examples_ms;
         // Grayed out for 100 trees
-        // PrintAndResetSplitAllDepthTimers(current_depth);
+        PrintAndResetSplitAllDepthTimers(current_depth);
 
         auto t_node_train_start = std::chrono::steady_clock::now();
         for (int n = 0; n < num_nodes; ++n) {
@@ -6203,7 +6202,7 @@ absl::Status GrowTreeLocalBFS(
           #endif
           node_config.best_projection_index = best_projection_per_node_index[n];
           node_config.num_proj = num_proj;
-          if (n < pos_class_counts.size() && !pos_class_counts[n].empty()) {
+          //if (n < pos_class_counts.size() && !pos_class_counts[n].empty()) {
             node_config.skip_set_leaf_on_children = true;
             node_config.gpu_num_classes = num_classes;
             node_config.gpu_pos_class_counts = pos_class_counts[n];
@@ -6214,7 +6213,7 @@ absl::Status GrowTreeLocalBFS(
             #else
             node_config.example_split = example_splits[n];
             #endif
-          }
+          //}
           node_config.gpu_projected_data = d_col_add_projected;
           RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
                                     deployment, weights, node_config, random,
@@ -6260,11 +6259,9 @@ absl::Status GrowTreeLocalBFS(
                   << " NodeTrain=" << node_train_ms << "ms"
                   << "\n";
         csv_file << csv_tree_id << "," << current_depth << "," << num_nodes << "," << total_rows
-                 << "," << depth_wall_ms << "," << sample_ms << "," << flatten_sel_ms
-                 << "," << flatten_proj_ms << "," << h2d_ms << "," << prefixsum_ms
-                 << "," << kernel_ms << "," << blockmm_ms << "," << finalmm_ms
-                 << "," << randbnd_ms << "," << buildhist_ms << "," << entropy_ms
-                 << "," << bestnode_ms << "," << d2h_hist_ms << "," << gpu_hist_ms
+                 << "," << depth_wall_ms << "," << sample_ms
+                 << "," << flatten_proj_ms << "," << h2d_ms
+                 << "," << kernel_ms << "," << gpu_hist_ms
                  << "," << split_examples_ms << "," << node_train_ms << "\n";
   }
     #else
@@ -6333,6 +6330,7 @@ absl::Status GrowTreeLocalBFS(
               << " D2H=" << total_d2h_hist_ms << "]"
               << " SplitAllDepth=" << total_split_all_depth_ms << "ms"
               << " NodeTrain=" << total_node_train_ms << "ms\n";
+    PrintAndResetSplitAllDepthTreeTimers();
     std::cerr << "  leaf exits: early_leaf=" << early_leaf_count
               << " no_split_leaf=" << no_split_leaf_count << "\n";
     early_leaf_count = 0;

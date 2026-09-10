@@ -17,6 +17,10 @@ static double s_sad_malloc = 0, s_sad_flags = 0, s_sad_prefix = 0,
               s_sad_scatter = 0, s_sad_d2h_scatter = 0, s_sad_d2h_counts = 0,
               s_sad_d2d_copy = 0, s_sad_free = 0;
 
+static double s_tree_sad_malloc = 0, s_tree_sad_flags = 0, s_tree_sad_prefix = 0,
+              s_tree_sad_scatter = 0, s_tree_sad_d2h_scatter = 0, s_tree_sad_d2h_counts = 0,
+              s_tree_sad_d2d_copy = 0, s_tree_sad_free = 0;
+
 #include "oblique_apply_projection.cuh"
 #include "yggdrasil_decision_forests/learner/random_forest/random_forest.pb.h"
 #include "yggdrasil_decision_forests/model/decision_tree/decision_tree.h"
@@ -548,6 +552,83 @@ __global__ void FusedFlagScatterAllDepthKernel_1D(
     } else {
         int neg_idx = atomicAdd(&d_atomic_counters[num_nodes + node_id], 1);
         d_neg_examples[rows_start + neg_idx] = example_idx;
+    }
+
+    int cls = d_labels[example_idx];
+    atomicAdd(&d_class_counts[node_id * 2 * num_classes + side * num_classes + cls], 1);
+}
+
+__global__ void CompactD2DKernel(
+    const int* __restrict__ d_neg_examples,
+    const int* __restrict__ d_pos_examples,
+    int* __restrict__ d_selected_examples,
+    const int* __restrict__ d_compact_src,
+    const int* __restrict__ d_compact_dst,
+    const int* __restrict__ d_compact_neg,
+    const int* __restrict__ d_compact_total,
+    const int* __restrict__ d_compact_block_off,
+    int num_compact_nodes)
+{
+    const int cn = cub::UpperBound(d_compact_block_off, num_compact_nodes + 1, (int)blockIdx.x) - 1;
+    const int local_bx = blockIdx.x - d_compact_block_off[cn];
+    const int r = local_bx * blockDim.x + threadIdx.x;
+    if (r >= d_compact_total[cn]) return;
+
+    const int src = d_compact_src[cn];
+    const int dst = d_compact_dst[cn];
+    const int neg_n = d_compact_neg[cn];
+
+    if (r < neg_n) {
+        d_selected_examples[dst + r] = d_neg_examples[src + r];
+    } else {
+        d_selected_examples[dst + r] = d_pos_examples[src + (r - neg_n)];
+    }
+}
+
+// Direct scatter: reads from d_read_buf, writes to d_selected_examples at
+// compacted child_offsets. Leaf nodes (d_child_offsets < 0) are skipped entirely.
+// Neg fills from front, pos fills from back within each node's allocation.
+__global__ void DirectScatterFusedAllDepthKernel_1D(
+    const float* __restrict__ d_col_add_projected,
+    const int* __restrict__ d_read_buf,
+    int* __restrict__ d_selected_examples,
+    const int* __restrict__ d_best_proj_per_node,
+    const float* __restrict__ d_best_threshold_per_node,
+    const int* __restrict__ d_node_row_off,
+    const int* __restrict__ d_node_block_off,
+    const int* __restrict__ d_child_offsets,
+    const int* __restrict__ d_labels,
+    int* __restrict__ d_class_counts,
+    const int num_classes,
+    int* __restrict__ d_atomic_counters,
+    int num_proj,
+    int num_nodes)
+{
+    const int node_id = cub::UpperBound(d_node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
+    const int child_off = d_child_offsets[node_id];
+    if (child_off < 0) return;
+
+    const int local_bx = blockIdx.x - d_node_block_off[node_id];
+    const int rows_start = d_node_row_off[node_id];
+    const int rows_node = d_node_row_off[node_id + 1] - rows_start;
+    const int r = local_bx * blockDim.x + threadIdx.x;
+    if (r >= rows_node) return;
+
+    int best_projection_index = d_best_proj_per_node[node_id];
+    int side = 0;
+    if (best_projection_index >= 0) {
+        const int base = rows_start * num_proj + best_projection_index * rows_node;
+        float val = d_col_add_projected[base + r];
+        side = val >= d_best_threshold_per_node[node_id] ? 1 : 0;
+    }
+
+    int example_idx = d_read_buf[rows_start + r];
+    if (side) {
+        int pos_idx = atomicAdd(&d_atomic_counters[node_id], 1);
+        d_selected_examples[child_off + rows_node - 1 - pos_idx] = example_idx;
+    } else {
+        int neg_idx = atomicAdd(&d_atomic_counters[num_nodes + node_id], 1);
+        d_selected_examples[child_off + neg_idx] = example_idx;
     }
 
     int cls = d_labels[example_idx];
@@ -1099,8 +1180,33 @@ void PrintAndResetSplitAllDepthTimers(int depth) {
               << " d2d_copy=" << s_sad_d2d_copy
               << " free=" << s_sad_free
               << " SUM=" << total << "ms" << std::endl;
+    s_tree_sad_malloc += s_sad_malloc;
+    s_tree_sad_flags += s_sad_flags;
+    s_tree_sad_prefix += s_sad_prefix;
+    s_tree_sad_scatter += s_sad_scatter;
+    s_tree_sad_d2h_scatter += s_sad_d2h_scatter;
+    s_tree_sad_d2h_counts += s_sad_d2h_counts;
+    s_tree_sad_d2d_copy += s_sad_d2d_copy;
+    s_tree_sad_free += s_sad_free;
     s_sad_malloc = s_sad_flags = s_sad_prefix = s_sad_scatter = 0;
     s_sad_d2h_scatter = s_sad_d2h_counts = s_sad_d2d_copy = s_sad_free = 0;
+}
+
+void PrintAndResetSplitAllDepthTreeTimers() {
+    double total = s_tree_sad_malloc + s_tree_sad_flags + s_tree_sad_prefix + s_tree_sad_scatter
+                 + s_tree_sad_d2h_scatter + s_tree_sad_d2h_counts + s_tree_sad_d2d_copy + s_tree_sad_free;
+    std::cerr << "  SplitAllDepth TREE TOTAL:"
+              << " malloc=" << s_tree_sad_malloc
+              << " flags_kernel=" << s_tree_sad_flags
+              << " prefix_sum=" << s_tree_sad_prefix
+              << " scatter_kernel=" << s_tree_sad_scatter
+              << " d2h_scatter=" << s_tree_sad_d2h_scatter
+              << " d2h_counts=" << s_tree_sad_d2h_counts
+              << " d2d_copy=" << s_tree_sad_d2d_copy
+              << " free=" << s_tree_sad_free
+              << " SUM=" << total << "ms" << std::endl;
+    s_tree_sad_malloc = s_tree_sad_flags = s_tree_sad_prefix = s_tree_sad_scatter = 0;
+    s_tree_sad_d2h_scatter = s_tree_sad_d2h_counts = s_tree_sad_d2d_copy = s_tree_sad_free = 0;
 }
 
 // --- Fused No D2H version: single kernel, no prefix sum ---
@@ -1126,9 +1232,114 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
                 const std::vector<bool>& node_has_split,
                 std::vector<int>& child_offsets)
 {
+    constexpr int BLOCK = 256;
+
+#if defined(D2D_DIRECT)
+    // --- Variant D: direct scatter — no temp buffer, no D2D compaction ---
     auto t0 = std::chrono::steady_clock::now();
 
-    constexpr int BLOCK = 256;
+    // Temp read buffer (single contiguous D2D instead of 2*total_rows temp)
+    int* d_read_buf;
+    CUDA_CHECK(cudaMalloc(&d_read_buf, total_rows * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_read_buf, d_selected_examples,
+                          total_rows * sizeof(int), cudaMemcpyDeviceToDevice));
+
+    const int counts_size = num_nodes * 2 * num_classes;
+    int* d_class_counts;
+    CUDA_CHECK(cudaMalloc(&d_class_counts, counts_size * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_class_counts, 0, counts_size * sizeof(int)));
+
+    int* d_atomic_counters;
+    CUDA_CHECK(cudaMalloc(&d_atomic_counters, 2 * num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_atomic_counters, 0, 2 * num_nodes * sizeof(int)));
+
+    // Precompute child_offsets (uses node sizes, not kernel output)
+    child_offsets.assign(num_nodes, -1);
+    int write_offset = 0;
+    for (int n = 0; n < num_nodes; ++n) {
+      if (!node_has_split[n]) continue;
+      child_offsets[n] = write_offset;
+      write_offset += node_row_off[n + 1] - node_row_off[n];
+    }
+
+    int* d_child_offsets;
+    CUDA_CHECK(cudaMalloc(&d_child_offsets, num_nodes * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_child_offsets, child_offsets.data(),
+                          num_nodes * sizeof(int), cudaMemcpyHostToDevice));
+
+    auto t1 = std::chrono::steady_clock::now();
+
+    DirectScatterFusedAllDepthKernel_1D<<<total_node_blocks, BLOCK>>>(
+        d_col_add_projected,
+        d_read_buf,
+        d_selected_examples,
+        d_best_proj_per_node,
+        d_best_threshold_per_node,
+        d_node_row_off,
+        d_node_block_off,
+        d_child_offsets,
+        d_labels,
+        d_class_counts,
+        num_classes,
+        d_atomic_counters,
+        num_proj,
+        num_nodes);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+
+    auto t2 = std::chrono::steady_clock::now();
+
+    // D2H: class counts + atomic counters
+    std::vector<int> h_class_counts(counts_size);
+    CUDA_CHECK(cudaMemcpy(h_class_counts.data(), d_class_counts,
+                          counts_size * sizeof(int), cudaMemcpyDeviceToHost));
+
+    std::vector<int> h_counters(2 * num_nodes);
+    CUDA_CHECK(cudaMemcpy(h_counters.data(), d_atomic_counters,
+                          2 * num_nodes * sizeof(int), cudaMemcpyDeviceToHost));
+
+    pos_class_counts.resize(num_nodes);
+    neg_class_counts.resize(num_nodes);
+    pos_counts.resize(num_nodes);
+    neg_counts.resize(num_nodes);
+    for (int n = 0; n < num_nodes; ++n) {
+      pos_class_counts[n].assign(
+          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes,
+          h_class_counts.begin() + n * 2 * num_classes + 2 * num_classes);
+      neg_class_counts[n].assign(
+          h_class_counts.begin() + n * 2 * num_classes + 0 * num_classes,
+          h_class_counts.begin() + n * 2 * num_classes + 1 * num_classes);
+      pos_counts[n] = h_counters[n];
+      neg_counts[n] = h_counters[num_nodes + n];
+    }
+
+    auto t3 = std::chrono::steady_clock::now();
+    // No D2D compaction — kernel wrote directly to d_selected_examples
+    auto t4 = t3;
+
+    cudaFree(d_read_buf);
+    cudaFree(d_class_counts);
+    cudaFree(d_atomic_counters);
+    cudaFree(d_child_offsets);
+
+    auto t5 = std::chrono::steady_clock::now();
+
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b - a).count(); };
+
+    s_sad_malloc      += ms(t0, t1);  // includes contiguous D2D + child_offsets upload
+    s_sad_flags       += 0;
+    s_sad_prefix      += 0;
+    s_sad_scatter     += ms(t1, t2);  // direct scatter kernel
+    s_sad_d2h_scatter += 0;
+    s_sad_d2h_counts  += ms(t2, t3);
+    s_sad_d2d_copy    += ms(t3, t4);  // 0 — no D2D
+    s_sad_free        += ms(t4, t5);
+
+    return std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>();
+
+#else
+    // --- Existing: fused scatter + D2D compaction (variants A/B/C) ---
+    auto t0 = std::chrono::steady_clock::now();
 
     int* d_neg_pos;
     cudaMalloc(&d_neg_pos, 2 * total_rows * sizeof(int));
@@ -1195,23 +1406,97 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     auto t3 = std::chrono::steady_clock::now();
 
     // D2D: copy partitioned [neg|pos] contiguously, skipping leaf parents.
-    // Reads from d_neg/d_pos (separate buffer), writes to d_selected_examples.
+    // Compute child_offsets (needed by all variants).
     child_offsets.assign(num_nodes, -1);
     int write_offset = 0;
+    for (int n = 0; n < num_nodes; ++n) {
+      if (!node_has_split[n]) continue;
+      child_offsets[n] = write_offset;
+      write_offset += neg_counts[n] + pos_counts[n];
+    }
+
+    #if defined(D2D_KERNEL)
+    // --- Variant C: single GPU kernel ---
+    {
+      int num_compact = 0;
+      for (int n = 0; n < num_nodes; ++n)
+        if (node_has_split[n]) num_compact++;
+
+      std::vector<int> h_plan(4 * num_compact + num_compact + 1);
+      int* h_src = h_plan.data();
+      int* h_dst = h_src + num_compact;
+      int* h_neg = h_dst + num_compact;
+      int* h_total = h_neg + num_compact;
+      int* h_block_off = h_total + num_compact;
+
+      int ci = 0, block_sum = 0;
+      for (int n = 0; n < num_nodes; ++n) {
+        if (!node_has_split[n]) continue;
+        h_src[ci] = node_row_off[n];
+        h_dst[ci] = child_offsets[n];
+        h_neg[ci] = neg_counts[n];
+        int total_n = neg_counts[n] + pos_counts[n];
+        h_total[ci] = total_n;
+        h_block_off[ci] = block_sum;
+        block_sum += (total_n + BLOCK - 1) / BLOCK;
+        ci++;
+      }
+      h_block_off[num_compact] = block_sum;
+
+      int* d_plan;
+      cudaMalloc(&d_plan, h_plan.size() * sizeof(int));
+      cudaMemcpy(d_plan, h_plan.data(), h_plan.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+      int* d_c_src = d_plan;
+      int* d_c_dst = d_c_src + num_compact;
+      int* d_c_neg = d_c_dst + num_compact;
+      int* d_c_total = d_c_neg + num_compact;
+      int* d_c_block_off = d_c_total + num_compact;
+
+      if (block_sum > 0) {
+        CompactD2DKernel<<<block_sum, BLOCK>>>(
+            d_neg_examples, d_pos_examples, d_selected_examples,
+            d_c_src, d_c_dst, d_c_neg, d_c_total, d_c_block_off,
+            num_compact);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaGetLastError());
+      }
+      cudaFree(d_plan);
+    }
+
+    #elif defined(D2D_ASYNC)
+    // --- Variant B: async memcpy + single sync ---
     for (int n = 0; n < num_nodes; ++n) {
       if (!node_has_split[n]) continue;
       const int src = node_row_off[n];
       const int neg_n = neg_counts[n];
       const int pos_n = pos_counts[n];
-      child_offsets[n] = write_offset;
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + write_offset,
+      const int dst = child_offsets[n];
+      cudaMemcpyAsync(d_selected_examples + dst,
+                      d_neg_examples + src,
+                      neg_n * sizeof(int), cudaMemcpyDeviceToDevice, 0);
+      cudaMemcpyAsync(d_selected_examples + dst + neg_n,
+                      d_pos_examples + src,
+                      pos_n * sizeof(int), cudaMemcpyDeviceToDevice, 0);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    #else
+    // --- Variant A: original sync memcpy ---
+    for (int n = 0; n < num_nodes; ++n) {
+      if (!node_has_split[n]) continue;
+      const int src = node_row_off[n];
+      const int neg_n = neg_counts[n];
+      const int pos_n = pos_counts[n];
+      const int dst = child_offsets[n];
+      CUDA_CHECK(cudaMemcpy(d_selected_examples + dst,
                             d_neg_examples + src,
                             neg_n * sizeof(int), cudaMemcpyDeviceToDevice));
-      CUDA_CHECK(cudaMemcpy(d_selected_examples + write_offset + neg_n,
+      CUDA_CHECK(cudaMemcpy(d_selected_examples + dst + neg_n,
                             d_pos_examples + src,
                             pos_n * sizeof(int), cudaMemcpyDeviceToDevice));
-      write_offset += neg_n + pos_n;
     }
+    #endif
 
     auto t4 = std::chrono::steady_clock::now();
 
@@ -1233,6 +1518,7 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
     s_sad_free        += ms(t4, t5);
 
     return std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>();
+#endif
 }
 
 template<int BLOCK>

@@ -413,3 +413,4 @@ void ApplyProjectionColumnADDFused (const float* d_flat_data,
                                     );
 
 void PrintAndResetSplitAllDepthTimers(int depth = -1);
+void PrintAndResetSplitAllDepthTreeTimers();

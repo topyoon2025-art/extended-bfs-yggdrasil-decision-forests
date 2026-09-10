@@ -32,6 +32,14 @@ build:combined --cxxopt="-DCOMBINED=1"
 # Requires BFS_ONLY. Use --config=no_d2h alongside --config=bfs_only.
 build:no_d2h --cxxopt="-DNO_D2H=1"
 
+# D2D compaction strategy for SplitExamplesAllDepth (inside NO_D2H path).
+# d2d_kernel: single GPU kernel — zero per-node API calls.
+# d2d_async:  cudaMemcpyAsync per node + single sync — minimal code change.
+# Neither:    original synchronous cudaMemcpy per node.
+build:d2d_kernel --cxxopt="-DD2D_KERNEL=1" --define=d2d=kernel
+build:d2d_async  --cxxopt="-DD2D_ASYNC=1" --define=d2d=async
+build:d2d_direct --cxxopt="-DD2D_DIRECT=1" --define=d2d=direct
+
 # USE_GPU: enable GPU code paths in the learner (BFS oblique projection,
 # histogram splits, example partitioning). Without this, all tree growth
 # uses the CPU-only NodeTrain path.

@@ -13,6 +13,10 @@ package(
     licenses = ["notice"],
 )
 
+config_setting(name = "d2d_direct_on", define_values = {"d2d": "direct"})
+config_setting(name = "d2d_kernel_on", define_values = {"d2d": "kernel"})
+config_setting(name = "d2d_async_on",  define_values = {"d2d": "async"})
+
 # Libraries
 # =========================================================
 
@@ -37,11 +41,12 @@ cuda_library(
         "-Xcompiler",
         "-DGOOGLE_PROTOBUF_NO_ARENA=1",
         "-Wno-deprecated-gpu-targets",
-    ], 
-    #+ select({
-    #    ":profile_on_1": ["-DPROFILE1"],   # added only when --define=profile=true
-    #    "//conditions:default": [],
-    #}),
+    ] + select({
+        ":d2d_direct_on": ["-DD2D_DIRECT=1"],
+        ":d2d_kernel_on": ["-DD2D_KERNEL=1"],
+        ":d2d_async_on":  ["-DD2D_ASYNC=1"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
