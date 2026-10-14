@@ -56,8 +56,8 @@ build:offsets_only --define=offsets_only=true
 # layout, so the histogram reads d_labels_srdw[row_start + r] coalesced rather
 # than gathering d_labels[d_selected_examples[...]]. Requires node_id_drsw +
 # offsets_only; incompatible with nid_srdw_hist. Intended use:
-#   --config=node_id_drsw --config=offsets_only --config=srdw_label_hist
-build:srdw_label_hist --define=srdw_label_hist=true
+#   --config=node_id_drsw --config=offsets_only --config=scattered_label_hist
+build:scattered_label_hist --define=scattered_label_hist=true
 
 # SYMMETRIC_PROJ: make the sampled oblique projections symmetric across nodes
 # per depth. All nodes at a given depth share the SAME set of num_proj
@@ -67,13 +67,6 @@ build:srdw_label_hist --define=srdw_label_hist=true
 # both the CPU sampler and --config=gpu_sample_proj (the GPU kernels seed curand
 # by proj_id only instead of by the (node, proj) segment id).
 build:symmetric_proj --define=symmetric_proj=true
-
-# TWO_PASS: ComputeOffsets algorithm (node_id_drsw). ON (default) = two-pass
-# count -> prefix-sum -> scatter; OFF = single-pass atomicAdd (do-both) /
-# warp-coalesced (offsets-only). Add --config=no_two_pass to disable.
-# Applies to num_nodes <= 256; larger node counts use the global-atomic path.
-build --define=two_pass=true
-build:no_two_pass --define=two_pass=false
 
 # SPLIT_SMEM: NODE_ID_DRSW split-update accumulation of child counts + per-class
 # counts. ON (default) = shared-memory block reduction (flush once per block);
@@ -143,8 +136,8 @@ common --enable_platform_specific_config
 # Required for bazel <=4, fails with bazel >= 5.
 # common --incompatible_restrict_string_escapes=false
 
-# build -c opt --@rules_cuda//cuda:archs=sm_120
-build -c opt --@rules_cuda//cuda:archs=sm_89
+build -c opt --@rules_cuda//cuda:archs=sm_120
+# build -c opt --@rules_cuda//cuda:archs=sm_89
 build --announce_rc
 build --noincompatible_strict_action_env
 

@@ -2472,304 +2472,19 @@ void ColumnAddProjectionKernel_DRSW_1_wrap(
 #ifdef NODE_ID_DRSW
 #include "yggdrasil_decision_forests/learner/decision_tree/node_id_drsw.cuh"
 
-template<int BLOCK>
-__global__ void BuildHistogramDRSWKernel(
-        const float*  __restrict__ projected,
-        const int*    __restrict__ d_node_ids,
-        const int*    __restrict__ d_node_offsets,
-        const int*    __restrict__ d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        const int*    __restrict__ d_ex_dup_counts,
-#endif
-        int*          d_hist_class0,
-        int*          d_hist_class1,
-        int           num_proj,
-        int           num_bins,
-        const float*  __restrict__ d_candidate_splits,
-        const int*    __restrict__ d_node_row_off,
-        int           num_nodes,
-        int           num_rows)
-{
-    const int proj_id = blockIdx.y;
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int node_id = -1;
-    if (r < num_rows) {
-        node_id = d_node_ids[r];
-        if (node_id >= num_nodes) node_id = -1;
-    }
-
-    extern __shared__ int sh_hist[];
-    float* sh_splits = (float*)(sh_hist + 2 * num_bins);
-
-    for (int i = threadIdx.x; i < 2 * num_bins; i += BLOCK)
-        sh_hist[i] = 0;
-
-    int leader_node = -1;
-    if (threadIdx.x == 0 && node_id >= 0) leader_node = node_id;
-    __shared__ int sh_leader_node;
-    if (threadIdx.x == 0) sh_leader_node = leader_node;
-    __syncthreads();
-    leader_node = sh_leader_node;
-
-    if (leader_node >= 0) {
-        const int lead_seg = leader_node * num_proj + proj_id;
-        const float* lead_splits = d_candidate_splits + (size_t)lead_seg * (num_bins - 1);
-        for (int i = threadIdx.x; i < num_bins - 1; i += BLOCK)
-            sh_splits[i] = lead_splits[i];
-    }
-    __syncthreads();
-
-    if (node_id >= 0)
-    {
-        const int row_start   = d_node_row_off[node_id];
-        const int rows_node   = d_node_row_off[node_id + 1] - row_start;
-        const int node_offset = d_node_offsets[r];
-        const int seg_id      = node_id * num_proj + proj_id;
-
-        float val = projected[(size_t)row_start * num_proj +
-                               (size_t)proj_id * rows_node + node_offset];
-
-        int bin;
-        if (node_id == leader_node) {
-            bin = cub::LowerBound(sh_splits, num_bins - 1, val);
-        } else {
-            const float* splits = d_candidate_splits + (size_t)seg_id * (num_bins - 1);
-            bin = cub::LowerBound(splits, num_bins - 1, val);
-        }
-
-        int lbl = 2 - d_labels[r];
-
-        if (node_id == leader_node) {
-#ifdef DEDUP_BOOTSTRAP
-            atomicAdd(&sh_hist[lbl * num_bins + bin], d_ex_dup_counts[r]);
-#else
-            atomicAdd(&sh_hist[lbl * num_bins + bin], 1);
-#endif
-        } else {
-            int off = seg_id * num_bins + bin;
-#ifdef DEDUP_BOOTSTRAP
-            atomicAdd(lbl == 0 ? &d_hist_class0[off] : &d_hist_class1[off],
-                      d_ex_dup_counts[r]);
-#else
-            atomicAdd(lbl == 0 ? &d_hist_class0[off] : &d_hist_class1[off], 1);
-#endif
-        }
-    }
-    __syncthreads();
-
-    if (threadIdx.x < num_bins && leader_node >= 0)
-    {
-        int lead_off = (leader_node * num_proj + proj_id) * num_bins + threadIdx.x;
-        int c0 = sh_hist[threadIdx.x];
-        int c1 = sh_hist[num_bins + threadIdx.x];
-        if (c0) atomicAdd(&d_hist_class0[lead_off], c0);
-        if (c1) atomicAdd(&d_hist_class1[lead_off], c1);
-    }
-}
-
-void BuildHistogramDRSWKernel_wrap(
-        const float* d_col_add_projected,
-        const int*   d_node_ids,
-        const int*   d_node_offsets,
-        const int*   d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        const int*   d_ex_dup_counts,
-#endif
-        int*         d_hist_class0,
-        int*         d_hist_class1,
-        int          num_proj,
-        int          num_bins,
-        const float* d_sorted_candidate_splits,
-        const int*   d_node_row_off,
-        int          num_nodes,
-        int          num_rows)
-{
-    constexpr int BLOCK = 256;
-    int sharedMemSize = 2 * num_bins * sizeof(int) +
-                        (num_bins - 1) * sizeof(float);
-    const int row_blocks = (num_rows + BLOCK - 1) / BLOCK;
-    dim3 grid(row_blocks, num_proj);
-    BuildHistogramDRSWKernel<BLOCK><<<grid, BLOCK, sharedMemSize>>>(
-        d_col_add_projected,
-        d_node_ids,
-        d_node_offsets,
-        d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        d_ex_dup_counts,
-#endif
-        d_hist_class0,
-        d_hist_class1,
-        num_proj,
-        num_bins,
-        d_sorted_candidate_splits,
-        d_node_row_off,
-        num_nodes,
-        num_rows
-    );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-// Compact histogram: iterates d_active_rows (ascending row indices, no inactive
-// rows) instead of all num_rows. Same leader-node shared-memory optimization.
-template <int BLOCK>
-__global__ void BuildHistogramCompactKernel(
-        const float*  __restrict__ projected,
-        const int*    __restrict__ d_active_rows,
-        const int*    __restrict__ d_node_ids,
-        const int*    __restrict__ d_node_offsets,
-        const int*    __restrict__ d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        const int*    __restrict__ d_ex_dup_counts,
-#endif
-        int*          d_hist_class0,
-        int*          d_hist_class1,
-        int           num_proj,
-        int           num_bins,
-        const float*  __restrict__ d_candidate_splits,
-        const int*    __restrict__ d_node_row_off,
-        int           num_nodes,
-        int           num_active)
-{
-    const int proj_id = blockIdx.y;
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int node_id = -1;
-    int r = -1;
-    if (idx < num_active) {
-        r = d_active_rows[idx];
-        node_id = d_node_ids[r];
-        if (node_id >= num_nodes) node_id = -1;
-    }
-
-    extern __shared__ int sh_hist[];
-    float* sh_splits = (float*)(sh_hist + 2 * num_bins);
-
-    for (int i = threadIdx.x; i < 2 * num_bins; i += BLOCK)
-        sh_hist[i] = 0;
-
-    int leader_node = -1;
-    if (threadIdx.x == 0 && node_id >= 0) leader_node = node_id;
-    __shared__ int sh_leader_node;
-    if (threadIdx.x == 0) sh_leader_node = leader_node;
-    __syncthreads();
-    leader_node = sh_leader_node;
-
-    if (leader_node >= 0) {
-        const int lead_seg = leader_node * num_proj + proj_id;
-        const float* lead_splits = d_candidate_splits + (size_t)lead_seg * (num_bins - 1);
-        for (int i = threadIdx.x; i < num_bins - 1; i += BLOCK)
-            sh_splits[i] = lead_splits[i];
-    }
-    __syncthreads();
-
-    if (node_id >= 0)
-    {
-        const int row_start   = d_node_row_off[node_id];
-        const int rows_node   = d_node_row_off[node_id + 1] - row_start;
-        const int node_offset = d_node_offsets[r];
-        const int seg_id      = node_id * num_proj + proj_id;
-
-        float val = projected[(size_t)row_start * num_proj +
-                               (size_t)proj_id * rows_node + node_offset];
-
-        int bin;
-        if (node_id == leader_node) {
-            bin = cub::LowerBound(sh_splits, num_bins - 1, val);
-        } else {
-            const float* splits = d_candidate_splits + (size_t)seg_id * (num_bins - 1);
-            bin = cub::LowerBound(splits, num_bins - 1, val);
-        }
-
-        int lbl = 2 - d_labels[r];
-
-        if (node_id == leader_node) {
-#ifdef DEDUP_BOOTSTRAP
-            atomicAdd(&sh_hist[lbl * num_bins + bin], d_ex_dup_counts[r]);
-#else
-            atomicAdd(&sh_hist[lbl * num_bins + bin], 1);
-#endif
-        } else {
-            int off = seg_id * num_bins + bin;
-#ifdef DEDUP_BOOTSTRAP
-            atomicAdd(lbl == 0 ? &d_hist_class0[off] : &d_hist_class1[off],
-                      d_ex_dup_counts[r]);
-#else
-            atomicAdd(lbl == 0 ? &d_hist_class0[off] : &d_hist_class1[off], 1);
-#endif
-        }
-    }
-    __syncthreads();
-
-    if (threadIdx.x < num_bins && leader_node >= 0)
-    {
-        int lead_off = (leader_node * num_proj + proj_id) * num_bins + threadIdx.x;
-        int c0 = sh_hist[threadIdx.x];
-        int c1 = sh_hist[num_bins + threadIdx.x];
-        if (c0) atomicAdd(&d_hist_class0[lead_off], c0);
-        if (c1) atomicAdd(&d_hist_class1[lead_off], c1);
-    }
-}
-
-void BuildHistogramCompactKernel_wrap(
-        const float* d_col_add_projected,
-        const int*   d_active_rows,
-        const int*   d_node_ids,
-        const int*   d_node_offsets,
-        const int*   d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        const int*   d_ex_dup_counts,
-#endif
-        int*         d_hist_class0,
-        int*         d_hist_class1,
-        int          num_proj,
-        int          num_bins,
-        const float* d_sorted_candidate_splits,
-        const int*   d_node_row_off,
-        int          num_nodes,
-        int          num_active)
-{
-    constexpr int BLOCK = 256;
-    int sharedMemSize = 2 * num_bins * sizeof(int) +
-                        (num_bins - 1) * sizeof(float);
-    const int row_blocks = (num_active + BLOCK - 1) / BLOCK;
-    dim3 grid(row_blocks, num_proj);
-    BuildHistogramCompactKernel<BLOCK><<<grid, BLOCK, sharedMemSize>>>(
-        d_col_add_projected,
-        d_active_rows,
-        d_node_ids,
-        d_node_offsets,
-        d_labels,
-#ifdef DEDUP_BOOTSTRAP
-        d_ex_dup_counts,
-#endif
-        d_hist_class0,
-        d_hist_class1,
-        num_proj,
-        num_bins,
-        d_sorted_candidate_splits,
-        d_node_row_off,
-        num_nodes,
-        num_active
-    );
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
 // SRDW-order histogram for the offsets_only path, WITHOUT d_selected_examples.
 // Identical in structure to BuildHistogramRandomKernel_2D (one block per node,
 // coalesced projected reads, shared-memory histogram, single flush), but the
 // per-example label (and dup count) are read coalesced from SRDW-ordered arrays
-// d_labels_srdw / d_dup_srdw (filled by the offsets scatter) at row_start + r,
+// d_labels_scattered / d_dup_scattered (filled by the offsets scatter) at row_start + r,
 // instead of gathering d_labels[d_selected_examples[row_start + r]].
 template<int BLOCK>
 __global__ void BuildHistogramSRDWLabelsKernel(
         const float*  __restrict__ projected,
-        const int*    __restrict__ d_labels_srdw,
+        const int*    __restrict__ d_labels_scattered,
 #ifdef DEDUP_BOOTSTRAP
-        const int*    __restrict__ d_dup_srdw,
+        const int*    __restrict__ d_dup_scattered,
 #endif
         int*          d_hist_class0,
         int*          d_hist_class1,
@@ -2811,10 +2526,10 @@ __global__ void BuildHistogramSRDWLabelsKernel(
         const int r = gid;
         float val = projected[(size_t)row_start * num_proj +
                                (size_t)proj_id * rows_node + r];
-        int lbl = 2 - d_labels_srdw[row_start + r];   // coalesced SRDW read
+        int lbl = 2 - d_labels_scattered[row_start + r];   // coalesced SRDW read
         int bin = cub::LowerBound(sh_splits, num_bins - 1, val);
 #ifdef DEDUP_BOOTSTRAP
-        atomicAdd(&sh_hist[lbl * num_bins + bin], d_dup_srdw[row_start + r]);
+        atomicAdd(&sh_hist[lbl * num_bins + bin], d_dup_scattered[row_start + r]);
 #else
         atomicAdd(&sh_hist[lbl * num_bins + bin], 1);
 #endif
@@ -2834,9 +2549,9 @@ __global__ void BuildHistogramSRDWLabelsKernel(
 
 void BuildHistogramSRDWLabelsKernel_wrap(
         const float* d_col_add_projected,
-        const int*   d_labels_srdw,
+        const int*   d_labels_scattered,
 #ifdef DEDUP_BOOTSTRAP
-        const int*   d_dup_srdw,
+        const int*   d_dup_scattered,
 #endif
         int*         d_hist_class0,
         int*         d_hist_class1,
@@ -2854,9 +2569,9 @@ void BuildHistogramSRDWLabelsKernel_wrap(
     dim3 grid(total_node_blocks, num_proj);
     BuildHistogramSRDWLabelsKernel<BLOCK><<<grid, BLOCK, sharedMemSize>>>(
         d_col_add_projected,
-        d_labels_srdw,
+        d_labels_scattered,
 #ifdef DEDUP_BOOTSTRAP
-        d_dup_srdw,
+        d_dup_scattered,
 #endif
         d_hist_class0,
         d_hist_class1,
@@ -2869,7 +2584,7 @@ void BuildHistogramSRDWLabelsKernel_wrap(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
-#endif  // NODE_ID_DRSW_SRDW_LABEL_HIST
+#endif  // NODE_ID_DRSW_SCATTERED_LABEL_HIST
 
 void NodeIdDRSW_Init_wrap(
     const int* d_selected_examples,
@@ -2897,34 +2612,26 @@ void NodeIdDRSW_ComputeOffsets_wrap(
                               num_rows, num_nodes, total_rows);
 }
 
-int NodeIdDRSW_CompactActiveRows_wrap(
-    const int* d_node_ids,
-    int* d_active_rows,
-    int num_rows)
-{
-    return NodeIdDRSW_CompactActiveRows(d_node_ids, d_active_rows, num_rows);
-}
-
 void NodeIdDRSW_ComputeOffsetsOnly_wrap(
     int* d_node_offsets,
     const int* d_node_ids,
     const int* d_node_row_off,
     int num_rows,
     int num_nodes
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
     ,
     const int* d_labels,
     const int* d_dup,
-    int* d_labels_srdw,
-    int* d_dup_srdw
+    int* d_labels_scattered,
+    int* d_dup_scattered
 #endif
     )
 {
     NodeIdDRSW_ComputeOffsetsOnly(d_node_offsets, d_node_ids,
                                    d_node_row_off,
                                    num_rows, num_nodes
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
-                                   , d_labels, d_dup, d_labels_srdw, d_dup_srdw
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
+                                   , d_labels, d_dup, d_labels_scattered, d_dup_scattered
 #endif
                                    );
 }
@@ -2992,22 +2699,6 @@ NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
     host_result.neg_class_counts = std::move(result.neg_class_counts);
     host_result.child_offsets = std::move(result.child_offsets);
     return host_result;
-}
-
-std::vector<int> NodeIdDRSW_CountRows_wrap(
-    const int* d_node_ids,
-    int num_rows,
-    int num_nodes)
-{
-    return NodeIdDRSW_CountRows(d_node_ids, num_rows, num_nodes);
-}
-
-bool NodeIdDRSW_VerifySorted_wrap(
-    const int* d_selected_examples,
-    const int* d_node_row_off,
-    int num_nodes)
-{
-    return NodeIdDRSW_VerifySorted(d_selected_examples, d_node_row_off, num_nodes);
 }
 
 #endif  // NODE_ID_DRSW

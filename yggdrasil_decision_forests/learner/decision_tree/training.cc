@@ -5493,19 +5493,19 @@ absl::Status GrowTreeLocalBFS(
   int* d_node_offsets = nullptr;
   CUDA_CHECK(cudaMalloc(&d_node_offsets, static_cast<size_t>(num_rows) * sizeof(int)));
 
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
   // SRDW-ordered per-example label/dup payload, filled by the offsets scatter so
   // the SRDW histogram reads them coalesced without rebuilding d_selected_examples.
   // Same sizing/lifetime as d_node_offsets (num_rows, allocated once, reused).
-  int* d_labels_srdw = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_labels_srdw, static_cast<size_t>(num_rows) * sizeof(int)));
+  int* d_labels_scattered = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_labels_scattered, static_cast<size_t>(num_rows) * sizeof(int)));
 #ifdef DEDUP_BOOTSTRAP
-  int* d_dup_srdw = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_dup_srdw, static_cast<size_t>(num_rows) * sizeof(int)));
+  int* d_dup_scattered = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_dup_scattered, static_cast<size_t>(num_rows) * sizeof(int)));
 #else
-  int* d_dup_srdw = nullptr;
+  int* d_dup_scattered = nullptr;
 #endif
-#endif  // NODE_ID_DRSW_SRDW_LABEL_HIST
+#endif  // NODE_ID_DRSW_SCATTERED_LABEL_HIST
 
   #ifndef NO_D2H
   std::vector<UnsignedExampleIdx> flat_sel(num_rows);
@@ -5881,17 +5881,23 @@ absl::Status GrowTreeLocalBFS(
 #error "OFFSETS_ONLY requires NODE_ID_DRSW (--config=node_id_drsw)."
 #endif
 #if defined(OFFSETS_ONLY) && defined(NODE_ID_DRSW_SRDW_HIST)
-#error "OFFSETS_ONLY is incompatible with NODE_ID_DRSW_SRDW_HIST: the old SRDW \
-histogram reads d_selected_examples, which ComputeOffsetsOnly does not rebuild. \
-Use the default (new) node-id histogram instead."
+#error "OFFSETS_ONLY is incompatible with NODE_ID_DRSW_SRDW_HIST: that histogram \
+reads d_selected_examples, which ComputeOffsetsOnly does not rebuild. Use \
+--config=scattered_label_hist instead."
 #endif
-#if defined(NODE_ID_DRSW_SRDW_LABEL_HIST) && \
+#if defined(OFFSETS_ONLY) && !defined(NODE_ID_DRSW_SCATTERED_LABEL_HIST)
+#error "OFFSETS_ONLY requires NODE_ID_DRSW_SCATTERED_LABEL_HIST \
+(--config=scattered_label_hist): the node-id/offset histogram was removed, and \
+the default histogram reads d_selected_examples which ComputeOffsetsOnly does \
+not rebuild."
+#endif
+#if defined(NODE_ID_DRSW_SCATTERED_LABEL_HIST) && \
     (!defined(NODE_ID_DRSW) || !defined(OFFSETS_ONLY))
-#error "NODE_ID_DRSW_SRDW_LABEL_HIST requires NODE_ID_DRSW and OFFSETS_ONLY \
-(--config=node_id_drsw --config=offsets_only --config=srdw_label_hist)."
+#error "NODE_ID_DRSW_SCATTERED_LABEL_HIST requires NODE_ID_DRSW and OFFSETS_ONLY \
+(--config=node_id_drsw --config=offsets_only --config=scattered_label_hist)."
 #endif
-#if defined(NODE_ID_DRSW_SRDW_LABEL_HIST) && defined(NODE_ID_DRSW_SRDW_HIST)
-#error "NODE_ID_DRSW_SRDW_LABEL_HIST and NODE_ID_DRSW_SRDW_HIST are mutually \
+#if defined(NODE_ID_DRSW_SCATTERED_LABEL_HIST) && defined(NODE_ID_DRSW_SRDW_HIST)
+#error "NODE_ID_DRSW_SCATTERED_LABEL_HIST and NODE_ID_DRSW_SRDW_HIST are mutually \
 exclusive (both choose the histogram kernel)."
 #endif
 #ifdef NODE_ID_DRSW
@@ -5907,7 +5913,7 @@ exclusive (both choose the histogram kernel)."
       NodeIdDRSW_ComputeOffsetsOnly_wrap(
             d_node_offsets, d_node_ids,
             d_node_row_off, num_rows, num_nodes
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
             // Also scatter labels/dups into SRDW order for the SRDW-label hist.
             , d_labels,
 #ifdef DEDUP_BOOTSTRAP
@@ -5915,7 +5921,7 @@ exclusive (both choose the histogram kernel)."
 #else
               nullptr,
 #endif
-              d_labels_srdw, d_dup_srdw
+              d_labels_scattered, d_dup_scattered
 #endif
             );
 #else
@@ -6242,12 +6248,12 @@ exclusive (both choose the histogram kernel)."
         CUDA_CHECK(cudaMemset(d_hist_class1, 0, hist_elems * sizeof(int)));
 
         auto t_build_hist_start = now();
-#if defined(NODE_ID_DRSW_SRDW_LABEL_HIST)
+#if defined(NODE_ID_DRSW_SCATTERED_LABEL_HIST)
         // SRDW-order histogram over pre-scattered labels/dups (no d_selected_examples).
         BuildHistogramSRDWLabelsKernel_wrap(d_col_add_projected,
-                                        d_labels_srdw,
+                                        d_labels_scattered,
 #ifdef DEDUP_BOOTSTRAP
-                                        d_dup_srdw,
+                                        d_dup_scattered,
 #endif
                                         d_hist_class0,
                                         d_hist_class1,
@@ -6258,22 +6264,6 @@ exclusive (both choose the histogram kernel)."
                                         d_node_block_off,
                                         num_nodes,
                                         total_node_blocks);
-#elif defined(NODE_ID_DRSW) && !defined(NODE_ID_DRSW_SRDW_HIST)
-        BuildHistogramDRSWKernel_wrap(d_col_add_projected,
-                                        d_node_ids,
-                                        d_node_offsets,
-                                        d_labels,
-#ifdef DEDUP_BOOTSTRAP
-                                        d_ex_dup_counts,
-#endif
-                                        d_hist_class0,
-                                        d_hist_class1,
-                                        num_proj,
-                                        num_bins,
-                                        d_sorted_candidate_splits,
-                                        d_node_row_off,
-                                        num_nodes,
-                                        num_rows);
 #else
         BuildHistogramRandomKernel_2D_wrap(d_col_add_projected,
                                         d_selected_examples,
@@ -6696,10 +6686,10 @@ exclusive (both choose the histogram kernel)."
   cudaFree(d_best_threshold_per_node);
   cudaFree(d_node_ids);
   cudaFree(d_node_offsets);
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
-  cudaFree(d_labels_srdw);
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
+  cudaFree(d_labels_scattered);
 #ifdef DEDUP_BOOTSTRAP
-  cudaFree(d_dup_srdw);
+  cudaFree(d_dup_scattered);
 #endif
 #endif
 #ifdef GPU_SAMPLE_PROJ
@@ -6736,6 +6726,7 @@ exclusive (both choose the histogram kernel)."
               << " apply_proj_kernel=" << total_ap_kernel_ms << "ms"
               << " (prefix_sum=" << total_prefix_sum_ms << "ms)"
               << " eval_proj=" << total_eval_proj_ms << "ms"
+              << " build_hist=" << total_build_hist_ms << "ms"
               << " partition=" << total_partition_ms << "ms"
               << " node_train=" << total_node_train_ms << "ms"
               << " sections_sum=" << depth_sections_sum << "ms"

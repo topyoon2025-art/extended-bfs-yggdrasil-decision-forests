@@ -420,23 +420,23 @@ void NodeIdDRSW_ComputeOffsetsOnly_wrap(
     const int* d_node_row_off,
     int num_rows,
     int num_nodes
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
     ,
     const int* d_labels,
     const int* d_dup,
-    int* d_labels_srdw,
-    int* d_dup_srdw
+    int* d_labels_scattered,
+    int* d_dup_scattered
 #endif
     );
 
-#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+#ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
 // SRDW-order histogram reading labels/dups pre-scattered into SRDW layout
 // (offsets_only path, no d_selected_examples). See the .cu for details.
 void BuildHistogramSRDWLabelsKernel_wrap(
     const float* d_col_add_projected,
-    const int*   d_labels_srdw,
+    const int*   d_labels_scattered,
 #ifdef DEDUP_BOOTSTRAP
-    const int*   d_dup_srdw,
+    const int*   d_dup_scattered,
 #endif
     int*         d_hist_class0,
     int*         d_hist_class1,
@@ -447,7 +447,7 @@ void BuildHistogramSRDWLabelsKernel_wrap(
     const int*   d_node_block_off,
     int          num_nodes,
     int          total_node_blocks);
-#endif  // NODE_ID_DRSW_SRDW_LABEL_HIST
+#endif  // NODE_ID_DRSW_SCATTERED_LABEL_HIST
 
 void NodeIdDRSW_ProjectionOnly_wrap(
     const float* d_flat_data,
@@ -481,55 +481,6 @@ NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
     int num_proj,
     int num_classes);
 
-std::vector<int> NodeIdDRSW_CountRows_wrap(
-    const int* d_node_ids,
-    int num_rows,
-    int num_nodes);
-
-void BuildHistogramDRSWKernel_wrap(
-    const float* d_col_add_projected,
-    const int*   d_node_ids,
-    const int*   d_node_offsets,
-    const int*   d_labels,
-#ifdef DEDUP_BOOTSTRAP
-    const int*   d_ex_dup_counts,
-#endif
-    int*         d_hist_class0,
-    int*         d_hist_class1,
-    int          num_proj,
-    int          num_bins,
-    const float* d_sorted_candidate_splits,
-    const int*   d_node_row_off,
-    int          num_nodes,
-    int          num_rows);
-
-int NodeIdDRSW_CompactActiveRows_wrap(
-    const int* d_node_ids,
-    int* d_active_rows,
-    int num_rows);
-
-void BuildHistogramCompactKernel_wrap(
-    const float* d_col_add_projected,
-    const int*   d_active_rows,
-    const int*   d_node_ids,
-    const int*   d_node_offsets,
-    const int*   d_labels,
-#ifdef DEDUP_BOOTSTRAP
-    const int*   d_ex_dup_counts,
-#endif
-    int*         d_hist_class0,
-    int*         d_hist_class1,
-    int          num_proj,
-    int          num_bins,
-    const float* d_sorted_candidate_splits,
-    const int*   d_node_row_off,
-    int          num_nodes,
-    int          num_active);
-
-bool NodeIdDRSW_VerifySorted_wrap(
-    const int* d_selected_examples,
-    const int* d_node_row_off,
-    int num_nodes);
 #endif  // NODE_ID_DRSW
 
 #ifdef GPU_SAMPLE_PROJ

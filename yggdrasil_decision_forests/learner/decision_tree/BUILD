@@ -26,10 +26,9 @@ config_setting(name = "no_d2h_on", define_values = {"no_d2h": "true"})
 config_setting(name = "use_drsw_on", define_values = {"use_drsw": "true"})
 config_setting(name = "node_id_drsw_on", define_values = {"node_id_drsw": "true"})
 config_setting(name = "nid_srdw_hist_on", define_values = {"nid_srdw_hist": "true"})
-config_setting(name = "srdw_label_hist_on", define_values = {"srdw_label_hist": "true"})
+config_setting(name = "scattered_label_hist_on", define_values = {"scattered_label_hist": "true"})
 config_setting(name = "symmetric_proj_on", define_values = {"symmetric_proj": "true"})
 config_setting(name = "offsets_only_on", define_values = {"offsets_only": "true"})
-config_setting(name = "two_pass_on", define_values = {"two_pass": "true"})
 config_setting(name = "split_smem_on", define_values = {"split_smem": "true"})
 config_setting(name = "verbose_depth_on", define_values = {"verbose_depth": "true"})
 
@@ -80,13 +79,10 @@ cuda_library(
         ":nid_srdw_hist_on": ["-DNODE_ID_DRSW_SRDW_HIST=1"],
         "//conditions:default": [],
     }) + select({
-        ":srdw_label_hist_on": ["-DNODE_ID_DRSW_SRDW_LABEL_HIST=1"],
+        ":scattered_label_hist_on": ["-DNODE_ID_DRSW_SCATTERED_LABEL_HIST=1"],
         "//conditions:default": [],
     }) + select({
         ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
-        "//conditions:default": [],
-    }) + select({
-        ":two_pass_on": ["-DTWO_PASS=1"],
         "//conditions:default": [],
     }) + select({
         ":split_smem_on": ["-DSPLIT_SMEM=1"],
@@ -196,16 +192,13 @@ cc_library_ydf(
         ":nid_srdw_hist_on": ["-DNODE_ID_DRSW_SRDW_HIST=1"],
         "//conditions:default": [],
     }) + select({
-        ":srdw_label_hist_on": ["-DNODE_ID_DRSW_SRDW_LABEL_HIST=1"],
+        ":scattered_label_hist_on": ["-DNODE_ID_DRSW_SCATTERED_LABEL_HIST=1"],
         "//conditions:default": [],
     }) + select({
         ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
         "//conditions:default": [],
     }) + select({
         ":offsets_only_on": ["-DOFFSETS_ONLY=1"],
-        "//conditions:default": [],
-    }) + select({
-        ":two_pass_on": ["-DTWO_PASS=1"],
         "//conditions:default": [],
     }) + select({
         ":split_smem_on": ["-DSPLIT_SMEM=1"],
