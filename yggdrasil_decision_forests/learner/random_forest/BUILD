@@ -64,6 +64,16 @@ cc_library_ydf(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/time",
     ],
+    copts = select({
+        "//yggdrasil_decision_forests/learner/decision_tree:dedup_bootstrap_on": ["-DDEDUP_BOOTSTRAP=1"],
+        "//conditions:default": [],
+    }) + select({
+        "//yggdrasil_decision_forests/learner/decision_tree:use_gpu_on": ["-DUSE_GPU=1"],
+        "//conditions:default": [],
+    }) + select({
+        "//yggdrasil_decision_forests/learner/decision_tree:no_d2h_on": ["-DNO_D2H=1"],
+        "//conditions:default": [],
+    }),
     alwayslink = 1,
 )
 

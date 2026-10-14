@@ -695,6 +695,9 @@ RandomForestLearner::TrainWithStatusImpl(
   std::atomic<double> total_sampling_ms{0.0};
   std::atomic<double> total_train_ms{0.0};
   std::atomic<double> total_oob_ms{0.0};
+#ifdef DEDUP_BOOTSTRAP
+  std::atomic<double> total_dedup_ms{0.0};
+#endif
   {
     yggdrasil_decision_forests::utils::concurrency::ThreadPool pool(
         deployment().num_threads(), {.name_prefix = std::string("TrainRF")});
@@ -778,6 +781,10 @@ RandomForestLearner::TrainWithStatusImpl(
         #else
         int* d_selected_examples = nullptr;
         int gpu_root_sel_count = 0;
+        #ifdef DEDUP_BOOTSTRAP
+        int* d_ex_dup_counts = nullptr;
+        double dedup_ms = 0.0;
+        #endif
         {
         #ifdef NO_D2H
         status_sampling = SampleTrainingExamplesKernel_No_D2H_wrap(
@@ -789,11 +796,35 @@ RandomForestLearner::TrainWithStatusImpl(
                                               static_cast<unsigned long long>(tree_seeds[tree_idx]));
         if (compute_oob_performances) {
           // D2H the bootstrap indices so OOB evaluation can identify in-bag examples
+          // DEDUP_BOOTSTRAP: Must happen BEFORE dedup so OOB sees original duplicated counts
           selected_examples.resize(gpu_root_sel_count);
           cudaMemcpy(selected_examples.data(), d_selected_examples,
                     gpu_root_sel_count * sizeof(UnsignedExampleIdx),
                     cudaMemcpyDeviceToHost);
         }
+
+        #ifdef DEDUP_BOOTSTRAP
+        int num_unique = 0;
+        {
+          auto t_dedup_start = std::chrono::steady_clock::now();
+          auto status_dedup = DeduplicateBootstrap_wrap(
+              d_selected_examples, d_ex_dup_counts, num_unique,
+              gpu_root_sel_count, num_rows);
+          auto t_dedup_end = std::chrono::steady_clock::now();
+          dedup_ms = std::chrono::duration<double, std::milli>(t_dedup_end - t_dedup_start).count();
+          total_dedup_ms.store(total_dedup_ms.load() + dedup_ms);
+          if (!status_dedup.ok()) {
+            utils::concurrency::MutexLock lock(concurrent_fields.mutex);
+            concurrent_fields.status.Update(status_dedup);
+            return;
+          }
+          std::cerr << "DEDUP_BOOTSTRAP: before=" << gpu_root_sel_count
+                    << " after=" << num_unique
+                    << " dedup=" << dedup_ms << "ms\n";
+          gpu_root_sel_count = num_unique;
+        }
+        #endif  // DEDUP_BOOTSTRAP
+
         #else
         status_sampling = SampleTrainingExamplesKernel_wrap(
                                               num_rows,
@@ -830,6 +861,10 @@ RandomForestLearner::TrainWithStatusImpl(
           #ifdef NO_D2H
           internal_config.gpu_root_sel_count = gpu_root_sel_count;
           #endif
+          #ifdef DEDUP_BOOTSTRAP
+          internal_config.d_ex_dup_counts = d_ex_dup_counts;
+          internal_config.dedup_ms = dedup_ms;
+          #endif
         #endif
         if (vector_sequence_computer) {
           internal_config.vector_sequence_computer =
@@ -846,12 +881,18 @@ RandomForestLearner::TrainWithStatusImpl(
             decision_tree.get(), internal_config);
         const absl::Duration tree_train_duration = absl::Now() - begin_tree_train;
 
-        #ifdef NO_D2H
+        #if defined(USE_GPU) && defined(NO_D2H)
         if (d_selected_examples) {
           cudaFree(d_selected_examples);
           d_selected_examples = nullptr;
         }
-        #endif
+        #ifdef DEDUP_BOOTSTRAP
+        if (d_ex_dup_counts) {
+          cudaFree(d_ex_dup_counts);
+          d_ex_dup_counts = nullptr;
+        }
+        #endif  // DEDUP_BOOTSTRAP
+        #endif  // USE_GPU && NO_D2H
 
         int current_num_trained_trees;
         {
@@ -1042,10 +1083,19 @@ RandomForestLearner::TrainWithStatusImpl(
       });
     }
   }
+  const double forest_wall_ms = absl::ToDoubleMilliseconds(absl::Now() - begin_tree_grow);
+  const double thread_sum_ms = total_sampling_ms.load() + total_train_ms.load() + total_oob_ms.load();
   std::cerr << absl::StrFormat(
-      "ALL TREES TOTAL sampling=%.2fms train=%.2fms oob=%.2fms total=%.2fms\n",
+      "ALL TREES sampling=%.2fms train=%.2fms oob=%.2fms"
+#ifdef DEDUP_BOOTSTRAP
+      " dedup=%.2fms"
+#endif
+      " thread_sum=%.2fms forest_wall=%.2fms\n",
       total_sampling_ms.load(), total_train_ms.load(), total_oob_ms.load(),
-      total_sampling_ms.load() + total_train_ms.load() + total_oob_ms.load());
+#ifdef DEDUP_BOOTSTRAP
+      total_dedup_ms.load(),
+#endif
+      thread_sum_ms, forest_wall_ms);
   #ifdef USE_GPU
     cudaFree(d_flat_data);
     cudaFree(d_labels);

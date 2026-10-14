@@ -16,6 +16,22 @@ package(
 config_setting(name = "d2d_direct_on", define_values = {"d2d": "direct"})
 config_setting(name = "d2d_kernel_on", define_values = {"d2d": "kernel"})
 config_setting(name = "d2d_async_on",  define_values = {"d2d": "async"})
+config_setting(name = "d2d_block_stable_on", define_values = {"d2d": "block_stable"})
+config_setting(name = "d2d_stable_two_pass_on", define_values = {"d2d": "stable_two_pass"})
+config_setting(name = "dedup_bootstrap_on", define_values = {"dedup_bootstrap": "true"})
+config_setting(name = "gpu_sample_proj_on", define_values = {"gpu_sample_proj": "true"})
+config_setting(name = "bfs_only_on", define_values = {"bfs_only": "true"})
+config_setting(name = "use_gpu_on", define_values = {"use_gpu": "true"})
+config_setting(name = "no_d2h_on", define_values = {"no_d2h": "true"})
+config_setting(name = "use_drsw_on", define_values = {"use_drsw": "true"})
+config_setting(name = "node_id_drsw_on", define_values = {"node_id_drsw": "true"})
+config_setting(name = "nid_srdw_hist_on", define_values = {"nid_srdw_hist": "true"})
+config_setting(name = "srdw_label_hist_on", define_values = {"srdw_label_hist": "true"})
+config_setting(name = "symmetric_proj_on", define_values = {"symmetric_proj": "true"})
+config_setting(name = "offsets_only_on", define_values = {"offsets_only": "true"})
+config_setting(name = "two_pass_on", define_values = {"two_pass": "true"})
+config_setting(name = "split_smem_on", define_values = {"split_smem": "true"})
+config_setting(name = "verbose_depth_on", define_values = {"verbose_depth": "true"})
 
 # Libraries
 # =========================================================
@@ -23,7 +39,7 @@ config_setting(name = "d2d_async_on",  define_values = {"d2d": "async"})
 cuda_library(
     name = "oblique_apply_projection",
     srcs = ["oblique_apply_projection.cu"],
-    hdrs = ["oblique_apply_projection.cuh"],
+    hdrs = ["oblique_apply_projection.cuh", "gpu_timer.h", "node_id_drsw.cuh"],
     includes = ["."],
     deps = [
         "@com_google_absl//absl/status:statusor",
@@ -45,6 +61,35 @@ cuda_library(
         ":d2d_direct_on": ["-DD2D_DIRECT=1"],
         ":d2d_kernel_on": ["-DD2D_KERNEL=1"],
         ":d2d_async_on":  ["-DD2D_ASYNC=1"],
+        ":d2d_block_stable_on": ["-DD2D_BLOCK_STABLE=1"],
+        ":d2d_stable_two_pass_on": ["-DD2D_STABLE_TWO_PASS=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":dedup_bootstrap_on": ["-DDEDUP_BOOTSTRAP=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":gpu_sample_proj_on": ["-DGPU_SAMPLE_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":verbose_depth_on": ["-DVERBOSE_DEPTH=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":node_id_drsw_on": ["-DNODE_ID_DRSW=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":nid_srdw_hist_on": ["-DNODE_ID_DRSW_SRDW_HIST=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":srdw_label_hist_on": ["-DNODE_ID_DRSW_SRDW_LABEL_HIST=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":two_pass_on": ["-DTWO_PASS=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":split_smem_on": ["-DSPLIT_SMEM=1"],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],
@@ -119,6 +164,52 @@ cc_library_ydf(
     ] + select({
         "//conditions:default": [
         ],
+    }),
+    copts = select({
+        ":dedup_bootstrap_on": ["-DDEDUP_BOOTSTRAP=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":gpu_sample_proj_on": ["-DGPU_SAMPLE_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":bfs_only_on": ["-DBFS_ONLY=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":use_gpu_on": ["-DUSE_GPU=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":no_d2h_on": ["-DNO_D2H=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":use_drsw_on": ["-DUSE_DRSW=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":verbose_depth_on": ["-DVERBOSE_DEPTH=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":d2d_direct_on": ["-DD2D_DIRECT=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":node_id_drsw_on": ["-DNODE_ID_DRSW=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":nid_srdw_hist_on": ["-DNODE_ID_DRSW_SRDW_HIST=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":srdw_label_hist_on": ["-DNODE_ID_DRSW_SRDW_LABEL_HIST=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":offsets_only_on": ["-DOFFSETS_ONLY=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":two_pass_on": ["-DTWO_PASS=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":split_smem_on": ["-DSPLIT_SMEM=1"],
+        "//conditions:default": [],
     }),
     alwayslink = 1,
 )
@@ -263,6 +354,10 @@ cc_library_ydf(
     defines = [] + select({
         # TODO: Add in OSS
         "//conditions:default": ["CUDA_DISABLED"],
+    }),
+    local_defines = select({
+        ":bfs_only_on": ["BFS_ONLY=1"],
+        "//conditions:default": [],
     }),
     deps = [
         "//yggdrasil_decision_forests/dataset:types",

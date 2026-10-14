@@ -8,42 +8,95 @@
 # the DFS grower (GrowTreeLocal). =0 is all-DFS. See SymmetricMaxDepth() in
 # learner/decision_tree/training.cc; swept by benchmarks' dw1_depth_linesearch.sh
 # --mode=symmetric.
-build:symmetric_depthwise_ap --cxxopt="-DSYMMETRIC_DEPTHWISE_AP=1"
-# Symmetric_Nodewise_Control: isolates shared-projection-sampling from the
-# bagwide column-read effect. K projections sampled once per depth and reused by
-# every node, but each node still runs the normal node-local Evaluate path. Do
-# not combine with --config=symmetric_depthwise_ap (AP path would shadow it).
-build:symmetric_nodewise_control --cxxopt="-DSYMMETRIC_NODEWISE_CONTROL=1"
 # BFS_Only: isolates the cost/benefit of the BFS (level-order) scheduler vs DFS.
-# Triggers GrowTreeLocalBFS but does NOT sample shared projections or call any
-# fused bag-wide Apply -- each node runs the normal per-node sampling + Evaluate,
-# algorithmically identical to the Nodewise baseline, only traversal order
-# differs. Lives by the symmetric_* configs as their BFS-only control but
-# involves no symmetric behavior. Mutually exclusive with symmetric_depthwise_ap
-# and symmetric_nodewise_control.
-build:bfs_only --cxxopt="-DBFS_ONLY=1"
-
-# combined means Apply Projection + Evaluate Projection
-build:combined --cxxopt="-DCOMBINED=1"
+build:bfs_only --define=bfs_only=true
 
 # NO_D2H: eliminate Device-to-Host and Host-to-Device transfers for
 # selected_examples during BFS tree growth. Examples stay on GPU; splits
 # use D2D copies and leaf values come from GPU class counts.
 # Requires BFS_ONLY. Use --config=no_d2h alongside --config=bfs_only.
-build:no_d2h --cxxopt="-DNO_D2H=1"
+build --define=no_d2h=true
+build:d2h --define=no_d2h=false
 
 # D2D compaction strategy for SplitExamplesAllDepth (inside NO_D2H path).
-# d2d_kernel: single GPU kernel — zero per-node API calls.
-# d2d_async:  cudaMemcpyAsync per node + single sync — minimal code change.
-# Neither:    original synchronous cudaMemcpy per node.
-build:d2d_kernel --cxxopt="-DD2D_KERNEL=1" --define=d2d=kernel
-build:d2d_async  --cxxopt="-DD2D_ASYNC=1" --define=d2d=async
-build:d2d_direct --cxxopt="-DD2D_DIRECT=1" --define=d2d=direct
+build:d2d_direct --define=d2d=direct
+
+# DEDUP_BOOTSTRAP: collapse duplicate bootstrap examples before projection,
+# reducing work in the Apply Projection kernel. On by default.
+build --define=dedup_bootstrap=true
+build:no_dedup --define=dedup_bootstrap=false
+
+# Projection kernel strategy for ColumnAddProjection.
+# drsw: data-row-sorted-write (DRSW_1) — requires dedup_bootstrap (the default).
+# default (no flag): SRDW_1_2D — 2D compacted grid, no wasted blocks.
+build:drsw --define=use_drsw=true
+
+# NODE_ID_DRSW: persistent node-ID-only approach. Maintains only d_node_ids[num_rows]
+# across BFS depths; no d_selected_examples reordering, no d_node_offsets.
+# Row-indexed projected layout: projected[proj_id * num_rows + row].
+# Split update just rewrites node_ids and accumulates counts via atomics.
+build:node_id_drsw --define=node_id_drsw=true
+
+# NODE_ID_DRSW_SRDW_HIST: force NODE_ID_DRSW to use the SRDW histogram kernel
+# (BuildHistogramRandomKernel_2D) instead of BuildHistogramDRSWKernel.
+# Requires node_id_drsw.
+build:nid_srdw_hist --define=nid_srdw_hist=true
+
+# OFFSETS_ONLY: in NODE_ID_DRSW, run ComputeOffsetsOnly (derive d_node_offsets
+# only) instead of the default ComputeOffsets (which also rebuilds the sorted
+# d_selected_examples). Valid ONLY when every downstream consumer is node-id
+# based (row-order ProjectionOnly + the default node-id histogram); incompatible
+# with nid_srdw_hist, which reads d_selected_examples. Requires node_id_drsw.
+build:offsets_only --define=offsets_only=true
+
+# NODE_ID_DRSW_SRDW_LABEL_HIST: in NODE_ID_DRSW + offsets_only, build the histogram
+# in SRDW order (block-per-node, shared-memory, coalesced) WITHOUT rebuilding
+# d_selected_examples. The offsets scatter instead writes the per-example labels
+# (and, under dedup_bootstrap, the per-example dup counts) directly into SRDW
+# layout, so the histogram reads d_labels_srdw[row_start + r] coalesced rather
+# than gathering d_labels[d_selected_examples[...]]. Requires node_id_drsw +
+# offsets_only; incompatible with nid_srdw_hist. Intended use:
+#   --config=node_id_drsw --config=offsets_only --config=srdw_label_hist
+build:srdw_label_hist --define=srdw_label_hist=true
+
+# SYMMETRIC_PROJ: make the sampled oblique projections symmetric across nodes
+# per depth. All nodes at a given depth share the SAME set of num_proj
+# projections (identical features + weights) instead of each node independently
+# sampling its own. The per-node split threshold is still chosen from each
+# node's own data, so only the projection directions are shared. Works with
+# both the CPU sampler and --config=gpu_sample_proj (the GPU kernels seed curand
+# by proj_id only instead of by the (node, proj) segment id).
+build:symmetric_proj --define=symmetric_proj=true
+
+# TWO_PASS: ComputeOffsets algorithm (node_id_drsw). ON (default) = two-pass
+# count -> prefix-sum -> scatter; OFF = single-pass atomicAdd (do-both) /
+# warp-coalesced (offsets-only). Add --config=no_two_pass to disable.
+# Applies to num_nodes <= 256; larger node counts use the global-atomic path.
+build --define=two_pass=true
+build:no_two_pass --define=two_pass=false
+
+# SPLIT_SMEM: NODE_ID_DRSW split-update accumulation of child counts + per-class
+# counts. ON (default) = shared-memory block reduction (flush once per block);
+# add --config=split_global_atomic to force per-row global atomicAdd. The smem
+# path still auto-falls back to global atomic when the per-block shared-memory
+# request exceeds the device cap (wide trees / many classes).
+build --define=split_smem=true
+build:split_global_atomic --define=split_smem=false
+
+# VERBOSE_DEPTH: print per-depth timing breakdown to stderr.
+# Off by default; add --config=verbose_depth to enable.
+build:verbose_depth --define=verbose_depth=true
+
+# GPU_SAMPLE_PROJ: move projection sampling (SampleProjection + FlattenProjections
+# + H2D) to GPU.  Two cuRAND-based kernels + cub prefix sum produce the CSR
+# directly on device, eliminating the CPU sample/flatten/remap/H2D per depth.
+build --define=gpu_sample_proj=true
+build:no_gpu_sample_proj --define=gpu_sample_proj=false
 
 # USE_GPU: enable GPU code paths in the learner (BFS oblique projection,
 # histogram splits, example partitioning). Without this, all tree growth
 # uses the CPU-only NodeTrain path.
-build:use_gpu --cxxopt="-DUSE_GPU=1"
+build:use_gpu --define=use_gpu=true
 
 # Bazel configuration for Yggdrasil Decision Forests
 #

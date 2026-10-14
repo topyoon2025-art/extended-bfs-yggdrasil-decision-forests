@@ -52,54 +52,15 @@ absl::Status SampleTrainingExamplesKernel_No_D2H_wrap(
     int& num_samples_out,
     unsigned long long seed);
 
-absl::StatusOr<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer> SplitExamplesInPlaceKernel_wrap(
-    const float* d_col_add_projected,
-    const float threshold,
-    yggdrasil_decision_forests::model::decision_tree::SelectedExamplesRollingBuffer selected_examples,
-    int rows_start,
-    int rows_node,
-    int best_projection_index,
-    int num_proj);
-
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_wrap(
-                const float* d_col_add_projected,
-                const int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& sel_spans,
-                std::vector<absl::Span<yggdrasil_decision_forests::model::UnsignedExampleIdx>>& inactive_spans,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts);
-
-absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_wrap(
-                const float* d_col_add_projected,
-                int* d_selected_examples,
-                const int* d_best_proj_per_node,
-                const float* d_best_threshold_per_node,
-                const int* d_node_row_off,
-                const int* node_row_off,
-                const int* d_node_block_off,
-                const int total_node_blocks,
-                const int num_proj,
-                const int num_nodes,
-                const int total_rows,
-                const int max_rows_per_node,
-                const int* d_labels,
-                const int num_classes,
-                std::vector<std::vector<int>>& pos_class_counts,
-                std::vector<std::vector<int>>& neg_class_counts,
-                std::vector<int>& pos_counts,
-                std::vector<int>& neg_counts);
+// ADDED: DEDUP_BOOTSTRAP — deduplicate sorted bootstrap indices and build
+// per-row duplicate counts. d_selected_examples is compacted in-place,
+// d_ex_dup_counts is allocated (caller frees), num_unique_out is set.
+absl::Status DeduplicateBootstrap_wrap(
+    int*& d_selected_examples,
+    int*& d_ex_dup_counts,
+    int& num_unique_out,
+    int num_samples,
+    int num_rows);
 
 absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap(
                 const float* d_col_add_projected,
@@ -115,6 +76,9 @@ absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::Exa
                 const int total_rows,
                 const int max_rows_per_node,
                 const int* d_labels,
+#ifdef DEDUP_BOOTSTRAP
+                const int* d_ex_dup_counts,  // ADDED: per-row bootstrap multiplicity
+#endif
                 const int num_classes,
                 std::vector<std::vector<int>>& pos_class_counts,
                 std::vector<std::vector<int>>& neg_class_counts,
@@ -186,6 +150,9 @@ void BuildHistogramRandomKernel_wrap(const float* d_col_add_projected,
 void BuildHistogramRandomKernel_2D_wrap(const float* d_col_add_projected,
                                     const int* d_selected_examples,
                                     const int* d_labels,
+#ifdef DEDUP_BOOTSTRAP
+                                    const int* d_ex_dup_counts,  // ADDED: per-row bootstrap multiplicity
+#endif
                                     int* d_hist_class0,
                                     int* d_hist_class1,
                                     int num_proj,
@@ -413,4 +380,172 @@ void ApplyProjectionColumnADDFused (const float* d_flat_data,
                                     );
 
 void PrintAndResetSplitAllDepthTimers(int depth = -1);
+double GetSplitAllDepthTreeFreeMs();
 void PrintAndResetSplitAllDepthTreeTimers();
+double GetDRSWTreeSetupMs();
+double GetDRSWTreeProjMs();
+void PrintAndResetDRSWTimers(int depth = -1);
+void PrintAndResetDRSWTreeTimers();
+
+#ifdef NODE_ID_DRSW
+struct NodeIdDRSW_SplitResult_Host {
+    int num_children;
+    std::vector<int> pos_counts;
+    std::vector<int> neg_counts;
+    std::vector<std::vector<int>> pos_class_counts;
+    std::vector<std::vector<int>> neg_class_counts;
+    std::vector<int> child_offsets;
+};
+
+void NodeIdDRSW_Init_wrap(
+    const int* d_selected_examples,
+    const int* d_node_row_off,
+    int* d_node_ids,
+    int num_rows,
+    int num_nodes,
+    int num_total_selected);
+
+void NodeIdDRSW_ComputeOffsets_wrap(
+    int* d_node_offsets,
+    int* d_selected_examples,
+    const int* d_node_ids,
+    const int* d_node_row_off,
+    int num_rows,
+    int num_nodes,
+    int total_rows);
+
+void NodeIdDRSW_ComputeOffsetsOnly_wrap(
+    int* d_node_offsets,
+    const int* d_node_ids,
+    const int* d_node_row_off,
+    int num_rows,
+    int num_nodes
+#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+    ,
+    const int* d_labels,
+    const int* d_dup,
+    int* d_labels_srdw,
+    int* d_dup_srdw
+#endif
+    );
+
+#ifdef NODE_ID_DRSW_SRDW_LABEL_HIST
+// SRDW-order histogram reading labels/dups pre-scattered into SRDW layout
+// (offsets_only path, no d_selected_examples). See the .cu for details.
+void BuildHistogramSRDWLabelsKernel_wrap(
+    const float* d_col_add_projected,
+    const int*   d_labels_srdw,
+#ifdef DEDUP_BOOTSTRAP
+    const int*   d_dup_srdw,
+#endif
+    int*         d_hist_class0,
+    int*         d_hist_class1,
+    int          num_proj,
+    int          num_bins,
+    const float* d_sorted_candidate_splits,
+    const int*   d_node_row_off,
+    const int*   d_node_block_off,
+    int          num_nodes,
+    int          total_node_blocks);
+#endif  // NODE_ID_DRSW_SRDW_LABEL_HIST
+
+void NodeIdDRSW_ProjectionOnly_wrap(
+    const float* d_flat_data,
+    float* d_col_add_projected,
+    const int* d_node_ids,
+    const int* d_node_offsets,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    int num_proj,
+    int num_rows,
+    int num_nodes);
+
+NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
+    int* d_node_ids,
+    const int* d_node_offsets,
+    const float* d_projected,
+    const int* d_best_proj_per_node,
+    const float* d_best_threshold_per_node,
+    const int* d_node_row_off,
+    const int* d_labels,
+#ifdef DEDUP_BOOTSTRAP
+    const int* d_dup_counts,
+#endif
+    const std::vector<bool>& node_has_split,
+    const std::vector<int>& node_counts,
+    const std::vector<int>& node_row_offsets,
+    int num_rows,
+    int num_active_nodes,
+    int num_proj,
+    int num_classes);
+
+std::vector<int> NodeIdDRSW_CountRows_wrap(
+    const int* d_node_ids,
+    int num_rows,
+    int num_nodes);
+
+void BuildHistogramDRSWKernel_wrap(
+    const float* d_col_add_projected,
+    const int*   d_node_ids,
+    const int*   d_node_offsets,
+    const int*   d_labels,
+#ifdef DEDUP_BOOTSTRAP
+    const int*   d_ex_dup_counts,
+#endif
+    int*         d_hist_class0,
+    int*         d_hist_class1,
+    int          num_proj,
+    int          num_bins,
+    const float* d_sorted_candidate_splits,
+    const int*   d_node_row_off,
+    int          num_nodes,
+    int          num_rows);
+
+int NodeIdDRSW_CompactActiveRows_wrap(
+    const int* d_node_ids,
+    int* d_active_rows,
+    int num_rows);
+
+void BuildHistogramCompactKernel_wrap(
+    const float* d_col_add_projected,
+    const int*   d_active_rows,
+    const int*   d_node_ids,
+    const int*   d_node_offsets,
+    const int*   d_labels,
+#ifdef DEDUP_BOOTSTRAP
+    const int*   d_ex_dup_counts,
+#endif
+    int*         d_hist_class0,
+    int*         d_hist_class1,
+    int          num_proj,
+    int          num_bins,
+    const float* d_sorted_candidate_splits,
+    const int*   d_node_row_off,
+    int          num_nodes,
+    int          num_active);
+
+bool NodeIdDRSW_VerifySorted_wrap(
+    const int* d_selected_examples,
+    const int* d_node_row_off,
+    int num_nodes);
+#endif  // NODE_ID_DRSW
+
+#ifdef GPU_SAMPLE_PROJ
+void SampleProjectionsOnGPU_wrap(
+    int* d_offset,
+    int* d_flat_projection_col_idx,
+    int* d_flat_projection_attr_idx,
+    float* d_flat_projection_weights,
+    const int* d_numerical_features,
+    const int* d_attr_to_flat_col,
+    const float* d_norm_factors,
+    int num_features,
+    int num_nodes,
+    int num_proj,
+    float projection_density,
+    int max_num_features,
+    unsigned long long seed,
+    int weight_type);
+#endif

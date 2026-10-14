@@ -398,9 +398,11 @@ struct InternalTrainConfig {
   float* d_flat_data = nullptr;
   int* d_labels = nullptr;
   int* d_selected_examples = nullptr;
+  int* d_ex_dup_counts = nullptr;  // ADDED: DEDUP_BOOTSTRAP — per-row bootstrap multiplicity (size num_rows, indexed by original row)
   int gpu_root_sel_count = 0;
   int gpu_pos_count = 0;
   int gpu_neg_count = 0;
+  double dedup_ms = 0.0;
 };
 
 // Find the best condition for a leaf node. Return true if a condition better

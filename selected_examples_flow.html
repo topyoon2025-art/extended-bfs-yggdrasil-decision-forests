@@ -1,0 +1,830 @@
+<title>Selected Examples Flow</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-alt: #eef1f6;
+    --text: #1a1d24;
+    --text-muted: #5a6170;
+    --border: #d4d9e3;
+    --accent-host: #2563eb;
+    --accent-host-bg: #eff4ff;
+    --accent-device: #9333ea;
+    --accent-device-bg: #f3ecff;
+    --accent-transfer-h2d: #d97706;
+    --accent-transfer-h2d-bg: #fef7ec;
+    --accent-transfer-d2h: #059669;
+    --accent-transfer-d2h-bg: #ecfdf5;
+    --accent-split: #dc2626;
+    --accent-split-bg: #fef2f2;
+    --code-bg: #f0f2f6;
+    --arrow-color: #8892a4;
+    --phase-line: #c7cdd8;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #111318;
+      --surface: #1a1d24;
+      --surface-alt: #22262f;
+      --text: #e2e5eb;
+      --text-muted: #8892a4;
+      --border: #2e3340;
+      --accent-host: #60a5fa;
+      --accent-host-bg: #1e2a40;
+      --accent-device: #a78bfa;
+      --accent-device-bg: #251e3d;
+      --accent-transfer-h2d: #fbbf24;
+      --accent-transfer-h2d-bg: #2a2210;
+      --accent-transfer-d2h: #34d399;
+      --accent-transfer-d2h-bg: #0f2922;
+      --accent-split: #f87171;
+      --accent-split-bg: #2a1515;
+      --code-bg: #22262f;
+      --arrow-color: #5a6170;
+      --phase-line: #2e3340;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #111318;
+    --surface: #1a1d24;
+    --surface-alt: #22262f;
+    --text: #e2e5eb;
+    --text-muted: #8892a4;
+    --border: #2e3340;
+    --accent-host: #60a5fa;
+    --accent-host-bg: #1e2a40;
+    --accent-device: #a78bfa;
+    --accent-device-bg: #251e3d;
+    --accent-transfer-h2d: #fbbf24;
+    --accent-transfer-h2d-bg: #2a2210;
+    --accent-transfer-d2h: #34d399;
+    --accent-transfer-d2h-bg: #0f2922;
+    --accent-split: #f87171;
+    --accent-split-bg: #2a1515;
+    --code-bg: #22262f;
+    --arrow-color: #5a6170;
+    --phase-line: #2e3340;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    line-height: 1.6;
+    padding-inline: 20px;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    margin: 2rem 0 0.25rem;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+  .subtitle {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    margin-bottom: 2rem;
+  }
+
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin: 2.5rem 0 1rem;
+    text-wrap: balance;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  h2 .phase-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 50%;
+    background: var(--surface-alt);
+    border: 1.5px solid var(--border);
+    font-size: 0.8rem;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 1.5rem 0 0.5rem;
+  }
+
+  p { margin: 0.5rem 0; }
+
+  code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82em;
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 2rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.82rem;
+    font-weight: 500;
+  }
+  .legend-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+
+  .type-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1rem 0;
+  }
+  .type-card .label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+  }
+  .type-card .type-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .type-card .type-name {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.9rem;
+    font-weight: 500;
+  }
+  .type-card .type-desc {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+
+  figure {
+    margin: 1.5rem 0;
+    overflow-x: auto;
+  }
+  figure svg {
+    display: block;
+    max-width: 100%;
+    height: auto;
+  }
+  figcaption {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
+    text-align: center;
+  }
+
+  .step-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0 1.25rem;
+    margin: 1rem 0;
+  }
+  .step-marker {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .step-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 0.35rem;
+  }
+  .step-line {
+    width: 2px;
+    flex: 1;
+    background: var(--phase-line);
+    margin: 4px 0;
+  }
+  .step-content {
+    padding-bottom: 1.25rem;
+  }
+  .step-title {
+    font-weight: 600;
+    font-size: 0.92rem;
+    margin-bottom: 0.15rem;
+  }
+  .step-desc {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+  .step-code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    background: var(--code-bg);
+    padding: 0.6rem 0.8rem;
+    border-radius: 6px;
+    margin-top: 0.4rem;
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.5;
+  }
+  .step-file {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+  }
+
+  .transfer-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 0.15em 0.5em;
+    border-radius: 4px;
+  }
+  .tag-h2d { background: var(--accent-transfer-h2d-bg); color: var(--accent-transfer-h2d); }
+  .tag-d2h { background: var(--accent-transfer-d2h-bg); color: var(--accent-transfer-d2h); }
+  .tag-device { background: var(--accent-device-bg); color: var(--accent-device); }
+  .tag-host { background: var(--accent-host-bg); color: var(--accent-host); }
+  .tag-split { background: var(--accent-split-bg); color: var(--accent-split); }
+
+  .cond-block {
+    background: var(--surface-alt);
+    border-left: 3px solid var(--border);
+    padding: 0.6rem 1rem;
+    margin: 0.5rem 0;
+    border-radius: 0 6px 6px 0;
+    font-size: 0.85rem;
+  }
+  .cond-block strong {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82rem;
+  }
+
+  .transfer-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    margin: 1rem 0;
+  }
+  .transfer-table th {
+    text-align: left;
+    font-weight: 600;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 2px solid var(--border);
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+  .transfer-table td {
+    padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .transfer-table tr:last-child td { border-bottom: none; }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 1.4rem; }
+    .legend { gap: 0.5rem; padding: 0.75rem; }
+    .step-grid { gap: 0 0.75rem; }
+  }
+</style>
+
+<h1>selected_examples Lifecycle</h1>
+<p class="subtitle">Host-device data flow through GPU-accelerated BFS tree training in YDF</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background: var(--accent-host)"></div> Host (CPU)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background: var(--accent-device)"></div> Device (GPU)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background: var(--accent-transfer-h2d)"></div> H&rarr;D Transfer</div>
+  <div class="legend-item"><div class="legend-swatch" style="background: var(--accent-transfer-d2h)"></div> D&rarr;H Transfer</div>
+  <div class="legend-item"><div class="legend-swatch" style="background: var(--accent-split)"></div> Partition / Split</div>
+</div>
+
+<!-- ───── Type Card ───── -->
+<div class="type-card">
+  <div class="label">Data Type</div>
+  <div class="type-row">
+    <span class="type-name">std::vector&lt;UnsignedExampleIdx&gt;</span>
+    <span class="type-desc">host &mdash; sorted <code>uint32_t</code> dataset row indices</span>
+  </div>
+  <div class="type-row" style="margin-top: 0.35rem">
+    <span class="type-name">int* d_selected_examples</span>
+    <span class="type-desc">device &mdash; raw CUDA pointer, same indices</span>
+  </div>
+  <div class="type-row" style="margin-top: 0.35rem">
+    <span class="type-name">SelectedExamplesRollingBuffer</span>
+    <span class="type-desc">mid-training wrapper &mdash; double-buffer with <code>.active</code> span</span>
+  </div>
+</div>
+
+<!-- ═══════════ OVERVIEW DIAGRAM ═══════════ -->
+<h2><span class="phase-num">&bull;</span> End-to-End Overview</h2>
+
+<figure>
+  <svg viewBox="0 0 880 520" role="img" aria-label="End-to-end data flow of selected_examples from bootstrap through BFS depths to OOB evaluation, showing host and device memory regions and transfers between them.">
+    <defs>
+      <marker id="ah" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="currentColor"/></marker>
+      <marker id="ah-h2d" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="var(--accent-transfer-h2d)"/></marker>
+      <marker id="ah-d2h" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="var(--accent-transfer-d2h)"/></marker>
+      <marker id="ah-split" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="var(--accent-split)"/></marker>
+    </defs>
+
+    <!-- Host region -->
+    <rect x="30" y="20" width="380" height="480" rx="10" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1.5" stroke-dasharray="6 3" opacity="0.5"/>
+    <text x="45" y="44" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="var(--accent-host)">HOST (CPU)</text>
+
+    <!-- Device region -->
+    <rect x="470" y="20" width="380" height="480" rx="10" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.5" stroke-dasharray="6 3" opacity="0.5"/>
+    <text x="485" y="44" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="var(--accent-device)">DEVICE (GPU)</text>
+
+    <!-- Phase 1: Bootstrap -->
+    <rect x="500" y="60" width="200" height="42" rx="6" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.5"/>
+    <text x="600" y="78" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="500" fill="var(--accent-device)">curandGenerate</text>
+    <text x="600" y="93" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--text-muted)">+ thrust::sort</text>
+
+    <!-- D2H for non-NO_D2H -->
+    <rect x="60" y="60" width="180" height="42" rx="6" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1.5"/>
+    <text x="150" y="78" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="500" fill="var(--accent-host)">selected_examples</text>
+    <text x="150" y="93" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--text-muted)">vector&lt;uint32&gt;</text>
+    <line x1="500" y1="81" x2="245" y2="81" stroke="var(--accent-transfer-d2h)" stroke-width="1.5" marker-end="url(#ah-d2h)" stroke-dasharray="4 3"/>
+    <text x="370" y="73" text-anchor="middle" font-size="9" font-weight="600" fill="var(--accent-transfer-d2h)">D&rarr;H (non-NO_D2H)</text>
+
+    <!-- Phase 1b: Dedup -->
+    <rect x="720" y="60" width="110" height="42" rx="6" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.5"/>
+    <text x="775" y="78" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">Dedup</text>
+    <text x="775" y="93" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--text-muted)">in-place compact</text>
+
+    <!-- Phase 2: Train entry -->
+    <rect x="60" y="130" width="230" height="36" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1"/>
+    <text x="175" y="153" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor">DecisionTreeTrain(selected_examples)</text>
+    <line x1="150" y1="102" x2="150" y2="130" stroke="currentColor" stroke-width="1" marker-end="url(#ah)"/>
+
+    <!-- Phase 3: RollingBuffer wrap -->
+    <rect x="60" y="185" width="230" height="36" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1"/>
+    <text x="175" y="208" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="currentColor">SelectedExamplesRollingBuffer</text>
+    <line x1="175" y1="166" x2="175" y2="185" stroke="currentColor" stroke-width="1" marker-end="url(#ah)"/>
+
+    <!-- BFS Loop box -->
+    <rect x="45" y="240" width="800" height="240" rx="8" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="8 4"/>
+    <text x="55" y="260" font-family="Inter, sans-serif" font-size="11" font-weight="600" fill="var(--text-muted)">BFS DEPTH LOOP (repeated per depth)</text>
+
+    <!-- Step 3: Flatten -->
+    <rect x="70" y="275" width="150" height="36" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="145" y="293" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-host)">[3] Flatten</text>
+    <text x="145" y="306" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--text-muted)">concat &rarr; flat_sel</text>
+
+    <!-- H2D flat_sel -->
+    <rect x="510" y="275" width="160" height="36" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="590" y="293" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">d_selected_examples</text>
+    <text x="590" y="306" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">contiguous indices</text>
+    <line x1="220" y1="293" x2="508" y2="293" stroke="var(--accent-transfer-h2d)" stroke-width="1.5" marker-end="url(#ah-h2d)"/>
+    <text x="365" y="286" text-anchor="middle" font-size="8.5" font-weight="600" fill="var(--accent-transfer-h2d)">H&rarr;D (non-NO_D2H)</text>
+
+    <!-- Step 7: Projection kernel -->
+    <rect x="510" y="325" width="160" height="36" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="590" y="343" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">[7] Projection</text>
+    <text x="590" y="356" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">SRDW / DRSW kernel</text>
+    <line x1="590" y1="311" x2="590" y2="325" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#ah)"/>
+
+    <!-- Step 7.5: Histogram -->
+    <rect x="510" y="375" width="160" height="36" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="590" y="393" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">[7.5] Histogram</text>
+    <text x="590" y="406" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">labels + entropy</text>
+    <line x1="590" y1="361" x2="590" y2="375" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#ah)"/>
+
+    <!-- D2H best splits -->
+    <rect x="70" y="375" width="150" height="36" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="145" y="393" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-host)">best splits</text>
+    <text x="145" y="406" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">gain, threshold, proj</text>
+    <line x1="510" y1="393" x2="222" y2="393" stroke="var(--accent-transfer-d2h)" stroke-width="1.5" marker-end="url(#ah-d2h)"/>
+    <text x="365" y="386" text-anchor="middle" font-size="8.5" font-weight="600" fill="var(--accent-transfer-d2h)">D&rarr;H best per node</text>
+
+    <!-- Step 8: Partition -->
+    <rect x="510" y="430" width="160" height="36" rx="5" fill="var(--accent-split-bg)" stroke="var(--accent-split)" stroke-width="1"/>
+    <text x="590" y="448" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="var(--accent-split)">[8] Partition</text>
+    <text x="590" y="461" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">in-place reorder</text>
+    <line x1="590" y1="411" x2="590" y2="430" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#ah)"/>
+
+    <!-- Step 9: NodeTrain -->
+    <rect x="70" y="430" width="150" height="36" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="145" y="448" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-host)">[9] NodeTrain</text>
+    <text x="145" y="461" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">push children &rarr; queue</text>
+
+    <!-- D2H partition results (non-NO_D2H) -->
+    <line x1="510" y1="450" x2="222" y2="450" stroke="var(--accent-transfer-d2h)" stroke-width="1.5" marker-end="url(#ah-d2h)" stroke-dasharray="4 3"/>
+    <text x="365" y="444" text-anchor="middle" font-size="8.5" font-weight="600" fill="var(--accent-transfer-d2h)">D&rarr;H reordered (non-NO_D2H)</text>
+
+    <!-- Loop-back arrow -->
+    <path d="M 145,466 L 145,485 Q 145,495 155,495 L 755,495 Q 765,495 765,485 L 765,275 Q 765,265 755,265 L 675,265" stroke="var(--arrow-color)" stroke-width="1.5" fill="none" marker-end="url(#ah)" stroke-dasharray="5 3"/>
+    <text x="770" y="380" font-size="9" fill="var(--text-muted)" writing-mode="tb" text-anchor="middle">next depth</text>
+  </svg>
+  <figcaption>End-to-end flow: bootstrap on device, optional D&rarr;H, then BFS loop where indices shuttle between host and device each depth (or stay device-only in NO_D2H mode).</figcaption>
+</figure>
+
+
+<!-- ═══════════ PHASE 1 ═══════════ -->
+<h2><span class="phase-num">1</span> Bootstrap Sampling</h2>
+<p>Each tree starts with a fresh <code>std::vector&lt;UnsignedExampleIdx&gt;</code> declared at <code>random_forest.cc:765</code>. Three compile-time paths fill it:</p>
+
+<div class="step-grid">
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-device)"></div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">GPU + NO_D2H Path</div>
+    <div class="step-desc"><span class="transfer-tag tag-device">DEVICE ONLY</span> Indices generated and sorted entirely on device. Host vector stays <strong>empty</strong>.</div>
+    <div class="step-code">SampleTrainingExamplesKernel_No_D2H_wrap(
+    num_rows, rf_config, bootstrap_size_ratio_factor,
+    d_selected_examples, gpu_root_sel_count, seed);</div>
+    <div class="step-file">random_forest.cc:790</div>
+  </div>
+
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-transfer-d2h)"></div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">GPU without NO_D2H</div>
+    <div class="step-desc"><span class="transfer-tag tag-d2h">D&rarr;H</span> Same kernel, then <code>cudaMemcpy</code> copies sorted indices back to host vector.</div>
+    <div class="step-code">SampleTrainingExamplesKernel_wrap(
+    num_rows, rf_config, bootstrap_size_ratio_factor,
+    d_selected_examples, &selected_examples, seed);</div>
+    <div class="step-file">random_forest.cc:829</div>
+  </div>
+
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-host)"></div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">CPU Path</div>
+    <div class="step-desc"><span class="transfer-tag tag-host">HOST ONLY</span> <code>SampleTrainingExamples()</code> &mdash; uniform random + sort, or iota for no-bootstrap.</div>
+    <div class="step-file">random_forest.cc:777</div>
+  </div>
+
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-split)"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">DEDUP_BOOTSTRAP (optional)</div>
+    <div class="step-desc"><span class="transfer-tag tag-device">DEVICE</span> <code>DeduplicateBootstrap_wrap()</code> compacts in-place, produces <code>d_ex_dup_counts</code> per-row multiplicities. Updates <code>gpu_root_sel_count</code> to unique count.</div>
+    <div class="step-file">random_forest.cc:810</div>
+  </div>
+</div>
+
+<div class="cond-block">
+  <strong>OOB exception:</strong> Even in NO_D2H, if <code>compute_oob_performances</code> is true, a D&rarr;H copy happens <em>before</em> dedup (line 800&ndash;803) so the host has the original duplicated indices for out-of-bag evaluation.
+</div>
+
+
+<!-- ═══════════ PHASE 2 ═══════════ -->
+<h2><span class="phase-num">2</span> Handoff to Tree Training</h2>
+<p>Both the host vector and device pointer travel into <code>decision_tree::Train()</code>:</p>
+<div class="step-code">decision_tree::Train(
+    train_dataset, selected_examples, config, config_link,
+    dt_config, deployment, weights, &random,
+    decision_tree.get(), internal_config);
+// internal_config carries: d_flat_data, d_labels,
+//   d_selected_examples, gpu_root_sel_count, d_ex_dup_counts</div>
+<div class="step-file">random_forest.cc:878</div>
+
+
+<!-- ═══════════ PHASE 3 ═══════════ -->
+<h2><span class="phase-num">3</span> DecisionTreeTrain &rarr; CoreTrain</h2>
+<div class="step-grid">
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-host)"></div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">Honest Split (optional)</div>
+    <div class="step-desc">If <code>dt_config.has_honest()</code>, partitions the host span into <code>working_selected_examples</code> (structure) and <code>leaf_examples</code> (leaf values). Otherwise, copies span as-is.</div>
+    <div class="step-file">training.cc:4878</div>
+  </div>
+
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-host)"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">Wrap in RollingBuffer</div>
+    <div class="step-desc"><code>SelectedExamplesRollingBuffer::Create(selected_examples, &buffer)</code> &mdash; a double-buffer so partition can write to the inactive side, then swap.</div>
+    <div class="step-file">training.cc:4949</div>
+  </div>
+</div>
+
+
+<!-- ═══════════ PHASE 4 ═══════════ -->
+<h2><span class="phase-num">4</span> BFS Loop &mdash; GrowTreeLocalBFS</h2>
+<p>This is the core loop. All nodes at a given depth are processed as a single GPU batch.</p>
+
+<!-- BFS OVERVIEW DIAGRAM -->
+<figure>
+  <svg viewBox="0 0 880 400" role="img" aria-label="Detailed per-depth BFS iteration showing the 7 steps: flatten, H2D, projection, histogram, best-split D2H, partition, and NodeTrain with children pushed back to queue.">
+    <defs>
+      <marker id="a2" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><polygon points="0 0, 7 2.5, 0 5" fill="currentColor"/></marker>
+    </defs>
+
+    <!-- Depth queue seed -->
+    <rect x="30" y="15" width="185" height="55" rx="6" fill="var(--surface)" stroke="var(--border)" stroke-width="1.5"/>
+    <text x="122" y="35" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="currentColor">node_queue</text>
+    <text x="122" y="51" text-anchor="middle" font-size="9" fill="var(--text-muted)">NodeAndExamples per node</text>
+    <text x="122" y="63" text-anchor="middle" font-size="8.5" fill="var(--text-muted)">{node, rolling_buf, d_sel_examples, d_sel_count}</text>
+
+    <!-- Arrow down -->
+    <line x1="122" y1="70" x2="122" y2="95" stroke="currentColor" stroke-width="1" marker-end="url(#a2)"/>
+
+    <!-- Step 3 -->
+    <rect x="50" y="97" width="145" height="38" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1.2"/>
+    <text x="122" y="114" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-host)">[3] Flatten</text>
+    <text x="122" y="128" text-anchor="middle" font-size="8" fill="var(--text-muted)">concat to flat_sel</text>
+
+    <!-- Arrow right to H2D -->
+    <line x1="195" y1="116" x2="240" y2="116" stroke="var(--accent-transfer-h2d)" stroke-width="1.5" marker-end="url(#ah-h2d)"/>
+    <text x="218" y="109" text-anchor="middle" font-size="7.5" font-weight="600" fill="var(--accent-transfer-h2d)">H&rarr;D</text>
+
+    <!-- d_selected_examples block -->
+    <rect x="245" y="97" width="170" height="38" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.2"/>
+    <text x="330" y="114" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="500" fill="var(--accent-device)">d_selected_examples</text>
+    <text x="330" y="128" text-anchor="middle" font-size="8" fill="var(--text-muted)">contiguous on device</text>
+
+    <!-- Arrow down -->
+    <line x1="330" y1="135" x2="330" y2="158" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#a2)"/>
+
+    <!-- Step 7: Projection -->
+    <rect x="245" y="160" width="170" height="38" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.2"/>
+    <text x="330" y="177" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">[7] Apply Projection</text>
+    <text x="330" y="191" text-anchor="middle" font-size="8" fill="var(--text-muted)">SRDW_1_2D / DRSW_1</text>
+
+    <!-- Reads annotation -->
+    <text x="440" y="175" font-size="8" fill="var(--text-muted)">reads: d_flat_data[col * N +</text>
+    <text x="455" y="187" font-size="8" fill="var(--text-muted)">d_selected_examples[off + i]]</text>
+
+    <!-- Arrow down -->
+    <line x1="330" y1="198" x2="330" y2="218" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#a2)"/>
+
+    <!-- Step 7.5: Histogram -->
+    <rect x="245" y="220" width="170" height="50" rx="5" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1.2"/>
+    <text x="330" y="237" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-device)">[7.5] Hist + Entropy</text>
+    <text x="330" y="251" text-anchor="middle" font-size="8" fill="var(--text-muted)">MinMax &rarr; Boundaries &rarr;</text>
+    <text x="330" y="263" text-anchor="middle" font-size="8" fill="var(--text-muted)">BuildHist &rarr; BestSplit</text>
+
+    <!-- Reads annotation -->
+    <text x="440" y="245" font-size="8" fill="var(--text-muted)">reads: d_labels[d_sel[...]]</text>
+    <text x="440" y="257" font-size="8" fill="var(--text-muted)">DEDUP: d_dup_counts[d_sel[i]]</text>
+
+    <!-- D2H best splits -->
+    <line x1="245" y1="252" x2="195" y2="252" stroke="var(--accent-transfer-d2h)" stroke-width="1.5" marker-end="url(#ah-d2h)"/>
+    <rect x="50" y="237" width="145" height="30" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="122" y="257" text-anchor="middle" font-size="8.5" fill="var(--accent-host)">best_gain, threshold, proj</text>
+    <text x="122" y="230" text-anchor="middle" font-size="7.5" font-weight="600" fill="var(--accent-transfer-d2h)">D&rarr;H</text>
+
+    <!-- Arrow down -->
+    <line x1="330" y1="270" x2="330" y2="295" stroke="var(--accent-device)" stroke-width="1" marker-end="url(#a2)"/>
+
+    <!-- Step 8: Partition -->
+    <rect x="245" y="297" width="170" height="38" rx="5" fill="var(--accent-split-bg)" stroke="var(--accent-split)" stroke-width="1.5"/>
+    <text x="330" y="314" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="600" fill="var(--accent-split)">[8] Partition</text>
+    <text x="330" y="328" text-anchor="middle" font-size="8" fill="var(--text-muted)">in-place reorder d_sel</text>
+
+    <!-- Annotation -->
+    <text x="440" y="312" font-size="8" fill="var(--text-muted)">proj &ge; threshold &rarr; left</text>
+    <text x="440" y="324" font-size="8" fill="var(--text-muted)">proj &lt; threshold &rarr; right</text>
+
+    <!-- D2H partition (non-NO_D2H) or class counts -->
+    <line x1="245" y1="320" x2="195" y2="320" stroke="var(--accent-transfer-d2h)" stroke-width="1.5" marker-end="url(#ah-d2h)" stroke-dasharray="4 3"/>
+    <rect x="50" y="305" width="145" height="30" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="122" y="324" text-anchor="middle" font-size="8.5" fill="var(--accent-host)">class counts / indices</text>
+    <text x="122" y="299" text-anchor="middle" font-size="7.5" font-weight="600" fill="var(--accent-transfer-d2h)">D&rarr;H</text>
+
+    <!-- Arrow down to NodeTrain -->
+    <line x1="122" y1="335" x2="122" y2="352" stroke="currentColor" stroke-width="1" marker-end="url(#a2)"/>
+
+    <!-- Step 9: NodeTrain -->
+    <rect x="50" y="354" width="145" height="36" rx="5" fill="var(--accent-host-bg)" stroke="var(--accent-host)" stroke-width="1.2"/>
+    <text x="122" y="370" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" font-weight="500" fill="var(--accent-host)">[9] NodeTrain</text>
+    <text x="122" y="384" text-anchor="middle" font-size="8" fill="var(--text-muted)">set leaf, push children</text>
+
+    <!-- Loop-back arrow -->
+    <path d="M 50,372 Q 30,372 30,360 L 30,105 Q 30,95 40,95 L 48,95" stroke="var(--arrow-color)" stroke-width="1.2" fill="none" marker-end="url(#a2)" stroke-dasharray="5 3"/>
+    <text x="22" y="230" font-size="8" fill="var(--text-muted)" writing-mode="tb" text-anchor="middle">next depth</text>
+
+    <!-- NO_D2H annotation box -->
+    <rect x="630" y="80" width="220" height="115" rx="6" fill="var(--surface)" stroke="var(--accent-device)" stroke-width="1" stroke-dasharray="4 2"/>
+    <text x="740" y="100" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="600" fill="var(--accent-device)">NO_D2H mode</text>
+    <text x="645" y="118" font-size="8.5" fill="var(--text-muted)">Step [3]: skip flatten, just compute</text>
+    <text x="645" y="132" font-size="8.5" fill="var(--text-muted)">node_row_offsets from d_sel_count</text>
+    <text x="645" y="152" font-size="8.5" fill="var(--text-muted)">Step [6]: skip H&rarr;D cudaMemcpy</text>
+    <text x="645" y="172" font-size="8.5" fill="var(--text-muted)">Step [8]: _No_D2H_fused variant;</text>
+    <text x="645" y="186" font-size="8.5" fill="var(--text-muted)">only class counts come back D&rarr;H</text>
+
+    <!-- Partition detail box -->
+    <rect x="630" y="260" width="220" height="125" rx="6" fill="var(--surface)" stroke="var(--accent-split)" stroke-width="1" stroke-dasharray="4 2"/>
+    <text x="740" y="280" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" font-weight="600" fill="var(--accent-split)">Partition output</text>
+    <text x="645" y="300" font-size="8.5" fill="var(--text-muted)">d_selected_examples reordered:</text>
+    <text x="645" y="318" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--text-muted)">[node0_pos|node0_neg|node1_pos|...]</text>
+    <text x="645" y="340" font-size="8.5" fill="var(--text-muted)">child_offsets[n]: start of each</text>
+    <text x="645" y="354" font-size="8.5" fill="var(--text-muted)">child's slice in the flat buffer</text>
+    <text x="645" y="374" font-size="8.5" fill="var(--text-muted)">Children reference contiguous</text>
+    <text x="645" y="388" font-size="8.5" fill="var(--text-muted)">slices &mdash; no extra allocation</text>
+  </svg>
+  <figcaption>Per-depth BFS iteration: steps [3]&ndash;[9] repeat for each tree depth, processing all nodes at once on the GPU.</figcaption>
+</figure>
+
+
+<!-- ═══════════ PARTITION DETAIL ═══════════ -->
+<h2><span class="phase-num">5</span> Partition Detail &mdash; How Indices Split</h2>
+<p>The partition kernel reorders <code>d_selected_examples</code> <strong>in-place</strong>. For each node, rows where the projected value &ge; threshold go to the positive (left) side, others to negative (right).</p>
+
+<figure>
+  <svg viewBox="0 0 880 240" role="img" aria-label="Before and after view of partition: the flat buffer of indices is reordered so each node's positive and negative children occupy contiguous slices, with child_offsets marking boundaries.">
+    <!-- Before -->
+    <text x="30" y="25" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="currentColor">BEFORE partition (depth d)</text>
+    <text x="30" y="42" font-size="9" fill="var(--text-muted)">d_selected_examples: contiguous per-node</text>
+
+    <!-- Node 0 -->
+    <rect x="30" y="52" width="250" height="32" rx="4" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="155" y="73" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--accent-device)">Node 0: [idx3, idx7, idx1, idx9, idx2]</text>
+
+    <!-- Node 1 -->
+    <rect x="285" y="52" width="220" height="32" rx="4" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="395" y="73" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--accent-device)">Node 1: [idx5, idx0, idx8, idx4]</text>
+
+    <!-- Node 2 -->
+    <rect x="510" y="52" width="180" height="32" rx="4" fill="var(--accent-device-bg)" stroke="var(--accent-device)" stroke-width="1"/>
+    <text x="600" y="73" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--accent-device)">Node 2: [idx6, idx11, idx10]</text>
+
+    <!-- Offsets -->
+    <text x="30" y="100" font-family="IBM Plex Mono, monospace" font-size="8" fill="var(--text-muted)">off: 0</text>
+    <text x="280" y="100" font-family="IBM Plex Mono, monospace" font-size="8" fill="var(--text-muted)">5</text>
+    <text x="505" y="100" font-family="IBM Plex Mono, monospace" font-size="8" fill="var(--text-muted)">9</text>
+    <text x="690" y="100" font-family="IBM Plex Mono, monospace" font-size="8" fill="var(--text-muted)">12</text>
+
+    <!-- Arrow -->
+    <line x1="400" y1="108" x2="400" y2="128" stroke="var(--accent-split)" stroke-width="2" marker-end="url(#ah-split)"/>
+    <text x="430" y="122" font-size="9" font-weight="600" fill="var(--accent-split)">SplitExamplesInPlace</text>
+
+    <!-- After -->
+    <text x="30" y="150" font-family="IBM Plex Mono, monospace" font-size="10" font-weight="600" fill="currentColor">AFTER partition (ready for depth d+1)</text>
+    <text x="30" y="167" font-size="9" fill="var(--text-muted)">Same buffer, reordered: [pos|neg] per node</text>
+
+    <!-- Node 0 pos -->
+    <rect x="30" y="175" width="100" height="32" rx="4" fill="#dbeafe" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="80" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-host)">N0 pos</text>
+
+    <!-- Node 0 neg -->
+    <rect x="132" y="175" width="115" height="32" rx="4" fill="#fce7f3" stroke="var(--accent-split)" stroke-width="1"/>
+    <text x="189" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-split)">N0 neg</text>
+
+    <!-- Node 1 pos -->
+    <rect x="249" y="175" width="90" height="32" rx="4" fill="#dbeafe" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="294" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-host)">N1 pos</text>
+
+    <!-- Node 1 neg -->
+    <rect x="341" y="175" width="105" height="32" rx="4" fill="#fce7f3" stroke="var(--accent-split)" stroke-width="1"/>
+    <text x="393" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-split)">N1 neg</text>
+
+    <!-- Node 2 pos -->
+    <rect x="448" y="175" width="80" height="32" rx="4" fill="#dbeafe" stroke="var(--accent-host)" stroke-width="1"/>
+    <text x="488" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-host)">N2 pos</text>
+
+    <!-- Node 2 neg -->
+    <rect x="530" y="175" width="80" height="32" rx="4" fill="#fce7f3" stroke="var(--accent-split)" stroke-width="1"/>
+    <text x="570" y="196" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8.5" fill="var(--accent-split)">N2 neg</text>
+
+    <!-- child_offsets annotation -->
+    <text x="30" y="225" font-family="IBM Plex Mono, monospace" font-size="8" fill="var(--text-muted)">child_offsets: [0, 2, 5, 7, 9, 10, 12]</text>
+    <text x="380" y="225" font-size="8.5" fill="var(--text-muted)">&larr; each pair = one child's d_sel_count at depth d+1</text>
+  </svg>
+  <figcaption>The partition kernel reorders indices in-place so each child's data is a contiguous slice. <code>child_offsets</code> marks boundaries.</figcaption>
+</figure>
+
+
+<!-- ═══════════ PHASE 6 ═══════════ -->
+<h2><span class="phase-num">6</span> Post-Training: OOB Evaluation</h2>
+<p>After the tree is fully built, the <strong>original host-side</strong> <code>selected_examples</code> (the sorted bootstrap indices before dedup) is used for out-of-bag evaluation at <code>random_forest.cc:995</code>.</p>
+<p><code>UpdateOOBPredictionsWithNewTree()</code> iterates all dataset rows, <strong>skipping</strong> those present in <code>selected_examples</code> (the in-bag set) to compute out-of-bag predictions. This is why even in NO_D2H mode, a D&rarr;H copy happens before dedup when OOB is enabled.</p>
+
+<!-- ═══════════ Transfer Summary Table ═══════════ -->
+<h2><span class="phase-num">7</span> Complete Transfer Summary</h2>
+
+<div style="overflow-x: auto">
+<table class="transfer-table">
+  <thead>
+    <tr>
+      <th>Direction</th>
+      <th>What</th>
+      <th>Where</th>
+      <th>When</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="transfer-tag tag-h2d">H&rarr;D</span></td>
+      <td>Full dataset (<code>d_flat_data</code>, <code>d_labels</code>)</td>
+      <td>RF learner :679</td>
+      <td>Once, before tree loop</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-device">DEV</span></td>
+      <td>Bootstrap indices generated + sorted on GPU</td>
+      <td>SampleKernel</td>
+      <td>Once per tree</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-d2h">D&rarr;H</span></td>
+      <td>Bootstrap indices to host vector</td>
+      <td>RF :800 or :829</td>
+      <td>NO_D2H+OOB, or always without NO_D2H</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-h2d">H&rarr;D</span></td>
+      <td><code>flat_sel</code> (concatenated node indices)</td>
+      <td>BFS :5798</td>
+      <td>Every depth, without NO_D2H</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-h2d">H&rarr;D</span></td>
+      <td><code>node_row_offsets</code></td>
+      <td>BFS :5800</td>
+      <td>Every depth</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-h2d">H&rarr;D</span></td>
+      <td>Projection data (offsets, col_idx, weights)</td>
+      <td>BFS :5830</td>
+      <td>Every depth, without GPU_SAMPLE_PROJ</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-d2h">D&rarr;H</span></td>
+      <td>Best split results (gain, threshold, proj index)</td>
+      <td>BFS :6150</td>
+      <td>Every depth</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-d2h">D&rarr;H</span></td>
+      <td>Partition class counts (pos/neg per class)</td>
+      <td>Partition kernel</td>
+      <td>Every depth</td>
+    </tr>
+    <tr>
+      <td><span class="transfer-tag tag-d2h">D&rarr;H</span></td>
+      <td>Reordered indices back to host spans</td>
+      <td>SplitAllDepth</td>
+      <td>Every depth, without NO_D2H</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="cond-block" style="margin-top: 1.5rem">
+  <strong>Key insight &mdash; NO_D2H eliminates the per-depth round-trip.</strong> In NO_D2H mode, <code>selected_examples</code> lives exclusively on device after bootstrap. The host tracks only offsets and counts while the GPU owns the actual index data. Without NO_D2H, every depth does a full H&rarr;D copy of flattened indices and a D&rarr;H copy of partitioned results.
+</div>
+
+<!-- ═══════════ Cleanup ═══════════ -->
+<h2><span class="phase-num">8</span> Cleanup</h2>
+<p>After the BFS loop exits (all leaves finalized), GPU buffers are freed:</p>
+<div class="step-grid">
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-device)"></div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">Per-tree device buffer</div>
+    <div class="step-desc">In NO_D2H: <code>d_selected_examples</code> freed after Train() returns (RF :885). Without NO_D2H: freed inside GrowTreeLocalBFS cleanup (:6423).</div>
+  </div>
+  <div class="step-marker">
+    <div class="step-dot" style="background: var(--accent-device)"></div>
+  </div>
+  <div class="step-content">
+    <div class="step-title">DEDUP_BOOTSTRAP counts</div>
+    <div class="step-desc"><code>d_ex_dup_counts</code> freed after Train() returns (RF :892).</div>
+  </div>
+</div>

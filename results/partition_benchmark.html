@@ -1,0 +1,549 @@
+<title>Partition Benchmark</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --surface: #f8f7f5;
+  --surface-chart: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #8a8880;
+  --border: #e5e3de;
+  --grid: #eae8e3;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --winner-bg: rgba(27, 175, 122, 0.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --surface: #141413;
+    --surface-chart: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #7a786e;
+    --border: #2e2d2a;
+    --grid: #262523;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --winner-bg: rgba(25, 158, 112, 0.10);
+  }
+}
+:root[data-theme="dark"] {
+  --surface: #141413;
+  --surface-chart: #1a1a19;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #7a786e;
+  --border: #2e2d2a;
+  --grid: #262523;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --winner-bg: rgba(25, 158, 112, 0.10);
+}
+
+body {
+  background: var(--surface);
+  color: var(--text-primary);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  padding-inline: 24px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 2rem 0 0.25rem;
+  letter-spacing: -0.02em;
+  text-wrap: balance;
+}
+
+.subtitle {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin: 0 0 2rem;
+  line-height: 1.5;
+}
+
+.subtitle span {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.8125rem;
+}
+
+.legend {
+  display: flex;
+  gap: 1.25rem;
+  margin-bottom: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+
+.legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.charts-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+@media (max-width: 640px) {
+  .charts-row { grid-template-columns: 1fr; }
+  body { padding-inline: 16px; }
+}
+
+.chart-card {
+  background: var(--surface-chart);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.25rem 1rem;
+}
+
+.chart-title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  margin: 0 0 0.125rem;
+  color: var(--text-primary);
+}
+
+.chart-unit {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin: 0 0 1rem;
+}
+
+svg text {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+
+.tick-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+}
+
+.axis-label {
+  fill: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.value-label {
+  fill: var(--text-secondary);
+  font-size: 10px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-weight: 500;
+}
+
+.grid-line {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+
+.baseline {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+
+.depth-chart-card {
+  background: var(--surface-chart);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem;
+  margin-bottom: 2rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 2rem;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  padding: 0.625rem 0.75rem;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.8125rem;
+}
+
+tr td:first-child {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.winner {
+  background: var(--winner-bg);
+  font-weight: 500;
+}
+
+.section-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 2rem 0 0.75rem;
+  color: var(--text-primary);
+}
+
+.tooltip {
+  position: fixed;
+  pointer-events: none;
+  background: var(--surface-chart);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+  z-index: 100;
+  display: none;
+  font-family: 'IBM Plex Mono', monospace;
+  color: var(--text-primary);
+}
+
+.line-marker {
+  r: 5;
+  stroke-width: 2;
+}
+
+.line-marker-ring {
+  fill: var(--surface-chart);
+  r: 7;
+}
+
+.hit-target {
+  fill: transparent;
+  cursor: pointer;
+}
+
+.speedup {
+  display: inline-block;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--series-3);
+  margin-left: 4px;
+}
+
+.table-wrap { overflow-x: auto; }
+</style>
+
+<h1>GPU Partition Strategy Comparison</h1>
+<p class="subtitle">
+  HIGGS dataset <span>(11M rows, 28 features)</span> &middot; Oblique RF, 1 tree, density 1.5 &middot; NVIDIA L40S
+</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--series-1)"></div>Block Stable</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--series-2)"></div>Two-Pass Stable</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:var(--series-3)"></div>Regular (d2d_kernel)</div>
+</div>
+
+<div class="charts-row">
+  <div class="chart-card">
+    <h3 class="chart-title">Partition Kernel Time</h3>
+    <p class="chart-unit">APkernel_ms &mdash; lower is better</p>
+    <svg id="chart-ap" width="100%" viewBox="0 0 400 260"></svg>
+  </div>
+  <div class="chart-card">
+    <h3 class="chart-title">Total Tree Time</h3>
+    <p class="chart-unit">tree_total_ms &mdash; lower is better</p>
+    <svg id="chart-tree" width="100%" viewBox="0 0 400 260"></svg>
+  </div>
+</div>
+
+<div class="depth-chart-card">
+  <h3 class="chart-title">SplitAllDepth per Level (depth-16 run)</h3>
+  <p class="chart-unit">SplitAllDepth_ms at each tree level &mdash; lower is better</p>
+  <svg id="chart-depth" width="100%" viewBox="0 0 880 300"></svg>
+</div>
+
+<h3 class="section-title">Summary</h3>
+<div class="table-wrap">
+<table id="summary-table">
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th>Depth</th>
+      <th>Block Stable</th>
+      <th>Two-Pass Stable</th>
+      <th>Regular</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+(function() {
+  const S1 = getComputedStyle(document.documentElement).getPropertyValue('--series-1').trim() || '#2a78d6';
+  const S2 = getComputedStyle(document.documentElement).getPropertyValue('--series-2').trim() || '#eb6834';
+  const S3 = getComputedStyle(document.documentElement).getPropertyValue('--series-3').trim() || '#1baf7a';
+  const GRID = getComputedStyle(document.documentElement).getPropertyValue('--grid').trim() || '#eae8e3';
+  const MUTED = getComputedStyle(document.documentElement).getPropertyValue('--text-muted').trim() || '#8a8880';
+  const SECONDARY = getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim() || '#52514e';
+  const SURFACE = getComputedStyle(document.documentElement).getPropertyValue('--surface-chart').trim() || '#fcfcfb';
+
+  const colors = [S1, S2, S3];
+  const names = ['Block Stable', 'Two-Pass Stable', 'Regular'];
+
+  const apData = {
+    depths: [6, 10, 16],
+    values: [
+      [11.55, 10.44, 13.48],
+      [33.96, 23.53, 41.51],
+      [89.89, 49.92, 102.49]
+    ]
+  };
+
+  const treeData = {
+    depths: [6, 10, 16],
+    values: [
+      [56.17, 55.57, 60.90],
+      [113.15, 102.52, 122.60],
+      [300.52, 284.79, 316.19]
+    ]
+  };
+
+  const splitData = {
+    depths: [6, 10, 16],
+    values: [
+      [26.58, 27.17, 28.54],
+      [47.61, 49.05, 48.27],
+      [73.57, 77.38, 76.70]
+    ]
+  };
+
+  const depthPerLevel = {
+    levels: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],
+    blockStable:  [5.51,4.87,5.71,5.26,5.19,5.61,5.15,5.41,4.95,4.80,4.63,4.55,4.09,4.05,3.79],
+    twoPass:      [5.61,5.00,5.75,5.47,5.11,6.13,5.48,5.47,4.82,5.28,4.97,4.60,4.43,4.46,4.79],
+    regular:      [5.82,5.27,6.08,5.66,5.57,5.67,5.21,5.47,5.03,4.87,4.71,4.61,4.20,4.27,4.26]
+  };
+
+  const tooltip = document.getElementById('tooltip');
+
+  function showTooltip(evt, html) {
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    const r = tooltip.getBoundingClientRect();
+    let x = evt.clientX + 12;
+    let y = evt.clientY - r.height - 8;
+    if (x + r.width > window.innerWidth - 12) x = evt.clientX - r.width - 12;
+    if (y < 4) y = evt.clientY + 12;
+    tooltip.style.left = x + 'px';
+    tooltip.style.top = y + 'px';
+  }
+  function hideTooltip() { tooltip.style.display = 'none'; }
+
+  function drawGroupedBar(svgId, data, maxVal) {
+    const svg = document.getElementById(svgId);
+    const W = 400, H = 260;
+    const ml = 50, mr = 16, mt = 8, mb = 36;
+    const cw = W - ml - mr, ch = H - mt - mb;
+
+    const nGroups = data.depths.length;
+    const groupW = cw / nGroups;
+    const barW = 20;
+    const gap = 2;
+    const totalBarBlock = 3 * barW + 2 * gap;
+    const groupPad = (groupW - totalBarBlock) / 2;
+
+    const ticks = niceScale(0, maxVal, 5);
+    const yMax = ticks[ticks.length - 1];
+
+    let svgContent = '';
+
+    ticks.forEach(t => {
+      const y = mt + ch - (t / yMax) * ch;
+      svgContent += `<line x1="${ml}" y1="${y}" x2="${W - mr}" y2="${y}" class="grid-line"/>`;
+      svgContent += `<text x="${ml - 8}" y="${y + 4}" text-anchor="end" class="tick-label">${t}</text>`;
+    });
+
+    svgContent += `<line x1="${ml}" y1="${mt + ch}" x2="${W - mr}" y2="${mt + ch}" class="baseline"/>`;
+
+    data.depths.forEach((depth, gi) => {
+      const gx = ml + gi * groupW;
+      svgContent += `<text x="${gx + groupW / 2}" y="${H - 8}" text-anchor="middle" class="axis-label">Depth ${depth}</text>`;
+
+      data.values[gi].forEach((val, bi) => {
+        const bx = gx + groupPad + bi * (barW + gap);
+        const bh = (val / yMax) * ch;
+        const by = mt + ch - bh;
+        const r = 4;
+        svgContent += `<path d="M${bx},${mt + ch} L${bx},${by + r} Q${bx},${by} ${bx + r},${by} L${bx + barW - r},${by} Q${bx + barW},${by} ${bx + barW},${by + r} L${bx + barW},${mt + ch} Z" fill="${colors[bi]}"/>`;
+        svgContent += `<text x="${bx + barW / 2}" y="${by - 5}" text-anchor="middle" class="value-label">${val.toFixed(1)}</text>`;
+        svgContent += `<rect x="${bx}" y="${by}" width="${barW}" height="${bh}" class="hit-target" data-name="${names[bi]}" data-depth="${depth}" data-val="${val.toFixed(2)}"/>`;
+      });
+    });
+
+    svg.innerHTML = svgContent;
+
+    svg.querySelectorAll('.hit-target').forEach(el => {
+      el.addEventListener('mousemove', e => {
+        showTooltip(e, `<strong>${el.dataset.name}</strong><br>Depth ${el.dataset.depth}: ${el.dataset.val} ms`);
+      });
+      el.addEventListener('mouseleave', hideTooltip);
+    });
+  }
+
+  function niceScale(lo, hi, targetTicks) {
+    const range = hi - lo || 1;
+    const rough = range / targetTicks;
+    const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+    const res = rough / mag;
+    let step;
+    if (res <= 1.5) step = 1 * mag;
+    else if (res <= 3) step = 2 * mag;
+    else if (res <= 7) step = 5 * mag;
+    else step = 10 * mag;
+    const start = Math.floor(lo / step) * step;
+    const ticks = [];
+    for (let v = start; v <= hi * 1.05; v += step) {
+      ticks.push(Math.round(v * 1000) / 1000);
+    }
+    if (ticks.length < 2) ticks.push(ticks[0] + step);
+    return ticks;
+  }
+
+  function drawDepthLines() {
+    const svg = document.getElementById('chart-depth');
+    const W = 880, H = 300;
+    const ml = 56, mr = 100, mt = 12, mb = 40;
+    const cw = W - ml - mr, ch = H - mt - mb;
+
+    const levels = depthPerLevel.levels;
+    const allVals = [...depthPerLevel.blockStable, ...depthPerLevel.twoPass, ...depthPerLevel.regular];
+    const yMin = Math.floor(Math.min(...allVals) - 0.5);
+    const yMax = Math.ceil(Math.max(...allVals) + 0.5);
+
+    const ticks = niceScale(yMin, yMax, 5);
+    const yTop = ticks[0];
+    const yBot = ticks[ticks.length - 1];
+
+    const xScale = i => ml + (i / (levels.length - 1)) * cw;
+    const yScale = v => mt + ch - ((v - yTop) / (yBot - yTop)) * ch;
+
+    let svgContent = '';
+
+    ticks.forEach(t => {
+      const y = yScale(t);
+      svgContent += `<line x1="${ml}" y1="${y}" x2="${W - mr}" y2="${y}" class="grid-line"/>`;
+      svgContent += `<text x="${ml - 8}" y="${y + 4}" text-anchor="end" class="tick-label">${t}</text>`;
+    });
+
+    svgContent += `<line x1="${ml}" y1="${mt + ch}" x2="${W - mr}" y2="${mt + ch}" class="baseline"/>`;
+
+    levels.forEach((lv, i) => {
+      if (i % 2 === 0 || i === levels.length - 1) {
+        svgContent += `<text x="${xScale(i)}" y="${H - 10}" text-anchor="middle" class="axis-label">D${lv}</text>`;
+      }
+    });
+
+    const series = [
+      { data: depthPerLevel.blockStable, color: 0, name: 'Block Stable' },
+      { data: depthPerLevel.twoPass, color: 1, name: 'Two-Pass Stable' },
+      { data: depthPerLevel.regular, color: 2, name: 'Regular' }
+    ];
+
+    series.forEach(s => {
+      let path = '';
+      s.data.forEach((v, i) => {
+        path += (i === 0 ? 'M' : 'L') + `${xScale(i)},${yScale(v)}`;
+      });
+      svgContent += `<path d="${path}" fill="none" stroke="${colors[s.color]}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    });
+
+    series.forEach(s => {
+      s.data.forEach((v, i) => {
+        const cx = xScale(i), cy = yScale(v);
+        svgContent += `<circle cx="${cx}" cy="${cy}" fill="${SURFACE}" class="line-marker-ring"/>`;
+        svgContent += `<circle cx="${cx}" cy="${cy}" fill="${colors[s.color]}" class="line-marker"/>`;
+        svgContent += `<circle cx="${cx}" cy="${cy}" r="12" class="hit-target" data-name="${s.name}" data-level="D${levels[i]}" data-val="${v.toFixed(2)}"/>`;
+      });
+    });
+
+    const endLabels = series.map(s => ({
+      name: s.name,
+      color: colors[s.color],
+      y: yScale(s.data[s.data.length - 1]),
+      val: s.data[s.data.length - 1]
+    }));
+    endLabels.sort((a, b) => a.y - b.y);
+    const minGap = 14;
+    for (let i = 1; i < endLabels.length; i++) {
+      if (endLabels[i].y - endLabels[i-1].y < minGap) {
+        endLabels[i].y = endLabels[i-1].y + minGap;
+      }
+    }
+    endLabels.forEach(el => {
+      svgContent += `<text x="${W - mr + 8}" y="${el.y + 4}" class="tick-label" style="font-size:11px;fill:${SECONDARY}">${el.name}</text>`;
+    });
+
+    svg.innerHTML = svgContent;
+
+    svg.querySelectorAll('.hit-target').forEach(el => {
+      el.addEventListener('mousemove', e => {
+        showTooltip(e, `<strong>${el.dataset.name}</strong><br>${el.dataset.level}: ${el.dataset.val} ms`);
+      });
+      el.addEventListener('mouseleave', hideTooltip);
+    });
+  }
+
+  function buildTable() {
+    const tbody = document.querySelector('#summary-table tbody');
+    const metrics = [
+      { label: 'APkernel', data: apData, unit: 'ms' },
+      { label: 'SplitAllDepth', data: splitData, unit: 'ms' },
+      { label: 'Tree Total', data: treeData, unit: 'ms' }
+    ];
+
+    metrics.forEach(m => {
+      m.data.depths.forEach((depth, di) => {
+        const vals = m.data.values[di];
+        const minVal = Math.min(...vals);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${m.label}</td>
+          <td style="font-family:'IBM Plex Mono',monospace">${depth}</td>
+          ${vals.map(v => `<td class="${v === minVal ? 'winner' : ''}">${v.toFixed(2)}</td>`).join('')}
+        `;
+        tbody.appendChild(tr);
+      });
+    });
+  }
+
+  const apMax = Math.max(...apData.values.flat());
+  const treeMax = Math.max(...treeData.values.flat());
+  drawGroupedBar('chart-ap', apData, apMax);
+  drawGroupedBar('chart-tree', treeData, treeMax);
+  drawDepthLines();
+  buildTable();
+})();
+</script>

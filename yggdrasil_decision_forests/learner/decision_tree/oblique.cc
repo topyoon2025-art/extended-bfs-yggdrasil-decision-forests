@@ -140,11 +140,11 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
               dt_config.sparse_oblique_split().num_projections_exponent()));
 
       // MODIFIED BY JY
-      // return std::max(std::min(target_num_projections, max_num_projections),
-      //                 min_num_projections);
-      return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
-                      max_num_projections),
+      return std::max(std::min(target_num_projections, max_num_projections),
                       min_num_projections);
+      // return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
+      //                 max_num_projections),
+      //                 min_num_projections);
     } break;
     case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit: {
       const int max_num_projections =
@@ -1251,7 +1251,7 @@ void SampleProjection(const absl::Span<const int>& features,
   // To control the number of selected features, we can use the max_num_features parameter.
   // MODIFIED BY JY
   // Gray out the below to use what YDF gives
-  // num_selected_features = 8; 
+  // num_selected_features = 4; 
  
   
   // TODO: Try std::bitmap

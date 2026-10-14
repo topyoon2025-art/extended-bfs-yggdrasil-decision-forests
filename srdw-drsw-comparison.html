@@ -1,0 +1,637 @@
+<title>SRDW vs DRSW Training</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  /* Layout: fixed header, scrollable content, data-dense dashboard */
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --fg: #1a1d23;
+    --fg-dim: #5a6070;
+    --fg-muted: #8b92a0;
+    --border: #dfe2e8;
+    --border-light: #eceef2;
+    --accent-srdw: #3b82f6;
+    --accent-srdw-light: rgba(59,130,246,0.12);
+    --accent-drsw: #f59e0b;
+    --accent-drsw-light: rgba(245,158,11,0.12);
+    --accent-nid: #10b981;
+    --accent-nid-light: rgba(16,185,129,0.12);
+    --bad: #ef4444;
+    --good: #10b981;
+    --neutral: #64748b;
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --fg: #e4e7ed;
+      --fg-dim: #9ca3b4;
+      --fg-muted: #636b7e;
+      --border: #2a2e3a;
+      --border-light: #23262f;
+      --accent-srdw: #60a5fa;
+      --accent-srdw-light: rgba(96,165,250,0.15);
+      --accent-drsw: #fbbf24;
+      --accent-drsw-light: rgba(251,191,36,0.15);
+      --accent-nid: #34d399;
+      --accent-nid-light: rgba(52,211,153,0.15);
+      --bad: #f87171;
+      --good: #34d399;
+      --neutral: #94a3b8;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --fg: #e4e7ed;
+    --fg-dim: #9ca3b4;
+    --fg-muted: #636b7e;
+    --border: #2a2e3a;
+    --border-light: #23262f;
+    --accent-srdw: #60a5fa;
+    --accent-srdw-light: rgba(96,165,250,0.15);
+    --accent-drsw: #fbbf24;
+    --accent-drsw-light: rgba(251,191,36,0.15);
+    --accent-nid: #34d399;
+    --accent-nid-light: rgba(52,211,153,0.15);
+    --bad: #f87171;
+    --good: #34d399;
+    --neutral: #94a3b8;
+    color-scheme: dark;
+  }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding-inline: 20px;
+    padding-block: 0;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+
+  header {
+    padding: calc(env(safe-area-inset-top, 0px) + 24px) 0 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+  header h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 4px;
+  }
+  header .subtitle {
+    color: var(--fg-dim);
+    font-size: 0.85rem;
+  }
+
+  .kpi-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-bottom: 28px;
+  }
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .kpi .label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-muted);
+    margin-bottom: 6px;
+  }
+  .kpi .value {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 500;
+    line-height: 1.2;
+  }
+  .kpi .delta {
+    font-size: 0.78rem;
+    font-weight: 500;
+    margin-top: 4px;
+  }
+  .kpi .delta.good { color: var(--good); }
+  .kpi .delta.bad { color: var(--bad); }
+  .kpi .delta.neutral { color: var(--neutral); }
+
+  .kpi.srdw { border-left: 3px solid var(--accent-srdw); }
+  .kpi.drsw { border-left: 3px solid var(--accent-drsw); }
+  .kpi.nid { border-left: 3px solid var(--accent-nid); }
+
+  .legend-bar {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    font-size: 0.8rem;
+    font-weight: 500;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+  }
+
+  section {
+    margin-bottom: 32px;
+  }
+  section h2 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+    letter-spacing: -0.01em;
+  }
+  section h3 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--fg-dim);
+  }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .chart-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 800px) {
+    .chart-grid { grid-template-columns: 1fr; }
+  }
+  canvas { max-width: 100%; }
+
+  .breakdown-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .breakdown-table th {
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+    padding: 8px 10px;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+  }
+  .breakdown-table td {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border-light);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+  }
+  .breakdown-table tr:last-child td { border-bottom: none; }
+  .breakdown-table .row-label {
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .breakdown-table .total-row td {
+    font-weight: 600;
+    border-top: 2px solid var(--border);
+    border-bottom: none;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--border-light);
+    border-radius: 10px;
+    padding: 4px 12px;
+  }
+  .pct-bar {
+    display: inline-block;
+    height: 6px;
+    border-radius: 3px;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  .note {
+    font-size: 0.75rem;
+    color: var(--fg-muted);
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+
+  .depth-table th.col-srdw { color: var(--accent-srdw); }
+  .depth-table th.col-drsw { color: var(--accent-drsw); }
+  .depth-table th.col-nid { color: var(--accent-nid); }
+  .best-cell { font-weight: 600; }
+
+  footer {
+    padding: 20px 0 calc(env(safe-area-inset-bottom, 0px) + 24px);
+    border-top: 1px solid var(--border);
+    font-size: 0.72rem;
+    color: var(--fg-muted);
+  }
+</style>
+
+<header>
+  <h1>SRDW vs DRSW vs NODE_ID_DRSW</h1>
+  <div class="subtitle">Training time breakdown &middot; HIGGS 11M rows &middot; depth 16 &middot; density 1.5 &middot; 1 tree &middot; 28 features</div>
+</header>
+
+<div class="legend-bar">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-srdw)"></div> SRDW (baseline)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-drsw)"></div> DRSW</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-nid)"></div> NODE_ID_DRSW</div>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi srdw">
+    <div class="label">SRDW Total</div>
+    <div class="value">271.9<span style="font-size:0.9rem">ms</span></div>
+    <div class="delta neutral">baseline</div>
+  </div>
+  <div class="kpi drsw">
+    <div class="label">DRSW Total</div>
+    <div class="value">277.3<span style="font-size:0.9rem">ms</span></div>
+    <div class="delta bad">+2.0% slower</div>
+  </div>
+  <div class="kpi nid">
+    <div class="label">NODE_ID_DRSW Total</div>
+    <div class="value">261.3<span style="font-size:0.9rem">ms</span></div>
+    <div class="delta good">&minus;3.9% faster</div>
+  </div>
+</div>
+
+<section>
+  <h2>Overall Time Breakdown</h2>
+  <div class="chart-card">
+    <canvas id="overallChart" height="200"></canvas>
+    <p class="note">Stacked components of the tree training phase. "Other" includes setup, H2D transfer, prefix sum, flatten, and miscellaneous overhead.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Component Comparison</h2>
+  <div class="chart-card">
+    <canvas id="componentChart" height="280"></canvas>
+  </div>
+</section>
+
+<section>
+  <h2>Per-Depth Wall Time</h2>
+  <div class="chart-grid">
+    <div class="chart-card">
+      <h3>Wall Time per Depth</h3>
+      <canvas id="depthWallChart" height="240"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Partition Time per Depth</h3>
+      <canvas id="depthPartitionChart" height="240"></canvas>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Per-Depth Apply Projection Kernel</h2>
+  <div class="chart-grid">
+    <div class="chart-card">
+      <h3>Apply Proj Kernel per Depth</h3>
+      <canvas id="depthApplyProjChart" height="240"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Node Train per Depth</h3>
+      <canvas id="depthNodeTrainChart" height="240"></canvas>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Detailed Breakdown (ms)</h2>
+  <div class="table-wrap">
+    <table class="breakdown-table" id="breakdownTable"></table>
+  </div>
+</section>
+
+<section>
+  <h2>NodeTrain Breakdown (ms)</h2>
+  <div class="table-wrap">
+    <table class="breakdown-table" id="nodeTrainTable"></table>
+  </div>
+</section>
+
+<section>
+  <h2>Per-Depth Wall Time (ms)</h2>
+  <div class="table-wrap">
+    <table class="breakdown-table depth-table" id="depthTable"></table>
+  </div>
+</section>
+
+<footer>
+  Benchmark: bench_srdw_drsw.sh &middot; bench_results2 &middot; HIGGS dataset 11M rows &middot; 28 features &middot; 1 tree, depth 16, density 1.5
+</footer>
+
+<script>
+const cs = getComputedStyle(document.documentElement);
+const SRDW_C = cs.getPropertyValue('--accent-srdw').trim();
+const DRSW_C = cs.getPropertyValue('--accent-drsw').trim();
+const NID_C = cs.getPropertyValue('--accent-nid').trim();
+const FG_DIM = cs.getPropertyValue('--fg-dim').trim();
+const FG_MUTED = cs.getPropertyValue('--fg-muted').trim();
+const BORDER = cs.getPropertyValue('--border-light').trim();
+
+Chart.defaults.font.family = "'IBM Plex Sans', system-ui, sans-serif";
+Chart.defaults.font.size = 12;
+Chart.defaults.color = FG_DIM;
+
+const data = {
+  srdw: {
+    total: 271.92,
+    tree_total: 236.423,
+    gpu_setup: 2.151,
+    all_depths: 204.466,
+    gpu_cleanup: 26.037,
+    sampling: 0.860,
+    apply_proj: 81.916,
+    eval_proj: 37.383,
+    partition: 47.341,
+    node_train: 32.847,
+    drsw_setup: 0,
+    drsw_proj: 0,
+    oob: 0.17,
+    dedup: 1.34,
+    sampling_total: 34.97
+  },
+  drsw: {
+    total: 277.33,
+    tree_total: 241.947,
+    gpu_setup: 2.134,
+    all_depths: 209.941,
+    gpu_cleanup: 26.038,
+    sampling: 0.865,
+    apply_proj: 87.299,
+    eval_proj: 37.197,
+    partition: 47.400,
+    node_train: 32.976,
+    drsw_setup: 18.168,
+    drsw_proj: 68.934,
+    oob: 0.15,
+    dedup: 1.32,
+    sampling_total: 34.88
+  },
+  nid: {
+    total: 261.27,
+    tree_total: 225.778,
+    gpu_setup: 2.137,
+    all_depths: 197.184,
+    gpu_cleanup: 21.884,
+    sampling: 0.920,
+    apply_proj: 82.742,
+    eval_proj: 38.971,
+    partition: 34.027,
+    node_train: 36.169,
+    compute_offsets: 14.725,
+    proj_only: 67.821,
+    drsw_setup: 0,
+    drsw_proj: 0,
+    oob: 0.18,
+    dedup: 1.35,
+    sampling_total: 34.94
+  }
+};
+
+const nodeTrain = {
+  srdw: { leaf_value_setup: 1.145, find_best_split: 7.397, create_children: 4.555, split_examples: 47.341, set_child_leaves: 10.007, apply_constraint: 0.840, mono_constraints: 0.812, push_to_queue: 5.111, sum: 77.207 },
+  drsw: { leaf_value_setup: 1.180, find_best_split: 7.760, create_children: 4.557, split_examples: 47.400, set_child_leaves: 9.078, apply_constraint: 0.817, mono_constraints: 0.802, push_to_queue: 5.878, sum: 77.473 },
+  nid:  { leaf_value_setup: 1.397, find_best_split: 8.338, create_children: 5.409, split_examples: 34.027, set_child_leaves: 10.145, apply_constraint: 0.798, mono_constraints: 0.829, push_to_queue: 6.159, sum: 67.102 }
+};
+
+const depths = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+const perDepth = {
+  srdw: {
+    wall:      [6.58,7.14,7.22,8.18,8.22,9.24,10.49,10.94,11.88,12.83,14.22,16.26,20.14,25.93,34.69],
+    apply_proj:[1.35,1.62,2.18,2.98,2.97,3.70,4.89,5.54,6.25,6.77,7.55,8.06,8.97,9.34,9.73],
+    eval_proj: [1.94,1.57,1.79,1.69,1.76,1.86,1.83,1.84,1.93,2.08,2.22,2.60,3.22,4.53,6.54],
+    partition: [3.03,3.81,3.10,3.33,3.33,3.53,3.60,3.34,3.26,3.17,2.91,2.73,2.62,2.68,2.89],
+    node_train:[0.01,0.01,0.01,0.01,0.01,0.03,0.05,0.09,0.28,0.65,1.33,2.56,4.86,8.59,14.37]
+  },
+  drsw: {
+    wall:      [7.33,8.00,8.27,9.28,9.50,10.85,11.87,11.88,12.51,13.28,14.17,15.80,19.17,24.58,32.93],
+    apply_proj:[2.18,2.47,3.20,4.11,4.26,5.29,6.27,6.51,6.87,7.23,7.50,7.59,7.89,7.91,8.01],
+    eval_proj: [1.90,1.56,1.78,1.68,1.75,1.86,1.83,1.84,1.94,2.07,2.23,2.60,3.25,4.52,6.38],
+    partition: [3.00,3.81,3.14,3.33,3.34,3.54,3.61,3.32,3.25,3.17,2.91,2.76,2.61,2.72,2.89],
+    node_train:[0.01,0.01,0.01,0.01,0.02,0.03,0.05,0.09,0.29,0.63,1.31,2.55,4.95,8.60,14.42]
+  },
+  nid: {
+    wall:      [7.97,8.00,7.66,8.79,8.31,9.88,10.64,11.67,12.00,11.96,12.67,13.79,17.61,23.39,32.26],
+    apply_proj:[2.17,2.58,3.10,3.85,3.90,4.90,6.20,6.24,7.52,7.01,7.29,6.98,6.98,7.13,6.87],
+    eval_proj: [1.93,2.09,1.93,1.99,1.81,1.95,1.93,1.92,2.03,2.16,2.32,2.65,3.31,4.50,6.45],
+    partition: [3.57,3.18,2.49,2.79,2.46,2.85,2.29,3.17,1.95,1.89,1.44,1.10,1.52,1.40,1.91],
+    node_train:[0.01,0.01,0.01,0.02,0.03,0.07,0.10,0.21,0.38,0.72,1.43,2.78,5.28,9.53,15.59]
+  }
+};
+
+// ---------- Overall stacked bar ----------
+function computeOther(d) {
+  return d.tree_total - d.apply_proj - d.eval_proj - d.partition - d.node_train - d.gpu_cleanup - (d.drsw_setup + d.drsw_proj) - (d.compute_offsets || 0);
+}
+new Chart(document.getElementById('overallChart'), {
+  type: 'bar',
+  data: {
+    labels: ['SRDW', 'DRSW', 'NODE_ID_DRSW'],
+    datasets: [
+      { label: 'Apply Proj Kernel', data: [data.srdw.apply_proj, data.drsw.apply_proj, data.nid.apply_proj], backgroundColor: ['rgba(59,130,246,0.85)','rgba(245,158,11,0.85)','rgba(16,185,129,0.85)'] },
+      { label: 'Eval Proj', data: [data.srdw.eval_proj, data.drsw.eval_proj, data.nid.eval_proj], backgroundColor: ['rgba(59,130,246,0.6)','rgba(245,158,11,0.6)','rgba(16,185,129,0.6)'] },
+      { label: 'Partition', data: [data.srdw.partition, data.drsw.partition, data.nid.partition], backgroundColor: ['rgba(59,130,246,0.4)','rgba(245,158,11,0.4)','rgba(16,185,129,0.4)'] },
+      { label: 'Node Train', data: [data.srdw.node_train, data.drsw.node_train, data.nid.node_train], backgroundColor: ['rgba(59,130,246,0.25)','rgba(245,158,11,0.25)','rgba(16,185,129,0.25)'] },
+      { label: 'DRSW Overhead', data: [0, data.drsw.drsw_setup + data.drsw.drsw_proj, 0], backgroundColor: ['transparent','rgba(245,158,11,0.15)','transparent'] },
+      { label: 'Compute Offsets', data: [0, 0, data.nid.compute_offsets || 0], backgroundColor: ['transparent','transparent','rgba(16,185,129,0.15)'] },
+      { label: 'GPU Cleanup', data: [data.srdw.gpu_cleanup, data.drsw.gpu_cleanup, data.nid.gpu_cleanup], backgroundColor: ['rgba(100,116,139,0.3)','rgba(100,116,139,0.3)','rgba(100,116,139,0.3)'] },
+      { label: 'Other', data: [computeOther(data.srdw), computeOther(data.drsw), computeOther(data.nid)], backgroundColor: ['rgba(100,116,139,0.12)','rgba(100,116,139,0.12)','rgba(100,116,139,0.12)'] },
+    ]
+  },
+  options: {
+    indexAxis: 'y',
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'bottom', labels: { boxWidth: 12, padding: 12, font: { size: 11 } } },
+      tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw.toFixed(1)} ms` } }
+    },
+    scales: {
+      x: { stacked: true, title: { display: true, text: 'ms' }, grid: { color: BORDER } },
+      y: { stacked: true, grid: { display: false } }
+    }
+  }
+});
+
+// ---------- Component grouped bar ----------
+const compLabels = ['Apply Proj\nKernel','Eval Proj','Partition','Node Train','GPU Cleanup','DRSW\nOverhead','Compute\nOffsets','Sampling'];
+const compSRDW = [data.srdw.apply_proj, data.srdw.eval_proj, data.srdw.partition, data.srdw.node_train, data.srdw.gpu_cleanup, 0, 0, data.srdw.sampling_total];
+const compDRSW = [data.drsw.apply_proj, data.drsw.eval_proj, data.drsw.partition, data.drsw.node_train, data.drsw.gpu_cleanup, data.drsw.drsw_setup + data.drsw.drsw_proj, 0, data.drsw.sampling_total];
+const compNID  = [data.nid.apply_proj, data.nid.eval_proj, data.nid.partition, data.nid.node_train, data.nid.gpu_cleanup, 0, data.nid.compute_offsets, data.nid.sampling_total];
+
+new Chart(document.getElementById('componentChart'), {
+  type: 'bar',
+  data: {
+    labels: compLabels,
+    datasets: [
+      { label: 'SRDW', data: compSRDW, backgroundColor: SRDW_C, borderRadius: 3 },
+      { label: 'DRSW', data: compDRSW, backgroundColor: DRSW_C, borderRadius: 3 },
+      { label: 'NODE_ID_DRSW', data: compNID, backgroundColor: NID_C, borderRadius: 3 },
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { position: 'top', labels: { boxWidth: 12, padding: 16 } },
+      tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw.toFixed(2)} ms` } }
+    },
+    scales: {
+      x: { grid: { display: false } },
+      y: { title: { display: true, text: 'ms' }, grid: { color: BORDER } }
+    }
+  }
+});
+
+// ---------- Per-depth line charts ----------
+function lineChart(canvasId, dataKey, yLabel) {
+  new Chart(document.getElementById(canvasId), {
+    type: 'line',
+    data: {
+      labels: depths.map(d => 'D' + d),
+      datasets: [
+        { label: 'SRDW', data: perDepth.srdw[dataKey], borderColor: SRDW_C, backgroundColor: SRDW_C, tension: 0.25, pointRadius: 3, borderWidth: 2 },
+        { label: 'DRSW', data: perDepth.drsw[dataKey], borderColor: DRSW_C, backgroundColor: DRSW_C, tension: 0.25, pointRadius: 3, borderWidth: 2 },
+        { label: 'NODE_ID_DRSW', data: perDepth.nid[dataKey], borderColor: NID_C, backgroundColor: NID_C, tension: 0.25, pointRadius: 3, borderWidth: 2 },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 10, padding: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw.toFixed(2)} ms` } }
+      },
+      scales: {
+        x: { grid: { color: BORDER } },
+        y: { title: { display: true, text: yLabel }, grid: { color: BORDER } }
+      }
+    }
+  });
+}
+lineChart('depthWallChart', 'wall', 'ms');
+lineChart('depthPartitionChart', 'partition', 'ms');
+lineChart('depthApplyProjChart', 'apply_proj', 'ms');
+lineChart('depthNodeTrainChart', 'node_train', 'ms');
+
+// ---------- Breakdown table ----------
+(function() {
+  const rows = [
+    ['Total (end-to-end)', data.srdw.total, data.drsw.total, data.nid.total],
+    ['Tree Total', data.srdw.tree_total, data.drsw.tree_total, data.nid.tree_total],
+    ['&emsp;Apply Proj Kernel', data.srdw.apply_proj, data.drsw.apply_proj, data.nid.apply_proj],
+    ['&emsp;Eval Proj', data.srdw.eval_proj, data.drsw.eval_proj, data.nid.eval_proj],
+    ['&emsp;Partition (SplitAllDepth)', data.srdw.partition, data.drsw.partition, data.nid.partition],
+    ['&emsp;Node Train', data.srdw.node_train, data.drsw.node_train, data.nid.node_train],
+    ['&emsp;GPU Cleanup', data.srdw.gpu_cleanup, data.drsw.gpu_cleanup, data.nid.gpu_cleanup],
+    ['&emsp;GPU Setup', data.srdw.gpu_setup, data.drsw.gpu_setup, data.nid.gpu_setup],
+    ['&emsp;DRSW Setup', data.srdw.drsw_setup, data.drsw.drsw_setup, data.nid.drsw_setup],
+    ['&emsp;DRSW Projection', data.srdw.drsw_proj, data.drsw.drsw_proj, data.nid.drsw_proj],
+    ['&emsp;Compute Offsets', 0, 0, data.nid.compute_offsets || 0],
+    ['&emsp;Proj Only', 0, 0, data.nid.proj_only || 0],
+    ['Sampling Total', data.srdw.sampling_total, data.drsw.sampling_total, data.nid.sampling_total],
+    ['Dedup', data.srdw.dedup, data.drsw.dedup, data.nid.dedup],
+    ['OOB', data.srdw.oob, data.drsw.oob, data.nid.oob],
+  ];
+  const table = document.getElementById('breakdownTable');
+  let html = '<thead><tr><th>Component</th><th>SRDW</th><th>DRSW</th><th>NODE_ID_DRSW</th><th>vs SRDW</th></tr></thead><tbody>';
+  rows.forEach(([label, s, d, n], i) => {
+    const best = Math.min(s, d, n);
+    const cls = i === 0 ? ' class="total-row"' : '';
+    const fmtDelta = (val) => {
+      if (s === 0 && val === 0) return '<span style="color:var(--fg-muted)">&mdash;</span>';
+      if (s === 0) return `<span style="color:var(--bad)">+${val.toFixed(2)}</span>`;
+      const pct = ((val - s) / s * 100).toFixed(1);
+      const sign = pct >= 0 ? '+' : '';
+      const color = pct < -1 ? 'var(--good)' : pct > 1 ? 'var(--bad)' : 'var(--fg-muted)';
+      return `<span style="color:${color}">${sign}${pct}%</span>`;
+    };
+    const bold = (v, ref) => v === best && best < ref * 0.98 ? ' class="best-cell"' : '';
+    html += `<tr${cls}><td class="row-label">${label}</td>`;
+    html += `<td${bold(s,d)}>${s.toFixed(2)}</td>`;
+    html += `<td${bold(d,s)}>${d.toFixed(2)}</td>`;
+    html += `<td${bold(n,s)}>${n.toFixed(2)}</td>`;
+    html += `<td>${fmtDelta(n)}</td></tr>`;
+  });
+  html += '</tbody>';
+  table.innerHTML = html;
+})();
+
+// ---------- NodeTrain table ----------
+(function() {
+  const keys = ['leaf_value_setup','find_best_split','create_children','split_examples','set_child_leaves','apply_constraint','mono_constraints','push_to_queue','sum'];
+  const labels = ['Leaf Value Setup','Find Best Split','Create Children','Split Examples','Set Child Leaves','Apply Constraint','Mono Constraints','Push to Queue','Total'];
+  const table = document.getElementById('nodeTrainTable');
+  let html = '<thead><tr><th>Component</th><th>SRDW</th><th>DRSW</th><th>NODE_ID_DRSW</th><th>vs SRDW</th></tr></thead><tbody>';
+  keys.forEach((k, i) => {
+    const s = nodeTrain.srdw[k], d = nodeTrain.drsw[k], n = nodeTrain.nid[k];
+    const best = Math.min(s, d, n);
+    const cls = k === 'sum' ? ' class="total-row"' : '';
+    const pct = s > 0 ? ((n - s) / s * 100).toFixed(1) : '0.0';
+    const sign = pct >= 0 ? '+' : '';
+    const color = pct < -1 ? 'var(--good)' : pct > 1 ? 'var(--bad)' : 'var(--fg-muted)';
+    const bold = (v) => v === best && best < Math.max(s,d,n) * 0.98 ? ' class="best-cell"' : '';
+    html += `<tr${cls}><td class="row-label">${labels[i]}</td>`;
+    html += `<td${bold(s)}>${s.toFixed(3)}</td>`;
+    html += `<td${bold(d)}>${d.toFixed(3)}</td>`;
+    html += `<td${bold(n)}>${n.toFixed(3)}</td>`;
+    html += `<td><span style="color:${color}">${sign}${pct}%</span></td></tr>`;
+  });
+  html += '</tbody>';
+  table.innerHTML = html;
+})();
+
+// ---------- Per-depth table ----------
+(function() {
+  const table = document.getElementById('depthTable');
+  let html = '<thead><tr><th>Depth</th><th class="col-srdw">SRDW</th><th class="col-drsw">DRSW</th><th class="col-nid">NID_DRSW</th><th>Best</th><th>NID vs SRDW</th></tr></thead><tbody>';
+  depths.forEach((d, i) => {
+    const s = perDepth.srdw.wall[i], dr = perDepth.drsw.wall[i], n = perDepth.nid.wall[i];
+    const best = Math.min(s, dr, n);
+    const winner = best === n ? 'NID' : best === s ? 'SRDW' : 'DRSW';
+    const pct = ((n - s) / s * 100).toFixed(1);
+    const sign = pct >= 0 ? '+' : '';
+    const color = pct < -1 ? 'var(--good)' : pct > 1 ? 'var(--bad)' : 'var(--fg-muted)';
+    const bold = (v) => v === best ? ' style="font-weight:600"' : '';
+    html += `<tr><td class="row-label">D${d}</td>`;
+    html += `<td${bold(s)}>${s.toFixed(2)}</td>`;
+    html += `<td${bold(dr)}>${dr.toFixed(2)}</td>`;
+    html += `<td${bold(n)}>${n.toFixed(2)}</td>`;
+    html += `<td>${winner}</td>`;
+    html += `<td><span style="color:${color}">${sign}${pct}%</span></td></tr>`;
+  });
+  const sTotal = perDepth.srdw.wall.reduce((a,b)=>a+b,0);
+  const dTotal = perDepth.drsw.wall.reduce((a,b)=>a+b,0);
+  const nTotal = perDepth.nid.wall.reduce((a,b)=>a+b,0);
+  const tPct = ((nTotal - sTotal) / sTotal * 100).toFixed(1);
+  html += `<tr class="total-row"><td class="row-label">Sum</td><td>${sTotal.toFixed(2)}</td><td>${dTotal.toFixed(2)}</td><td>${nTotal.toFixed(2)}</td><td>${Math.min(sTotal,dTotal,nTotal)===nTotal?'NID':'SRDW'}</td><td><span style="color:var(--good)">${tPct}%</span></td></tr>`;
+  html += '</tbody>';
+  table.innerHTML = html;
+})();
+</script>

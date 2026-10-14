@@ -1,0 +1,628 @@
+<title>AtomicAdd Audit</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  /* Layout: single-column technical report, max 960px, tabular data sections */
+  :root {
+    --bg: #f8f7f5;
+    --surface: #ffffff;
+    --fg: #1a1a1a;
+    --fg-muted: #5c5955;
+    --accent: #c44b25;
+    --accent-light: #fdf0ec;
+    --border: #e2ddd7;
+    --code-bg: #f0eeeb;
+    --green: #2a7d4f;
+    --green-light: #edf7f1;
+    --yellow: #9a7b1a;
+    --yellow-light: #fdf8e8;
+    --red: #b83a2a;
+    --red-light: #fdf0ee;
+    --font-display: 'JetBrains Mono', monospace;
+    --font-body: 'Inter', system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141312;
+      --surface: #1e1d1b;
+      --fg: #e4e0da;
+      --fg-muted: #9a958d;
+      --accent: #e8704e;
+      --accent-light: #2a1c15;
+      --border: #302d28;
+      --code-bg: #252320;
+      --green: #4fba7a;
+      --green-light: #162218;
+      --yellow: #d4ab2a;
+      --yellow-light: #252012;
+      --red: #e0584a;
+      --red-light: #2a1614;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141312;
+    --surface: #1e1d1b;
+    --fg: #e4e0da;
+    --fg-muted: #9a958d;
+    --accent: #e8704e;
+    --accent-light: #2a1c15;
+    --border: #302d28;
+    --code-bg: #252320;
+    --green: #4fba7a;
+    --green-light: #162218;
+    --yellow: #d4ab2a;
+    --yellow-light: #252012;
+    --red: #e0584a;
+    --red-light: #2a1614;
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    line-height: 1.6;
+    max-width: 960px;
+    margin: 0 auto;
+    padding-block: 2rem;
+  }
+
+  h1 {
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 0.25rem;
+    text-wrap: balance;
+  }
+  .subtitle {
+    color: var(--fg-muted);
+    font-size: 0.9rem;
+    margin-bottom: 2rem;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 1.25rem;
+  }
+
+  h2 {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 2.5rem 0 0.75rem;
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  h2 .num {
+    background: var(--accent);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 700;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  h3 {
+    font-family: var(--font-display);
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 1.5rem 0 0.5rem;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  p { margin: 0.5rem 0; }
+
+  code {
+    font-family: var(--font-display);
+    font-size: 0.82rem;
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 3px;
+  }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    margin: 0.75rem 0;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    margin: 1rem 0;
+  }
+  .card.avoidable { border-left: 3px solid var(--green); }
+  .card.necessary { border-left: 3px solid var(--fg-muted); }
+  .card.hot { border-left: 3px solid var(--accent); }
+
+  .tag {
+    display: inline-block;
+    font-family: var(--font-display);
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.2em 0.55em;
+    border-radius: 3px;
+    vertical-align: middle;
+  }
+  .tag-green { background: var(--green-light); color: var(--green); }
+  .tag-yellow { background: var(--yellow-light); color: var(--yellow); }
+  .tag-red { background: var(--red-light); color: var(--red); }
+  .tag-muted { background: var(--code-bg); color: var(--fg-muted); }
+
+  .loc {
+    font-family: var(--font-display);
+    font-size: 0.75rem;
+    color: var(--fg-muted);
+  }
+
+  .field-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-top: 0.75rem;
+    margin-bottom: 0.15rem;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    margin: 0.75rem 0;
+    font-variant-numeric: tabular-nums;
+  }
+  th {
+    font-family: var(--font-display);
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-muted);
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+  }
+  td {
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+  }
+  td:first-child { font-family: var(--font-display); font-size: 0.8rem; }
+  tr:last-child td { border-bottom: none; }
+  .r { text-align: right; }
+
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.75rem;
+    margin: 1rem 0;
+  }
+  .summary-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+  }
+  .summary-box .label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+  }
+  .summary-box .value {
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    font-weight: 700;
+    margin-top: 0.15rem;
+  }
+  .summary-box .detail {
+    font-size: 0.78rem;
+    color: var(--fg-muted);
+    margin-top: 0.15rem;
+  }
+
+  .toc {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    font-family: var(--font-display);
+    font-size: 0.78rem;
+  }
+  .toc li::before {
+    content: attr(data-n) ".";
+    color: var(--accent);
+    font-weight: 700;
+    margin-right: 0.25rem;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2rem 0;
+  }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 1.25rem; }
+    .summary-grid { grid-template-columns: 1fr 1fr; }
+    table { font-size: 0.78rem; }
+    td, th { padding: 0.4rem 0.5rem; }
+  }
+</style>
+
+<h1>AtomicAdd Audit: GPU Kernel Atomics</h1>
+<p class="subtitle">Every atomic operation in the BFS oblique-split pipeline — why it exists, what it costs, and whether it can be eliminated.</p>
+
+<div class="summary-grid">
+  <div class="summary-box">
+    <div class="label">Total atomic sites</div>
+    <div class="value">10</div>
+    <div class="detail">across 2 files, 7 kernels</div>
+  </div>
+  <div class="summary-box">
+    <div class="label">Avoidable</div>
+    <div class="value" style="color: var(--green)">3</div>
+    <div class="detail">warp-coalesce or restructure</div>
+  </div>
+  <div class="summary-box">
+    <div class="label">Hot path share</div>
+    <div class="value" style="color: var(--accent)">~4 ms</div>
+    <div class="detail">histogram is the dominant user</div>
+  </div>
+  <div class="summary-box">
+    <div class="label">Negligible</div>
+    <div class="value">5</div>
+    <div class="detail">class counts, bootstrap, init</div>
+  </div>
+</div>
+
+<ul class="toc">
+  <li data-n="1">Histogram bins (hot)</li>
+  <li data-n="2">Histogram merge (hot)</li>
+  <li data-n="3">Partition counters</li>
+  <li data-n="4">Class counts</li>
+  <li data-n="5">ComputeOffsets</li>
+  <li data-n="6">SplitUpdate counters</li>
+  <li data-n="7">SplitUpdate class counts</li>
+  <li data-n="8">FinalMinMax</li>
+  <li data-n="9">Bootstrap dedup</li>
+  <li data-n="10">CountRows</li>
+</ul>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<h2><span class="num">1</span> Histogram bin accumulation</h2>
+<div class="card hot">
+  <p class="loc">oblique_apply_projection.cu : 1434 &nbsp; <span class="tag tag-red">hot path</span></p>
+  <pre>atomicAdd(&sh_hist[lbl * num_bins + bin], d_ex_dup_counts[example_idx]);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>Each thread in <code>BuildHistogramRandomKernel_2D</code> maps its row's projected value to a bin via <code>cub::LowerBound</code>, then increments the shared-memory histogram for that bin. With 256 threads and 32 bins, ~8 threads contend per bin on average.</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Multiple threads within the same block can land in the same bin. Without an atomic, concurrent writes to the same shared-memory location produce a race and lost updates. This is the most-executed atomic in the pipeline — called once per active row per projection, per depth.</p>
+
+  <p class="field-label">Measured cost</p>
+  <table>
+    <tr><th>Depth</th><th class="r">Rows</th><th class="r">Nodes</th><th class="r">hist (ms)</th><th class="r">Contention</th></tr>
+    <tr><td>D1</td><td class="r">662,834</td><td class="r">1</td><td class="r">0.696</td><td class="r">8 thr/bin</td></tr>
+    <tr><td>D2</td><td class="r">662,834</td><td class="r">2</td><td class="r">0.734</td><td class="r">8 thr/bin</td></tr>
+    <tr><td>D3</td><td class="r">662,834</td><td class="r">4</td><td class="r">0.785</td><td class="r">8 thr/bin</td></tr>
+    <tr><td>D4</td><td class="r">662,834</td><td class="r">8</td><td class="r">0.853</td><td class="r">8 thr/bin</td></tr>
+    <tr><td>D5</td><td class="r">662,834</td><td class="r">16</td><td class="r">0.947</td><td class="r">8 thr/bin</td></tr>
+    <tr><td><strong>Total</strong></td><td></td><td></td><td class="r"><strong>4.015</strong></td><td></td></tr>
+  </table>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-yellow">partially</span></p>
+  <p><strong>Warp-privatized histograms.</strong> Each of the 8 warps in a block maintains its own 32-bin histogram in shared memory (8 warps × 2 classes × 32 bins = 512 ints = 2 KB). Within a warp, threads that hit the same bin use <code>__reduce_add_sync</code> (SM 80+) to sum before a single write — eliminating intra-warp contention entirely. After all warps finish, a single pass merges the 8 per-warp histograms into the final shared histogram with no atomics needed (each thread owns one slot).</p>
+  <p>Expected improvement: reduces contention from 8-way to zero within each warp, and the merge is a simple sum. On SM 89 (Ada), shared-memory atomics already have ~5-cycle latency, so the gain is moderate — estimated 10–20% on the histogram kernel.</p>
+  <p><strong>Ballot-based histogram.</strong> For each of the 32 bins, every warp executes <code>__ballot_sync(mask, my_bin == b)</code> + <code>__popc</code>. Eliminates atomics entirely but requires 32 ballot rounds per warp — trades atomic latency for instruction count. Only wins if bins are few (≤ 32) and contention is high.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">2</span> Histogram merge to global</h2>
+<div class="card hot">
+  <p class="loc">oblique_apply_projection.cu : 1447–1448 &nbsp; <span class="tag tag-red">hot path</span></p>
+  <pre>if (c0) atomicAdd(&d_hist_class0[off], c0);
+if (c1) atomicAdd(&d_hist_class1[off], c1);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>After all threads in a block accumulate into the shared-memory histogram, threads 0–31 merge the block's partial histogram into the global histogram arrays. Multiple blocks may contribute to the same (node, projection) segment.</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>At depth 1 with 1 node, all ~2,589 blocks write to the same segment. Each block's thread 0–31 needs to add its partial bin count to the global total. Without an atomic, concurrent blocks overwrite each other.</p>
+
+  <p class="field-label">Contention</p>
+  <table>
+    <tr><th>Depth</th><th class="r">Blocks/segment</th><th class="r">Contention per bin</th></tr>
+    <tr><td>D1 (1 node)</td><td class="r">2,589</td><td class="r">2,589 blocks</td></tr>
+    <tr><td>D3 (4 nodes)</td><td class="r">~647</td><td class="r">~647 blocks</td></tr>
+    <tr><td>D5 (16 nodes)</td><td class="r">~162</td><td class="r">~162 blocks</td></tr>
+  </table>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-yellow">partially</span></p>
+  <p><strong>Two-pass merge.</strong> Instead of every block atomicAdd-ing to global, each block writes its per-block partial histogram to a staging buffer (no atomics — each block owns its slot). A second kernel reduces all partial histograms per segment with a tree reduction. Eliminates global atomics entirely but adds a second kernel launch + staging memory (<code>total_node_blocks × 2 × num_bins × sizeof(int)</code>).</p>
+  <p>At early depths (D1), this would replace 2,589-way contention on 32 bins with a clean tree reduction. At later depths with more nodes, contention drops to ~162 blocks/segment and the atomic is already fast. The <code>if (c0)</code>/<code>if (c1)</code> guards already skip zero-count bins, reducing contention on sparse histograms.</p>
+  <p><strong>Verdict:</strong> The two-pass approach adds complexity (staging buffer allocation, second kernel) for a small gain. Global L2 atomics on SM 89 handle this well. <strong>Not worth optimizing</strong> unless profiling shows L2 atomic throughput as a bottleneck.</p>
+</div>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<h2><span class="num">3</span> Partition position counters</h2>
+<div class="card necessary">
+  <p class="loc">oblique_apply_projection.cu : 290, 293 &nbsp; <span class="tag tag-muted">partition</span></p>
+  <pre>int pos_idx = atomicAdd(&d_atomic_counters[node_id], 1);      // right-child slot
+int neg_idx = atomicAdd(&d_atomic_counters[num_nodes + node_id], 1); // left-child slot</pre>
+
+  <p class="field-label">What it does</p>
+  <p>In <code>SplitExamplesInPlaceKernel</code>, each thread decides whether its row goes left or right based on the split threshold, then atomically claims a write position in the child's segment of <code>d_selected_examples</code>.</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Classic scatter pattern: all threads in a node race to write to the same two counters. The atomic ensures each row gets a unique position. With ~662K rows and 1 node at D1, all threads contend on a single pair of counters.</p>
+
+  <p class="field-label">Measured cost</p>
+  <p>Part of partition total: ~0.69 ms/depth (baseline). The DRSW path avoids this kernel entirely.</p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-green">yes</span></p>
+  <p><strong>Already avoided in the StablePartition path.</strong> <code>StablePartitionCountKernel</code> + <code>StablePartitionScatterKernel</code> (lines 306–427) use a two-pass approach: first a per-block prefix scan to count left/right per block, then a global prefix sum, then a deterministic scatter — no atomics for position assignment. The class-count atomic (site #4) remains in both paths.</p>
+  <p>The unstable partition (<code>SplitExamplesInPlaceKernel</code>) is the current default because the output order doesn't matter for the histogram. Switching to stable partition eliminates these 2 atomics but adds a second kernel launch and prefix-sum pass. Measured difference is negligible since the two-counter atomic is low-contention (only <code>num_nodes</code> distinct counters, spread across L2 cache lines).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">4</span> Partition class counts</h2>
+<div class="card necessary">
+  <p class="loc">oblique_apply_projection.cu : 299, 422 &nbsp; <span class="tag tag-muted">partition</span></p>
+  <pre>atomicAdd(&d_class_counts[node_id * 2 * num_classes + side * num_classes + cls],
+          d_ex_dup_counts[example_idx]);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>During partitioning (both unstable and stable paths), each thread adds its row's class weight to the appropriate child's class-count bucket. Used to compute leaf-node predictions and to decide whether child nodes are pure (can stop splitting).</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Many rows share the same (node, side, class) bucket. With binary classification (<code>num_classes = 2</code>), there are only <code>num_nodes × 2 × 2 = 4 × num_nodes</code> distinct counters — high contention at early depths.</p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-yellow">partially</span></p>
+  <p><strong>Warp-coalesced atomics.</strong> Use <code>__match_any_sync</code> to group threads with the same (node, side, class) triple, sum within the group via shuffle, and have only the leader atomicAdd. Reduces atomic calls by ~16× (average warp group size). With binary classification, most threads in a warp share the same node and roughly half go to each side, so group sizes are large.</p>
+  <p><strong>Shared-memory pre-accumulation.</strong> Since all threads in a block share the same node (in the 2D kernel), accumulate class counts in shared memory first, then one thread writes to global. Straightforward, adds 4 shared-memory ints per block.</p>
+  <p><strong>Measured cost:</strong> Negligible — only <code>num_nodes × 4</code> counters, each counter hit by ~82K threads at D1 but L2 atomic coalescing handles this efficiently. The total partition time includes projection reads and scatter writes that dominate. <strong>Not a bottleneck.</strong></p>
+</div>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<h2><span class="num">5</span> ComputeOffsets position counters</h2>
+<div class="card avoidable">
+  <p class="loc">node_id_drsw.cuh : 105 &nbsp; <span class="tag tag-muted">drsw_depth</span></p>
+  <pre>base_offset = atomicAdd(&d_atomic_counters[nid], group_size);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>In <code>NodeIdDRSW_ComputeOffsetsKernel</code>, each warp finds all threads sharing the same node via <code>__match_any_sync</code>, sums the group, and the leader atomically claims positions for the entire group. This assigns each row a unique <code>node_offset</code> (its position within the node's segment).</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Multiple warps across different blocks contain rows belonging to the same node. Each warp-group needs a unique range of positions. The atomic counter per node is the synchronization point.</p>
+
+  <p class="field-label">Already optimized</p>
+  <p>The warp-coalesced pattern (<code>__match_any_sync</code> + leader-only atomic) is the textbook optimization for this pattern. Instead of 1 atomicAdd per thread (~662K atomics), it does 1 per warp-group (~20K–40K atomics depending on node distribution). At depth 1 with 1 node, all 8 threads in a warp share the same node → 1 atomic per 32 active threads.</p>
+
+  <p class="field-label">Measured cost</p>
+  <p>Total <code>drsw_depth</code> = 0.34 ms across 5 depths (0.07 ms/depth). This includes the memset of counters + kernel launch + sync.</p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-green">yes, but not worth it</span></p>
+  <p><strong>Segmented sort + prefix sum.</strong> Sort rows by <code>d_node_ids</code> (via <code>cub::DeviceRadixSort</code>), then compute offsets as a simple sequence within each segment. No atomics, fully deterministic. But a radix sort of 1M ints takes ~0.5–1 ms, far more than the current 0.07 ms. <strong>Worse.</strong></p>
+  <p><strong>Verdict:</strong> Current warp-coalesced implementation is already near-optimal. The 0.07 ms/depth cost is negligible. <strong>Leave as is.</strong></p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">6</span> SplitUpdate child counters</h2>
+<div class="card avoidable">
+  <p class="loc">node_id_drsw.cuh : 261 &nbsp; <span class="tag tag-muted">partition</span></p>
+  <pre>atomicAdd(&d_child_counters[child_id], 1);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>In <code>NodeIdDRSW_SplitUpdateKernel</code>, each thread decides its row's child node based on the split threshold, writes the new <code>node_ids[row] = child_id</code>, and increments the child's row counter.</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Many threads map to the same child node. The counter tracks how many rows each child has, which is needed to build <code>node_row_offsets</code> for the next depth.</p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-green">yes</span></p>
+  <p><strong>Warp-coalesced atomics.</strong> Same <code>__match_any_sync</code> pattern as ComputeOffsets — group threads by <code>child_id</code>, count via <code>__popc</code>, leader-only atomicAdd. Reduces atomic calls by ~16×. With 2 children per split node and 8 nodes at D4, there are only 16 distinct child_ids, so warp groups are large.</p>
+  <p><strong>Segmented reduction.</strong> Alternatively, skip the per-row atomic entirely: after writing <code>node_ids[row]</code>, run a separate <code>NodeIdDRSW_CountRows</code> kernel (already exists at line 428) that counts rows per node. This separates the scatter (write node_ids) from the reduction (count per child), at the cost of a second pass over <code>d_node_ids</code>.</p>
+  <p><strong>Measured cost:</strong> Part of partition = 0.37 ms (DRSW). The atomic contention is moderate — only <code>2 × num_nodes</code> distinct counters. With L2 atomics on SM 89, this is fast. <strong>Warp-coalescing would save ~0.02–0.05 ms/depth.</strong></p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">7</span> SplitUpdate class counts</h2>
+<div class="card necessary">
+  <p class="loc">node_id_drsw.cuh : 269 &nbsp; <span class="tag tag-muted">partition</span></p>
+  <pre>atomicAdd(&d_child_class_counts[child_id * num_classes + cls], weight);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>Same kernel as #6. Each thread contributes its row's class weight to the child node's class-count array. Binary classification: 2 classes × num_children counters.</p>
+
+  <p class="field-label">Same analysis as partition class counts (#4)</p>
+  <p>Could be warp-coalesced by grouping on <code>(child_id, cls)</code>. Negligible cost — only <code>2 × num_children × 2</code> counters. <strong>Not a bottleneck.</strong></p>
+</div>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<h2><span class="num">8</span> FinalMinMax reduction</h2>
+<div class="card necessary">
+  <p class="loc">oblique_apply_projection.cu : 1118–1119, 1183–1184 &nbsp; <span class="tag tag-muted">finMM</span></p>
+  <pre>atomicMinFloat(&outMin[seg], block_mm.minv);
+atomicMaxFloat(&outMax[seg], block_mm.maxv);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>After <code>BlockMinMax</code> produces per-block min/max values, <code>finalMinMaxReduceAtomic</code> merges them into per-segment (node × projection) min/max. Uses CAS-based float atomics since CUDA has no native <code>atomicMin</code> for floats (before SM 90).</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Multiple meta-blocks contribute to the same segment's min/max. The CAS loop retries until the value is updated.</p>
+
+  <p class="field-label">Contention</p>
+  <p>At D1 with 1 node: ~2,589 data blocks → <code>ceil(2589/256) = 11</code> meta-blocks per segment. Only 11 blocks contend per segment — very low. The CAS loop almost never retries.</p>
+
+  <p class="field-label">Measured cost</p>
+  <p><code>finMM</code> = 0.01–0.03 ms/depth. <strong>Negligible.</strong></p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-green">yes, but pointless</span></p>
+  <p><strong>Tree reduction.</strong> Replace the atomic merge with a multi-level <code>cub::BlockReduce</code> tree. Since meta-block count is already ≤ 11 per segment, a single block could load all partial results and reduce without atomics. But the current 0.01 ms cost makes this a zero-impact optimization.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">9</span> Bootstrap dedup counts</h2>
+<div class="card necessary">
+  <p class="loc">oblique_apply_projection.cu : 218 &nbsp; <span class="tag tag-muted">one-time</span></p>
+  <pre>atomicAdd(&d_ex_dup_counts[d_bootstrap[tid]], 1);</pre>
+
+  <p class="field-label">What it does</p>
+  <p>In <code>ComputeBootstrapDupCountsKernel</code>, each bootstrap sample increments the count for its original row index. Builds the <code>d_ex_dup_counts[row]</code> array used by <code>DEDUP_BOOTSTRAP</code>.</p>
+
+  <p class="field-label">Why atomic is used</p>
+  <p>Bootstrap sampling draws with replacement — multiple samples can reference the same row. The counter must handle collisions.</p>
+
+  <p class="field-label">Measured cost</p>
+  <p>Part of <code>dedup</code> = 0.49 ms, run once per tree (not per depth). With 662K samples and ~1M rows, contention is very low — most rows are sampled 0–2 times.</p>
+
+  <p class="field-label">Can it be avoided? <span class="tag tag-muted">no need</span></p>
+  <p>The bootstrap indices are already sorted. Could use <code>cub::DeviceRunLengthEncode</code> for a non-atomic alternative, but the 0.49 ms one-time cost (which includes sort + unique + memcpy, not just this kernel) is not worth optimizing.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="num">10</span> CountRows histogram</h2>
+<div class="card necessary">
+  <p class="loc">node_id_drsw.cuh : 437 &nbsp; <span class="tag tag-muted">init only</span></p>
+  <pre>if (nid >= 0 && nid < num_nodes) atomicAdd(&counts[nid], 1);</pre>
+
+  <p class="field-label">What it does</p>
+  <p><code>NodeIdDRSW_CountRowsKernel</code> counts how many rows belong to each node, scanning all <code>d_node_ids</code>. Used only during initialization or verification, not on the hot path.</p>
+
+  <p class="field-label">Can it be avoided?</p>
+  <p>Could use <code>cub::DeviceHistogram</code> or warp-coalesced atomics, but this kernel runs at most once per tree. <strong>Not worth touching.</strong></p>
+</div>
+
+<hr class="divider">
+
+<!-- ============================================================ -->
+<h2 style="margin-top: 2rem;">Priority ranking</h2>
+
+<p>Ranked by wall-time impact. Measured on 1,048,576 × 1,024 synthetic dataset, tree depth 6, 1 tree, SM 89 (RTX 4090).</p>
+
+<div style="overflow-x: auto;">
+<table>
+  <tr>
+    <th>#</th>
+    <th>Site</th>
+    <th class="r">Time/depth</th>
+    <th class="r">Total (5 depths)</th>
+    <th>Avoidable?</th>
+    <th>Estimated saving</th>
+  </tr>
+  <tr>
+    <td>1</td>
+    <td>Histogram bin accumulation</td>
+    <td class="r">0.70–0.95 ms</td>
+    <td class="r">4.02 ms</td>
+    <td><span class="tag tag-yellow">partial</span></td>
+    <td>0.4–0.8 ms (warp-private hist)</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>Histogram global merge</td>
+    <td class="r">incl. above</td>
+    <td class="r">incl. above</td>
+    <td><span class="tag tag-yellow">partial</span></td>
+    <td>minimal (L2 atomics fast)</td>
+  </tr>
+  <tr>
+    <td>6</td>
+    <td>SplitUpdate child counters</td>
+    <td class="r">incl. in 0.37 ms</td>
+    <td class="r">1.94 ms*</td>
+    <td><span class="tag tag-green">yes</span></td>
+    <td>0.1–0.25 ms (warp-coalesce)</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td>Partition position counters</td>
+    <td class="r">incl. in 0.69 ms</td>
+    <td class="r">3.46 ms*</td>
+    <td><span class="tag tag-green">yes</span></td>
+    <td>0 (stable partition exists)</td>
+  </tr>
+  <tr>
+    <td>5</td>
+    <td>ComputeOffsets counters</td>
+    <td class="r">0.07 ms</td>
+    <td class="r">0.34 ms</td>
+    <td><span class="tag tag-green">yes</span></td>
+    <td>~0 (already warp-coalesced)</td>
+  </tr>
+  <tr>
+    <td>4,7</td>
+    <td>Class counts (both paths)</td>
+    <td class="r">< 0.01 ms</td>
+    <td class="r">negligible</td>
+    <td><span class="tag tag-yellow">partial</span></td>
+    <td>~0</td>
+  </tr>
+  <tr>
+    <td>8</td>
+    <td>FinalMinMax</td>
+    <td class="r">0.01 ms</td>
+    <td class="r">0.05 ms</td>
+    <td><span class="tag tag-green">yes</span></td>
+    <td>~0</td>
+  </tr>
+  <tr>
+    <td>9</td>
+    <td>Bootstrap dedup</td>
+    <td class="r">one-time</td>
+    <td class="r">0.49 ms</td>
+    <td><span class="tag tag-muted">no</span></td>
+    <td>~0</td>
+  </tr>
+  <tr>
+    <td>10</td>
+    <td>CountRows</td>
+    <td class="r">init only</td>
+    <td class="r">negligible</td>
+    <td><span class="tag tag-muted">no</span></td>
+    <td>~0</td>
+  </tr>
+</table>
+</div>
+<p style="font-size: 0.78rem; color: var(--fg-muted);">* Total includes non-atomic work (projection reads, scatter writes, label lookups). The atomic itself is a fraction of this total.</p>
+
+<hr class="divider">
+
+<h2 style="margin-top: 2rem;">Recommendation</h2>
+
+<div class="card" style="border-left: 3px solid var(--accent);">
+<p><strong>The only atomic worth optimizing is #1 — histogram bin accumulation.</strong></p>
+<p>It accounts for ~4 ms out of the ~28 ms depth-loop, and it's the only site where contention is both high (8 threads/bin avg) and on the hot path (every row × every projection × every depth). All other atomics are either already warp-coalesced (#5), low-contention (#3, #4, #6, #7, #8), or one-time costs (#9, #10).</p>
+<p style="margin-top: 0.75rem;">The highest-ROI improvement is <strong>warp-privatized histograms</strong>: give each of the 8 warps its own 32-bin shared-memory histogram. Threads within a warp accumulate via <code>__reduce_add_sync</code> (single-cycle on SM 80+). After the warp loop, a merge pass sums the 8 partial histograms — 256 threads merging 512 values, zero contention. Shared-memory cost: 8 × 2 × 32 × 4 = 2,048 bytes on top of the existing 256 bytes for splits. Well within the 48 KB shared-memory budget.</p>
+</div>

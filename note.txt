@@ -1,0 +1,82 @@
+Quick recap of the two composite buckets (both are in per_tree_timing.csv with their sub-parts):
+
+example_mgmt — maintaining the example↔node structure
+
+The cost of figuring out which node each example belongs to and reshaping the layout for the next depth. Sum of three sub-parts (which one is nonzero depends on the variant):
+
+┌─────────────────┬─────────────────────────────────────┬───────────────┐
+│    sub-part     │             what it is              │  nonzero in   │
+├─────────────────┼─────────────────────────────────────┼───────────────┤
+│                 │ NID ComputeOffsets (derive          │               │
+│ compute_offsets │ node_offsets, optionally rebuild    │ NODE_ID_DRSW  │
+│                 │ d_selected_examples)                │               │
+├─────────────────┼─────────────────────────────────────┼───────────────┤
+│                 │ DRSW-original ComputeDRSWArrays     │               │
+│ drsw_setup      │ (derive node_ids/offsets via        │ --config=drsw │
+│                 │ UpperBound)                         │               │
+├─────────────────┼─────────────────────────────────────┼───────────────┤
+│                 │ the example→child reassignment:     │               │
+│ partition       │ SplitUpdate (NID) or                │ all           │
+│                 │ SplitExamplesAllDepth (SRDW/DRSW)   │               │
+└─────────────────┴─────────────────────────────────────┴───────────────┘
+
+- SRDW → partition only
+- DRSW-original → drsw_setup + partition
+- NID → compute_offsets + partition
+
+overhead — per-tree fixed costs not tied to any depth
+
+Everything in tree_total that isn't one of the five depth-stage buckets. It's a residual, decomposed as:
+
+┌────────────────┬──────────────────────────────────────────────────────┐
+│    sub-part    │                      what it is                      │
+├────────────────┼──────────────────────────────────────────────────────┤
+│ setup          │ one-time GPU buffer allocation before the depth loop │
+│                │  (cudaMallocs)                                       │
+├────────────────┼──────────────────────────────────────────────────────┤
+│ gpu_cleanup    │ end-of-tree cudaFree of those buffers (usually the   │
+│                │ biggest, ~26ms)                                      │
+├────────────────┼──────────────────────────────────────────────────────┤
+│ partition_free │ frees inside the split step                          │
+├────────────────┼──────────────────────────────────────────────────────┤
+│ gap            │ unattributed residual (per-depth wall − summed       │
+│                │ sections + tiny sampling sub-stages)                 │
+└────────────────┴──────────────────────────────────────────────────────┘
+
+Both are per-tree fixed in spirit — setup/gpu_cleanup don't scale with depth and amortize with --num_trees>1 (or vanish if buffers were pooled).
+
+The full bucket set, for reference: sampling + projection + split_finding + example_mgmt + node_train + overhead = tree_total.
+
+
+default: no_d2h, dedup_bootstrap, gpu_sample_proj
+Two pass on is default
+--config=no_two_pass to disable
+
+
+Two pass on is default
+--config=no_two_pass to disable
+
+Variant 1:
+  bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw --config=offsets_only --define=split_smem=false
+  
+ Variant 2:
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw --config=nid_srdw_hist \
+  --define=split_smem=false
+ 
+ Variant 3:
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw --config=nid_srdw_hist 
+
+
+SRDW
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth
+  
+DRSW
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth --config=drsw

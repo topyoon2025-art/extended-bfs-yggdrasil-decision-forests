@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Histogram Variants Reference</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm; }
+  :root {
+    --ink:#1a1a1a; --muted:#555; --line:#d8d8d8; --head:#2b3a4a;
+    --best:#e6f4ea; --best-bd:#1e7d43; --mid:#fff7e6; --worst:#fdecec;
+    --code:#0b3d5c; --chip:#eef2f6;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:"Helvetica Neue",Arial,sans-serif; color:var(--ink);
+         font-size:10.5px; line-height:1.45; margin:0; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  h2 { font-size:13px; margin:18px 0 6px; color:var(--head);
+       border-bottom:2px solid var(--head); padding-bottom:3px; }
+  .sub { color:var(--muted); font-size:10px; margin:0 0 4px; }
+  p.note { color:var(--muted); font-size:9.5px; margin:5px 0 0; }
+  code { font-family:"SF Mono",Menlo,Consolas,monospace; font-size:9.3px;
+         color:var(--code); background:var(--chip); padding:0.5px 3px; border-radius:3px;
+         white-space:nowrap; }
+  table { width:100%; border-collapse:collapse; margin:4px 0 2px; }
+  th,td { border:1px solid var(--line); padding:4px 6px; text-align:left; vertical-align:top; }
+  th { background:var(--head); color:#fff; font-weight:600; font-size:9.6px; }
+  td.num,th.num { text-align:right; white-space:nowrap; }
+  tr.best td { background:var(--best); }
+  tr.mid  td { background:var(--mid); }
+  tr.worst td { background:var(--worst); }
+  .star { color:var(--best-bd); font-weight:700; }
+  .rank { font-weight:700; }
+  .legend { font-size:9px; color:var(--muted); margin-top:3px; }
+  .foot { margin-top:14px; font-size:8.8px; color:var(--muted);
+          border-top:1px solid var(--line); padding-top:5px; }
+  ul { margin:4px 0 0 0; padding-left:16px; }
+  li { margin:1.5px 0; }
+</style>
+</head>
+<body>
+
+<h1>GPU Histogram &amp; Example-Management Variants</h1>
+<p class="sub">Oblique decision-tree training — kernel inventory &amp; measured progression. Dataset: HIGGS1 (11,000,000 rows, 28 features), 2 trees.</p>
+
+<h2>1 · Background layout lineages (pre-existing baselines)</h2>
+<table>
+  <tr><th>Approach</th><th>Build config</th><th>Example management</th><th>Projection kernel</th><th>Histogram kernel</th></tr>
+  <tr><td><b>SRDW</b> (sort per depth)</td><td><i>default</i></td><td>sort examples per node → <code>d_selected_examples</code></td><td><code>ColumnAddProjectionKernel_SRDW_1_2D</code></td><td><code>BuildHistogramRandomKernel_2D</code></td></tr>
+  <tr><td><b>DRSW</b></td><td><code>--config=drsw</code></td><td><code>ComputeDRSWArrays</code> (UpperBound → node_ids/offsets)</td><td><code>ColumnAddProjectionKernel_DRSW_1</code></td><td><code>BuildHistogramRandomKernel_2D</code></td></tr>
+</table>
+
+<h2>2 · NODE_ID_DRSW lineage — <code>--config=node_id_drsw</code></h2>
+<p class="sub">Persistent <code>d_node_ids[num_rows]</code>; per-depth derives offsets instead of re-sorting. Projection is always <code>NodeIdDRSW_ProjectionOnly</code>; split is always <code>NodeIdDRSW_SplitUpdate</code>. Variation lives in two stages:</p>
+
+<table>
+  <tr><th>Stage</th><th>Kernel</th><th>Role</th><th>Selected by</th></tr>
+  <tr><td rowspan="5">Compute&nbsp;offsets</td><td><code>..._ComputeOffsetsKernel_Smem_OldAtomicAdd</code></td><td>per-thread shared-mem atomicAdd ranking</td><td><code>--config=no_two_pass</code> (+ A/B)</td></tr>
+  <tr><td><code>..._ComputeOffsetsKernel_Smem</code></td><td>warp-ranked single pass</td><td>A/B only (<code>COMPUTE_OFFSETS_AB=1</code>)</td></tr>
+  <tr><td><code>..._ComputeOffsets_CountKernel</code> + <code>_ScatterKernel</code></td><td>two-pass: count → prefix-sum → scatter</td><td><code>TWO_PASS</code> (<b>default on</b>)</td></tr>
+  <tr><td><code>..._ComputeOffsetsKernel_Global</code></td><td>global-atomic fallback</td><td><code>num_nodes &gt; 256</code></td></tr>
+  <tr><td><code>..._ComputeOffsetsOnlyKernel</code></td><td>offsets only, no <code>d_selected_examples</code></td><td><code>--config=offsets_only</code></td></tr>
+  <tr><td rowspan="2">Split&nbsp;update</td><td><code>..._SplitUpdateKernel_GlobalAtomic</code></td><td>per-row global atomicAdd</td><td><code>--config=split_global_atomic</code></td></tr>
+  <tr><td><code>..._SplitUpdateKernel_SmemReduce</code></td><td>shared-mem block reduction, flush once/block</td><td><code>SPLIT_SMEM</code> (<b>default on</b>)</td></tr>
+</table>
+
+<h2>3 · Partition / SplitExamples kernels (example → child reassignment)</h2>
+<p class="sub">The <code>partition</code> timing bucket. Two separate code paths depending on lineage.</p>
+<table>
+  <tr><th>Lineage</th><th>Host wrap</th><th>Device kernel(s)</th><th>Selected by</th></tr>
+  <tr><td><b>SRDW / DRSW</b></td><td rowspan="2"><code>SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap</code></td><td><code>DirectScatterFusedAllDepthKernel_1D</code></td><td><code>--define=d2d=direct</code></td></tr>
+  <tr><td><b>SRDW / DRSW</b></td><td><code>StablePartitionCountKernel</code> + <code>StablePartitionScatterKernel</code></td><td>default (stable two-pass)</td></tr>
+  <tr><td><b>NODE_ID_DRSW</b></td><td colspan="2"><code>NodeIdDRSW_SplitUpdate</code> → two kernels, see sub-table below</td><td><code>node_id_drsw</code></td></tr>
+</table>
+
+<p class="sub" style="margin-top:8px;"><b>NODE_ID_DRSW split — <code>NodeIdDRSW_SplitUpdate</code> (reads node_id + offset)</b></p>
+<table>
+  <tr><th>Version</th><th>Kernel</th><th>Accumulates child + per-class counts</th><th>Selected by</th></tr>
+  <tr class="best"><td><b>shared-memory</b></td><td><code>NodeIdDRSW_SplitUpdateKernel_SmemReduce</code></td><td>block-local smem; one <code>atomicAdd</code> per key per block (flush once)</td><td><code>SPLIT_SMEM</code> — <b>default on</b></td></tr>
+  <tr><td><b>global atomic</b></td><td><code>NodeIdDRSW_SplitUpdateKernel_GlobalAtomic</code></td><td>per-row global <code>atomicAdd</code></td><td><code>--config=split_global_atomic</code></td></tr>
+</table>
+<p class="legend"><b>Auto-fallback:</b> even with <code>SPLIT_SMEM</code> on, the global-atomic kernel is used when the required shared memory (<code>num_children × (1 + num_classes) × 4 B</code>) exceeds the device per-block cap (wide trees / many classes). A/B harness: <code>SPLITUPDATE_AB=1</code> times GLOBAL vs SMEM head-to-head.</p>
+<p class="legend">All in <code>oblique_apply_projection.cu</code> except the NODE_ID_DRSW split (<code>node_id_drsw.cuh</code>). Older SplitExamples kernels (<code>ComputeSplitFlagsKernel</code>, <code>ScatterSplitKernel</code>, <code>…AllDepthKernel</code>, <code>CompactSplitResultsKernel</code>) live only in <code>*_bak1/_bak2.cu</code> and are <b>not compiled</b>.</p>
+
+<h2>4 · Histogram-kernel inventory</h2>
+<table>
+  <tr><th>Kernel</th><th>Value / label access</th><th>Selected by</th></tr>
+  <tr><td><code>BuildHistogramRandomKernel</code></td><td>1D original</td><td><i>superseded</i></td></tr>
+  <tr><td><code>BuildHistogramRandomKernel_2D</code></td><td>projected coalesced; <b>label gathered</b> <code>d_labels[d_selected_examples[...]]</code></td><td>SRDW/DRSW base, or <code>--config=nid_srdw_hist</code></td></tr>
+  <tr><td><code>BuildHistogramRandomKernel_2D_WarpAgg</code></td><td>same, warp-aggregated atomics</td><td>runtime <code>HIST_WARPAGG=1</code></td></tr>
+  <tr><td><code>BuildHistogramDRSWKernel</code></td><td>iterate all rows; <b>node_id + offset</b>; global atomics for non-leader nodes</td><td><code>node_id_drsw</code> default / <code>offsets_only</code></td></tr>
+  <tr><td><code>BuildHistogramCompactKernel</code></td><td>like DRSW but over compacted active rows</td><td>implemented, <b>not wired</b> (experimental)</td></tr>
+  <tr><td><code>BuildHistogramSRDWLabelsKernel</code> <span class="star">★ new</span></td><td>projected coalesced; <b>label coalesced</b> <code>d_labels_srdw[row_start+r]</code></td><td><code>--config=srdw_label_hist</code></td></tr>
+</table>
+
+<h2>5 · Measured progression — <code>build_hist</code> on HIGGS1 (worst → best)</h2>
+<p class="sub">Sum over depths 1–9, averaged across 2 trees. All three are NODE_ID_DRSW builds.</p>
+<table>
+  <tr><th>Rank</th><th>Build config combo</th><th>Histogram kernel</th><th>Label source</th><th class="num">build_hist sum</th></tr>
+  <tr class="worst"><td class="rank">①</td><td><code>node_id_drsw</code> + <code>nid_srdw_hist</code></td><td><code>BuildHistogramRandomKernel_2D</code></td><td>scattered gather, per-projection, grows with depth</td><td class="num"><b>84.8 ms</b></td></tr>
+  <tr class="mid"><td class="rank">②</td><td><code>node_id_drsw</code> + <code>offsets_only</code></td><td><code>BuildHistogramDRSWKernel</code></td><td><code>d_labels[r]</code> coalesced, but global atomics</td><td class="num"><b>48.2 ms</b></td></tr>
+  <tr class="best"><td class="rank star">③ ★</td><td><code>node_id_drsw</code> + <code>offsets_only</code> + <code>srdw_label_hist</code></td><td><code>BuildHistogramSRDWLabelsKernel</code></td><td><code>d_labels_srdw[...]</code> coalesced, block-per-node</td><td class="num"><b>17.4 ms</b></td></tr>
+</table>
+<p class="legend">Speedups: ①→② = 1.76× · ②→③ = 2.77× · ①→③ = 4.9× overall. Variant ③ is also flat (~1.9 ms/depth) while ① climbs 3 → 15 ms with depth. Correctness: tree-0 per-depth node counts of ③ match the baseline exactly.</p>
+
+<h2>6 · Not yet measured on HIGGS1 (built-in A/B harnesses)</h2>
+<ul>
+  <li><b>SRDW base</b> and <b>DRSW base</b> histograms — separate <code>--config</code> builds.</li>
+  <li><b>ComputeOffsets</b> OLD vs WARP vs 2PASS — run any node_id build with <code>COMPUTE_OFFSETS_AB=1</code>.</li>
+  <li><b>SplitUpdate</b> GLOBAL vs SMEM — <code>SPLITUPDATE_AB=1</code>.</li>
+  <li><b>Histogram</b> ORIG vs WARPAGG — <code>HIST_AB=1</code>.</li>
+</ul>
+
+<p class="foot">Per-depth timings print to stderr under <code>--config=verbose_depth</code> (field <code>hist=</code>) and to <code>per_depth_timing.csv</code>. Build command for the new variant:<br>
+<code>bazel build //examples:oblique_apply_projection_main --config=bfs_only --config=use_gpu --config=verbose_depth --config=node_id_drsw --config=offsets_only --config=srdw_label_hist --define=split_smem=false</code></p>
+
+</body>
+</html>
