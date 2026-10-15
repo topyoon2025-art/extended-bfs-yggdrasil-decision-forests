@@ -1,0 +1,72 @@
+These four options are build-time toggles (Bazel --config= flags), not runtime flags — so "on/off of symmetric column ID sampling" means two separate builds. node_id_drsw + scattered histogram + smem split update are the same in both; only --config=symmetric_proj is added/omitted.
+
+Build
+
+
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw --config=nid_srdw_hist \
+  --define=split_smem=true
+
+Symmetric column ID sampling OFF (just drop that last config — OFF is the default):
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw \
+  --config=offsets_only --config=scattered_label_hist \
+  --define=split_smem=true
+
+
+Symmetric column ID sampling ON (add --config=symmetric_proj):
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+  --config=node_id_drsw \
+  --config=offsets_only --config=scattered_label_hist \
+  --define=split_smem=true \
+  --config=symmetric_proj
+
+
+
+SRDW original
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+
+bazel build //examples:oblique_apply_projection_main \
+  --config=bfs_only --config=use_gpu --config=verbose_depth \
+   --config=symmetric_proj
+
+
+
+
+
+Run (same for either build)
+
+bazel-bin/examples/oblique_apply_projection_main \
+  --input_mode=tfrecord --ds_path=/home/ubuntu/projects/dataset/HIGGS1 \
+  --label_col=target --num_trees=1 --tree_depth=6 --seed=1
+
+bazel-bin/examples/oblique_apply_projection_main \
+  --input_mode=csv \
+  --train_csv=/home/ubuntu/projects/dataset/HIGGS1.csv \
+  --label_col=target \
+  --num_trees=1 --tree_depth=6 --seed=1
+
+
+bazel-bin/examples/oblique_apply_projection_main \
+  --input_mode=trunk --rows=1048576 --cols=1024 \
+  --label_col=target --num_trees=1 --tree_depth=6 --seed=1
+
+Notes on each piece:
+- --config=node_id_drsw → the DRSW persistent node-ID strategy.
+- scattered histogram → --config=scattered_label_hist, which requires --config=offsets_only (and node_id_drsw) — enforced in training.cc:5888-5897.
+- smem split update → --define=split_smem=true (this is the default; passing it explicitly keeps it ON. The alternative is --config=split_global_atomic, which sets it false).
+- symmetric column ID sampling → --config=symmetric_proj ON / omit for OFF. There's no =false alias.
+
+
+(* dune clean
+dune test --instrument-with bisect_ppx_ng
+bisect-ppx-report summary _build/default/test/_bisect/*.coverage *)
+(* dune clean
+dune test --instrument-with bisect_ppx_ng
+bisect-ppx-report html
+open _coverage/index.html*)
+

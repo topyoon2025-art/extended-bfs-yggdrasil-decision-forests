@@ -62,6 +62,7 @@ absl::Status DeduplicateBootstrap_wrap(
     int num_samples,
     int num_rows);
 
+
 absl::StatusOr<std::vector<yggdrasil_decision_forests::model::decision_tree::ExampleSplitRollingBuffer>> SplitExamplesInPlaceKernel_all_depth_No_D2H_fused_wrap(
                 const float* d_col_add_projected,
                 int* d_selected_examples,
@@ -484,6 +485,11 @@ NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
 #endif  // NODE_ID_DRSW
 
 #ifdef GPU_SAMPLE_PROJ
+// Query the cub temp-storage bytes needed to prefix-sum `num_segments + 1`
+// projection counts. Call once (at max_segments) to size a persistent buffer
+// that is reused across depths, so the per-depth path does no cudaMalloc/Free.
+size_t SampleProjectionsCubTempBytes(int num_segments);
+
 void SampleProjectionsOnGPU_wrap(
     int* d_offset,
     int* d_flat_projection_col_idx,
@@ -492,6 +498,9 @@ void SampleProjectionsOnGPU_wrap(
     const int* d_numerical_features,
     const int* d_attr_to_flat_col,
     const float* d_norm_factors,
+    int* d_proj_counts,       // persistent scratch, size >= (num_segments + 1)
+    void* d_cub_temp,         // persistent cub scratch, size >= cub_temp_bytes
+    size_t cub_temp_bytes,
     int num_features,
     int num_nodes,
     int num_proj,

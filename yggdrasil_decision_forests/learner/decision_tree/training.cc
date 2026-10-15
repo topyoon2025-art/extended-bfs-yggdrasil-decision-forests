@@ -5608,6 +5608,15 @@ absl::Status GrowTreeLocalBFS(
   CUDA_CHECK(cudaMalloc(&d_flat_projection_weights, max_proj_nnz * sizeof(float)));
 #ifdef GPU_SAMPLE_PROJ
   CUDA_CHECK(cudaMalloc(&d_flat_projection_attr_idx, max_proj_nnz * sizeof(int)));
+  // Persistent scratch for GPU projection sampling, sized at max_segments and
+  // reused every depth so SampleProjectionsOnGPU_wrap does no per-depth
+  // cudaMalloc/cudaFree (that allocator churn was the bulk of "sampling" time).
+  int* d_proj_counts = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_proj_counts, (max_segments + 1) * sizeof(int)));
+  const size_t sample_cub_temp_bytes =
+      SampleProjectionsCubTempBytes(max_segments);
+  void* d_sample_cub_temp = nullptr;
+  CUDA_CHECK(cudaMalloc(&d_sample_cub_temp, sample_cub_temp_bytes));
 #endif
   CUDA_CHECK(cudaMalloc(&d_node_row_off, (max_nodes + 1) * sizeof(int)));
 
@@ -5824,6 +5833,7 @@ absl::Status GrowTreeLocalBFS(
           d_offset, d_flat_projection_col_idx, d_flat_projection_attr_idx,
           d_flat_projection_weights,
           d_numerical_features_gpu, d_attr_to_flat_col_gpu, d_norm_factors,
+          d_proj_counts, d_sample_cub_temp, sample_cub_temp_bytes,
           num_features, num_nodes, num_proj,
           projection_density,
           dt_config.sparse_oblique_split().max_num_features(),
@@ -6697,6 +6707,8 @@ exclusive (both choose the histogram kernel)."
   cudaFree(d_attr_to_flat_col_gpu);
   cudaFree(d_norm_factors);
   cudaFree(d_flat_projection_attr_idx);
+  cudaFree(d_proj_counts);
+  cudaFree(d_sample_cub_temp);
 #endif
   double cleanup_ms = ms_between(t_cleanup_start, now());
   // Drain any outstanding async GPU work before reading the whole-tree wall,

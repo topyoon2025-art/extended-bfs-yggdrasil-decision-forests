@@ -575,6 +575,18 @@ __global__ void SampleProjectionFillKernel(
     }
 }
 
+size_t SampleProjectionsCubTempBytes(int num_segments)
+{
+    // ExclusiveSum's temp requirement depends only on the item count and is
+    // monotonic in it, so sizing at the max num_segments covers every depth.
+    void* d_temp = nullptr;
+    size_t temp_bytes = 0;
+    int* d_dummy = nullptr;  // null is fine for the sizing query
+    cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes,
+        d_dummy, d_dummy, num_segments + 1);
+    return temp_bytes;
+}
+
 void SampleProjectionsOnGPU_wrap(
     int* d_offset,
     int* d_flat_projection_col_idx,
@@ -583,6 +595,9 @@ void SampleProjectionsOnGPU_wrap(
     const int* d_numerical_features,
     const int* d_attr_to_flat_col,
     const float* d_norm_factors,
+    int* d_proj_counts,
+    void* d_cub_temp,
+    size_t cub_temp_bytes,
     int num_features,
     int num_nodes,
     int num_proj,
@@ -595,23 +610,18 @@ void SampleProjectionsOnGPU_wrap(
     constexpr int BLOCK = 256;
     const int grid = (num_segments + BLOCK - 1) / BLOCK;
 
-    int* d_proj_counts = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_proj_counts, (num_segments + 1) * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_proj_counts, 0, (num_segments + 1) * sizeof(int)));
+    // d_proj_counts and d_cub_temp are persistent buffers owned by the caller
+    // (allocated once before the depth loop). The count kernel writes seg_id in
+    // [0, num_segments); zero the trailing element the prefix sum reads.
+    CUDA_CHECK(cudaMemset(d_proj_counts + num_segments, 0, sizeof(int)));
 
     SampleProjectionCountKernel<BLOCK><<<grid, BLOCK>>>(
         d_proj_counts, num_features, num_segments, num_proj,
         projection_density, max_num_features, seed);
 
-    void* d_temp = nullptr;
-    size_t temp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes,
+    size_t temp_bytes = cub_temp_bytes;
+    cub::DeviceScan::ExclusiveSum(d_cub_temp, temp_bytes,
         d_proj_counts, d_offset, num_segments + 1);
-    CUDA_CHECK(cudaMalloc(&d_temp, temp_bytes));
-    cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes,
-        d_proj_counts, d_offset, num_segments + 1);
-    cudaFree(d_temp);
-    cudaFree(d_proj_counts);
 
     SampleProjectionFillKernel<BLOCK><<<grid, BLOCK>>>(
         d_flat_projection_col_idx, d_flat_projection_attr_idx,

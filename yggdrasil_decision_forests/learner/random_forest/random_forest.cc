@@ -866,6 +866,7 @@ RandomForestLearner::TrainWithStatusImpl(
           internal_config.dedup_ms = dedup_ms;
           #endif
         #endif
+
         if (vector_sequence_computer) {
           internal_config.vector_sequence_computer =
               vector_sequence_computer.get();
