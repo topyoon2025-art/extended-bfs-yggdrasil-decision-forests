@@ -68,8 +68,15 @@ ABSL_FLAG(std::string, ensemble_method, "Bagging",
 ABSL_FLAG(float, shrinkage, 0.1f,
           "Learning rate for boosting (only used when ensemble_method = 'Boosting').");         
 
-ABSL_FLAG(bool, bootstrap_training_dataset, true,
+ABSL_FLAG(bool, bootstrap_training_dataset, false,
           "Whether to use bootstrap sampling of the training dataset (Bagging only). NOTE: NO BOOTSTRAP USES ~50% MORE MEMORY. POSSIBLE BUG");
+ABSL_FLAG(bool, sampling_with_replacement, true,
+          "Bagging only, requires bootstrap_training_dataset=true. true: sample WITH "
+          "replacement (classic bootstrap). false: sample WITHOUT replacement a "
+          "bootstrap_size_ratio fraction of rows (ratio>=1 => all rows once).");
+ABSL_FLAG(double, bootstrap_size_ratio, 1.0,
+          "Fraction of rows drawn per tree (Bagging). With replacement this is the "
+          "#draws/N; without replacement it is the subset fraction (clamped to 1).");
 ABSL_FLAG(bool, compute_oob_performances, false,
           "Whether to compute out-of-bag performances (only for csv mode).");
 
@@ -732,6 +739,11 @@ int main (int argc, char* argv[]) {
             LOG(INFO) << "Loaded " << tf_ds->nrow() << " rows, "
                       << data_spec.columns_size() << " columns.";
         }
+
+        // Report the real CSV dimensions (not the default --rows/--cols sweep
+        // flags) in all subsequent logs, the results CSV, and output dir names.
+        sweep_rows = ds_ptr->nrow();
+        sweep_cols = data_spec.columns_size() - 1;  // exclude the label column
     } else if (mode == "tfrecord") {
         label_col = absl::GetFlag(FLAGS_label_col);
         const std::string path = absl::GetFlag(FLAGS_ds_path);
@@ -806,7 +818,8 @@ int main (int argc, char* argv[]) {
             yggdrasil_decision_forests::model::random_forest::proto::random_forest_config);
         rf.set_num_trees(num_trees);
         rf.set_bootstrap_training_dataset(absl::GetFlag(FLAGS_bootstrap_training_dataset));
-        rf.set_bootstrap_size_ratio(1.0);
+        rf.set_sampling_with_replacement(absl::GetFlag(FLAGS_sampling_with_replacement));
+        rf.set_bootstrap_size_ratio(absl::GetFlag(FLAGS_bootstrap_size_ratio));
         rf.set_winner_take_all_inference(false);
         rf.set_compute_oob_performances(
             absl::GetFlag(FLAGS_compute_oob_performances));

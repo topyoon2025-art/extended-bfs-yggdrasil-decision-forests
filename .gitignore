@@ -5,3 +5,12 @@ tmp_package
 __pycache__
 no_sync*
 .claude/worktrees/
+
+# sweeps: keep scripts (run_sweep.sh, aggregate.py), ignore generated artifacts
+sweeps/bin/
+sweeps/results/
+sweeps/logs/
+
+# generated benchmark CSVs (test_data/*.csv stay tracked since already committed;
+# add new fixtures with `git add -f` if needed)
+*.csv

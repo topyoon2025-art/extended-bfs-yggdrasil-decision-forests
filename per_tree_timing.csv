@@ -1,2 +1,0 @@
-run,tree,sampling_ms,projection_ms,split_finding_ms,example_mgmt_ms,node_train_ms,overhead_ms,tree_total_ms,compute_offsets_ms,drsw_setup_ms,partition_ms,setup_ms,gpu_cleanup_ms,partition_free_ms,overhead_gap_ms,apply_proj_kernel_ms,drsw_proj_ms,eval_proj_ms
-0,0,0.76519,2.693,2.24657,0.48013,0.053719,1.55976,7.79837,0.138133,0,0.341997,0.644745,0.656382,0,0.258634,2.693,0,2.24657

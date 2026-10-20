@@ -136,8 +136,8 @@ common --enable_platform_specific_config
 # Required for bazel <=4, fails with bazel >= 5.
 # common --incompatible_restrict_string_escapes=false
 
-build -c opt --@rules_cuda//cuda:archs=sm_120
-# build -c opt --@rules_cuda//cuda:archs=sm_89
+# build -c opt --@rules_cuda//cuda:archs=sm_120
+build -c opt --@rules_cuda//cuda:archs=sm_89
 build --announce_rc
 build --noincompatible_strict_action_env
 

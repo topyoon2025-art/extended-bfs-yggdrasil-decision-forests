@@ -140,6 +140,99 @@ __global__ void SampleTrainingExamplesKernel(
     d_selected_examples[tid] = r % num_rows;
 }
 
+// ── Sampling WITHOUT replacement ───────────────────────────────────────────
+// Identity selection: d_selected_examples[i] = i (the whole dataset, once).
+// Used for bootstrap_training_dataset=false, and for sampling_with_replacement
+// =false with bootstrap_size_ratio>=1 (all examples per YDF semantics).
+__global__ void IotaSelectedExamplesKernel(
+    int* __restrict__ d_selected_examples,
+    const int num_rows)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    d_selected_examples[tid] = tid;
+}
+
+// Per-row random key + its index, for a without-replacement SUBSET (ratio<1):
+// sort indices by key and take the first k — a uniform sample without repeats.
+__global__ void FillRandomKeysAndIotaKernel(
+    unsigned int* __restrict__ d_keys,
+    int*          __restrict__ d_idx,
+    const int num_rows,
+    const unsigned long long seed)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    curandState state;
+    curand_init(seed, tid, 0, &state);
+    d_keys[tid] = curand(&state);
+    d_idx[tid]  = tid;
+}
+
+// How many examples a tree draws, honoring the RF config:
+//   bootstrap_training_dataset=false      -> num_rows (all examples, once)
+//   sampling_with_replacement=true        -> round(ratio*N)   (may exceed N)
+//   sampling_with_replacement=false       -> min(N, round(ratio*N))  (<= N)
+static int SelectedExamplesCount(
+    int num_rows,
+    const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config)
+{
+    const int64_t raw = std::max<int64_t>(
+        1, static_cast<int64_t>(static_cast<double>(num_rows) * rf_config.bootstrap_size_ratio()));
+    if (!rf_config.bootstrap_training_dataset()) return num_rows;
+    if (rf_config.sampling_with_replacement()) return static_cast<int>(raw);
+    return static_cast<int>(std::min<int64_t>(num_rows, raw));
+}
+
+// Fill d_selected_examples[0..num_samples) and leave it sorted ascending
+// (DeduplicateBootstrap and the SRDW/node-id consumers expect sorted indices).
+static absl::Status FillSelectedExamples(
+    int* d_selected_examples,
+    int num_samples,
+    int num_rows,
+    bool with_replacement,
+    unsigned long long seed)
+{
+    constexpr int BLOCK = 256;
+    bool need_sort = true;
+
+    if (with_replacement) {
+        const int blocks = (num_samples + BLOCK - 1) / BLOCK;
+        SampleTrainingExamplesKernel<<<blocks, BLOCK>>>(
+            d_selected_examples, num_samples, num_rows, seed);
+    } else if (num_samples >= num_rows) {
+        // Without replacement, full dataset -> identity (already sorted).
+        const int blocks = (num_rows + BLOCK - 1) / BLOCK;
+        IotaSelectedExamplesKernel<<<blocks, BLOCK>>>(d_selected_examples, num_rows);
+        need_sort = false;
+    } else {
+        // Without replacement, strict subset -> random-key sort, take first k.
+        unsigned int* d_keys = nullptr;
+        int* d_idx = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_keys, static_cast<size_t>(num_rows) * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_idx,  static_cast<size_t>(num_rows) * sizeof(int)));
+        const int blocks = (num_rows + BLOCK - 1) / BLOCK;
+        FillRandomKeysAndIotaKernel<<<blocks, BLOCK>>>(d_keys, d_idx, num_rows, seed);
+        CUDA_CHECK(cudaGetLastError());
+        thrust::sort_by_key(thrust::device_ptr<unsigned int>(d_keys),
+                            thrust::device_ptr<unsigned int>(d_keys) + num_rows,
+                            thrust::device_ptr<int>(d_idx));
+        CUDA_CHECK(cudaMemcpy(d_selected_examples, d_idx,
+                              static_cast<size_t>(num_samples) * sizeof(int),
+                              cudaMemcpyDeviceToDevice));
+        cudaFree(d_keys);
+        cudaFree(d_idx);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+
+    if (need_sort) {
+        thrust::device_ptr<int> d_ptr(d_selected_examples);
+        thrust::sort(d_ptr, d_ptr + num_samples);
+    }
+    return absl::OkStatus();
+}
+
 absl::Status SampleTrainingExamplesKernel_wrap(
     const int num_rows,
     const yggdrasil_decision_forests::model::random_forest::proto::RandomForestTrainingConfig& rf_config,
@@ -148,22 +241,15 @@ absl::Status SampleTrainingExamplesKernel_wrap(
     std::vector<yggdrasil_decision_forests::dataset::UnsignedExampleIdx>* selected_examples,
     unsigned long long seed)
 {
-    const int num_samples = std::max(
-        int64_t{1},
-        static_cast<int64_t>(static_cast<double>(num_rows) * rf_config.bootstrap_size_ratio()));
+    const int num_samples = SelectedExamplesCount(num_rows, rf_config);
+    const bool with_replacement =
+        rf_config.bootstrap_training_dataset() && rf_config.sampling_with_replacement();
 
     CUDA_CHECK(cudaMalloc(&d_selected_examples, num_samples * sizeof(int)));
 
-    constexpr int BLOCK = 256;
-    const int blocks = (num_samples + BLOCK - 1) / BLOCK;
-
-    SampleTrainingExamplesKernel<<<blocks, BLOCK>>>(
-        d_selected_examples, num_samples, num_rows, seed);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    thrust::device_ptr<int> d_ptr(d_selected_examples);
-    thrust::sort(d_ptr, d_ptr + num_samples);
+    auto st = FillSelectedExamples(
+        d_selected_examples, num_samples, num_rows, with_replacement, seed);
+    if (!st.ok()) return st;
 
     selected_examples->resize(num_samples);
     CUDA_CHECK(cudaMemcpy(selected_examples->data(), d_selected_examples,
@@ -181,24 +267,17 @@ absl::Status SampleTrainingExamplesKernel_No_D2H_wrap(
     int& num_samples_out,
     unsigned long long seed)
 {
-    const int num_samples = std::max(
-        int64_t{1},
-        static_cast<int64_t>(static_cast<double>(num_rows) * rf_config.bootstrap_size_ratio()));
+    const int num_samples = SelectedExamplesCount(num_rows, rf_config);
+    const bool with_replacement =
+        rf_config.bootstrap_training_dataset() && rf_config.sampling_with_replacement();
 
     num_samples_out = num_samples;
 
     CUDA_CHECK(cudaMalloc(&d_selected_examples, num_samples * sizeof(int)));
 
-    constexpr int BLOCK = 256;
-    const int blocks = (num_samples + BLOCK - 1) / BLOCK;
-
-    SampleTrainingExamplesKernel<<<blocks, BLOCK>>>(
-        d_selected_examples, num_samples, num_rows, seed);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
-
-    thrust::device_ptr<int> d_ptr(d_selected_examples);
-    thrust::sort(d_ptr, d_ptr + num_samples);
+    auto st = FillSelectedExamples(
+        d_selected_examples, num_samples, num_rows, with_replacement, seed);
+    if (!st.ok()) return st;
 
     return absl::OkStatus();
 }
@@ -2263,6 +2342,7 @@ __global__ void ColumnAddProjectionKernel_DRSW_1(
         }
         const long long base = (long long)row_start * num_proj + (long long)proj_id * rows_node;
         projected[base + node_offset] = sum;
+
     }
 }
 

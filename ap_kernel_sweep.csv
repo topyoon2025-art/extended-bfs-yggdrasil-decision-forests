@@ -1,4 +1,0 @@
-run,rows,cols,tree_depth,projection_density_factor,num_trees,train_time_s,sampling_ms,apply_proj_kernel_ms,eval_proj_ms,free_ms,partition_ms,node_train_ms,tree_total_ms,drsw_setup_ms,drsw_proj_ms
-0,11000000,28,6,1.5,1,1.15559,0.336719,11.1876,7.84495,7.52628,16.5425,0.044012,43.8546,0,0
-1,11000000,28,10,1.5,1,1.10909,0.40271,31.6005,16.1253,8.94025,30.1187,0.499104,88.0111,0,0
-2,11000000,28,16,1.5,1,1.24521,0.737429,82.1481,37.0414,27.4715,46.9459,33.2901,232.606,0,0
