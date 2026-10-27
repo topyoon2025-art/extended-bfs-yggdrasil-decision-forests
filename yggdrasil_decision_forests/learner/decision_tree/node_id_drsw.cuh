@@ -75,8 +75,11 @@ inline void NodeIdDRSW_Init(
 //    Replaces both CUB sort and ComputeDRSWArrays.
 // ═══════════════════════════════════════════════════════════════════════
 
-// Per-thread shared-memory atomicAdd for ranking.  Primary ComputeOffsets path
-// for num_nodes <= SMEM_NODES.
+// Max nodes per depth for the shared-memory ranking kernels below (one
+// s_counts / s_base slot per node). The only ComputeOffsets(Only) kernels.
+constexpr int kMaxOffsetNodes = 256;
+
+// Per-thread shared-memory atomicAdd for ranking, for num_nodes <= SMEM_NODES.
 template <int SMEM_NODES>
 __global__ void NodeIdDRSW_ComputeOffsetsKernel_SmemAtomicAdd(
         const int* __restrict__ node_ids,
@@ -117,48 +120,6 @@ __global__ void NodeIdDRSW_ComputeOffsetsKernel_SmemAtomicAdd(
     d_selected_examples[node_row_off[nid] + offset] = row;
 }
 
-// Global-atomics fallback: num_nodes > SMEM_NODES
-// Uses warp-level __match_any_sync to coalesce atomics — one atomicAdd per
-// distinct node_id per warp instead of per thread.  Within each warp's group,
-// lower lanes (lower row indices) get lower offsets, giving partial sort order.
-__global__ void NodeIdDRSW_ComputeOffsetsKernel_Global(
-        const int* __restrict__ node_ids,
-        int*       __restrict__ node_offsets,
-        int*       __restrict__ d_selected_examples,
-        const int* __restrict__ node_row_off,
-        int*       __restrict__ d_atomic_counters,
-        int num_rows,
-        int num_nodes)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int nid = -1;
-    if (row < num_rows) {
-        nid = node_ids[row];
-        if (nid < 0 || nid >= num_nodes) nid = -1;
-    }
-
-    unsigned active = __ballot_sync(0xFFFFFFFF, nid >= 0);
-    if (nid < 0) return;
-
-    unsigned match_mask = __match_any_sync(active, nid);
-    int lane = threadIdx.x & 31;
-    int leader = __ffs(match_mask) - 1;
-    int group_size = __popc(match_mask);
-
-    int base_offset;
-    if (lane == leader) {
-        base_offset = atomicAdd(&d_atomic_counters[nid], group_size);
-    }
-    base_offset = __shfl_sync(match_mask, base_offset, leader);
-
-    unsigned lower_mask = (1u << lane) - 1;
-    int offset = base_offset + __popc(match_mask & lower_mask);
-
-    node_offsets[row] = offset;
-    d_selected_examples[node_row_off[nid] + offset] = row;
-}
-
 inline void NodeIdDRSW_ComputeOffsets(
         int* d_node_offsets,
         int* d_selected_examples,
@@ -181,83 +142,28 @@ inline void NodeIdDRSW_ComputeOffsets(
 
     int blocks = (num_rows + BLOCK - 1) / BLOCK;
 
-    // Single-pass atomicAdd ranking for small node counts; global-atomics
-    // fallback for large node counts.  Both rebuild d_selected_examples.
-    if (num_nodes <= 256) {
-        CUDA_CHECK(cudaMemset(d_atomic_counters, 0, num_nodes * sizeof(int)));
-        NodeIdDRSW_ComputeOffsetsKernel_SmemAtomicAdd<256><<<blocks, BLOCK>>>(
-            d_node_ids, d_node_offsets, d_selected_examples,
-            d_node_row_off, d_atomic_counters, num_rows, num_nodes);
-    } else {
-        CUDA_CHECK(cudaMemset(d_atomic_counters, 0, num_nodes * sizeof(int)));
-        NodeIdDRSW_ComputeOffsetsKernel_Global<<<blocks, BLOCK>>>(
-            d_node_ids, d_node_offsets, d_selected_examples,
-            d_node_row_off, d_atomic_counters,
-            num_rows, num_nodes);
+    // Only the shared-memory ranking kernel exists (one smem counter slot per
+    // node), so at most kMaxOffsetNodes nodes per depth: tree_depth <= 10, since
+    // the last depth only makes leaves. The >256-node global-atomic fallback was
+    // removed; fail loudly instead.
+    if (num_nodes > kMaxOffsetNodes) {
+        fprintf(stderr, "%s: %d nodes at this depth exceeds the %d-node limit "
+                "(the >256-node fallback kernel was removed; use tree_depth <= 10)\n",
+                __func__, num_nodes, kMaxOffsetNodes);
+        exit(EXIT_FAILURE);
     }
+    CUDA_CHECK(cudaMemset(d_atomic_counters, 0, num_nodes * sizeof(int)));
+    NodeIdDRSW_ComputeOffsetsKernel_SmemAtomicAdd<kMaxOffsetNodes><<<blocks, BLOCK>>>(
+        d_node_ids, d_node_offsets, d_selected_examples,
+        d_node_row_off, d_atomic_counters, num_rows, num_nodes);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-// write_labels=true additionally scatters the per-example label (and, under
-// DEDUP_BOOTSTRAP, dup count) into SRDW layout at node_row_off[nid] + local_r,
-// for the NODE_ID_DRSW_SCATTERED_LABEL_HIST path on large node counts (> 256) where
-// the two-pass scatter is not used. The extra pointers default to null and the
-// branch is dead when write_labels=false, leaving existing behavior unchanged.
-__global__ void NodeIdDRSW_ComputeOffsetsOnlyKernel(
-        const int* __restrict__ node_ids,
-        int*       __restrict__ node_offsets,
-        int*       __restrict__ d_atomic_counters,
-        int num_rows,
-        int num_nodes,
-        const int* __restrict__ node_row_off = nullptr,
-        const int* __restrict__ d_labels = nullptr,
-        const int* __restrict__ d_dup = nullptr,
-        int*       __restrict__ d_labels_scattered = nullptr,
-        int*       __restrict__ d_dup_scattered = nullptr,
-        bool write_labels = false)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-
-    int nid = -1;
-    if (row < num_rows) {
-        nid = node_ids[row];
-        if (nid < 0 || nid >= num_nodes) nid = -1;
-    }
-
-    unsigned active = __ballot_sync(0xFFFFFFFF, nid >= 0);
-    if (nid < 0) return;
-
-    unsigned match_mask = __match_any_sync(active, nid);
-    int lane = threadIdx.x & 31;
-    int leader = __ffs(match_mask) - 1;
-    int group_size = __popc(match_mask);
-
-    int base_offset;
-    if (lane == leader) {
-        base_offset = atomicAdd(&d_atomic_counters[nid], group_size);
-    }
-    base_offset = __shfl_sync(match_mask, base_offset, leader);
-
-    unsigned lower_mask = (1u << lane) - 1;
-    int local_r = base_offset + __popc(match_mask & lower_mask);
-
-    node_offsets[row] = local_r;
-
-    if (write_labels) {
-        const int slot = node_row_off[nid] + local_r;
-        d_labels_scattered[slot] = d_labels[row];
-#ifdef DEDUP_BOOTSTRAP
-        d_dup_scattered[slot] = d_dup[row];
-#endif
-    }
 }
 
 // Shared-memory-ranked offsets-only for num_nodes <= SMEM_NODES.  Mirrors
 // NodeIdDRSW_ComputeOffsetsKernel_SmemAtomicAdd (cheap intra-block ranking in
 // shared memory + one global atomicAdd per node per block), but skips the
-// d_selected_examples store.  This avoids the per-warp global-atomic contention
-// of the warp-coalesced kernel above, matching the do-both ComputeOffsets speed.
+// d_selected_examples store (except under NODE_ID_SRDW_PROJ).
 // WRITE_LABELS additionally scatters labels/dups into SRDW layout at the slot.
 template <int SMEM_NODES, bool WRITE_LABELS>
 __global__ void NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem(
@@ -270,7 +176,8 @@ __global__ void NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem(
         const int* __restrict__ d_labels = nullptr,
         const int* __restrict__ d_dup = nullptr,
         int*       __restrict__ d_labels_scattered = nullptr,
-        int*       __restrict__ d_dup_scattered = nullptr)
+        int*       __restrict__ d_dup_scattered = nullptr,
+        int*       __restrict__ d_selected_examples = nullptr)
 {
     __shared__ int s_counts[SMEM_NODES];
     __shared__ int s_base[SMEM_NODES];
@@ -301,11 +208,15 @@ __global__ void NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem(
     node_offsets[row] = offset;
     if (WRITE_LABELS) {
         const int slot = node_row_off[nid] + offset;
-        d_labels_scattered[slot] = d_labels[row];
+        d_labels_scattered[slot] = d_labels[row]; // is the class label value. 
 #ifdef DEDUP_BOOTSTRAP
-        d_dup_scattered[slot] = d_dup[row];
+        d_dup_scattered[slot] = d_dup[row]; // count
 #endif
     }
+#ifdef NODE_ID_SRDW_PROJ
+    // Sorted row list for the SRDW_1_2D projection kernel.
+    d_selected_examples[node_row_off[nid] + offset] = row;
+#endif
 }
 
 // The d_labels/d_dup/d_labels_scattered/d_dup_scattered pointers are used only in the
@@ -313,6 +224,8 @@ __global__ void NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem(
 // label (and dup count) into SRDW layout so the SRDW histogram can read them
 // coalesced without d_selected_examples. They default to null and are ignored in
 // every other build.
+// d_selected_examples is written only under NODE_ID_SRDW_PROJ (SRDW_1_2D
+// projection needs the node-sorted row list); ignored otherwise.
 inline void NodeIdDRSW_ComputeOffsetsOnly(
         int* d_node_offsets,
         const int* d_node_ids,
@@ -322,7 +235,8 @@ inline void NodeIdDRSW_ComputeOffsetsOnly(
         const int* d_labels = nullptr,
         const int* d_dup = nullptr,
         int* d_labels_scattered = nullptr,
-        int* d_dup_scattered = nullptr)
+        int* d_dup_scattered = nullptr,
+        int* d_selected_examples = nullptr)
 {
     constexpr int BLOCK = 256;
     int blocks = (num_rows + BLOCK - 1) / BLOCK;
@@ -341,21 +255,22 @@ inline void NodeIdDRSW_ComputeOffsetsOnly(
         CUDA_CHECK(cudaMalloc(&d_atomic_counters, alloc_size * sizeof(int)));
         counters_capacity = alloc_size;
     }
-    CUDA_CHECK(cudaMemset(d_atomic_counters, 0, num_nodes * sizeof(int)));
-
-    if (num_nodes <= 256) {
-        // Shared-memory ranking (matches the do-both ComputeOffsets speed).
-        NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem<256, kWriteLabels><<<blocks, BLOCK>>>(
-            d_node_ids, d_node_offsets, d_node_row_off, d_atomic_counters,
-            num_rows, num_nodes,
-            d_labels, d_dup, d_labels_scattered, d_dup_scattered);
-    } else {
-        // Global-atomic warp-coalesced fallback for large node counts.
-        NodeIdDRSW_ComputeOffsetsOnlyKernel<<<blocks, BLOCK>>>(
-            d_node_ids, d_node_offsets, d_atomic_counters,
-            num_rows, num_nodes,
-            d_node_row_off, d_labels, d_dup, d_labels_scattered, d_dup_scattered, kWriteLabels);
+    // Only the shared-memory ranking kernel exists (one smem counter slot per
+    // node), so at most kMaxOffsetNodes nodes per depth: tree_depth <= 10, since
+    // the last depth only makes leaves. The >256-node global-atomic fallback was
+    // removed; fail loudly instead.
+    if (num_nodes > kMaxOffsetNodes) {
+        fprintf(stderr, "%s: %d nodes at this depth exceeds the %d-node limit "
+                "(the >256-node fallback kernel was removed; use tree_depth <= 10)\n",
+                __func__, num_nodes, kMaxOffsetNodes);
+        exit(EXIT_FAILURE);
     }
+    CUDA_CHECK(cudaMemset(d_atomic_counters, 0, num_nodes * sizeof(int)));
+    NodeIdDRSW_ComputeOffsetsOnlyKernel_Smem<kMaxOffsetNodes, kWriteLabels><<<blocks, BLOCK>>>(
+        d_node_ids, d_node_offsets, d_node_row_off, d_atomic_counters,
+        num_rows, num_nodes,
+        d_labels, d_dup, d_labels_scattered, d_dup_scattered,
+        d_selected_examples);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }

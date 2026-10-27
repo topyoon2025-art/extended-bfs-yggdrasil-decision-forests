@@ -123,6 +123,31 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
     return 1;
   }
 
+#ifdef AXIS_ALIGNED
+  // AXIS_ALIGNED: one axis-aligned projection per numerical feature, so every
+  // node performs an exhaustive axis-aligned split search (every column) each
+  // depth rather than testing a sampled set of oblique directions. The GPU
+  // projection sampler (SampleProjection{Count,Fill}Kernel) relies on this count
+  // to map projection p -> feature p.
+  return num_numerical_features;
+#endif
+
+#ifdef PAIR_PROJ
+  // PAIR_PROJ: 2 * num_numerical_features projections. The first N are
+  // axis-aligned (one per column, projection p -> feature p); the next N are
+  // random pairs of 2 distinct features. All weights are 1.0. The GPU projection
+  // sampler keys its per-projection feature counts and the CSR layout on this
+  // total (N counts of 1 then N counts of 2 per node).
+  return 2 * num_numerical_features;
+#endif
+
+#ifdef PAIR_PROJ_GROUPED
+  // PAIR_PROJ_GROUPED: same 2 * num_numerical_features projections as PAIR_PROJ
+  // (N axis-aligned + N random pairs), but reordered so each pair sits right after
+  // the axis-aligned projection of its lower feature. The GPU sampler rebuilds the
+  // per-node grouping to place counts/features; the total is unchanged.
+  return 2 * num_numerical_features;
+#endif
 
   switch (dt_config.split_axis_case()) {
     case proto::DecisionTreeTrainingConfig::kSparseObliqueSplit: {

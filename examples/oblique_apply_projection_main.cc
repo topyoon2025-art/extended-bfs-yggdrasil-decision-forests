@@ -68,9 +68,9 @@ ABSL_FLAG(std::string, ensemble_method, "Bagging",
 ABSL_FLAG(float, shrinkage, 0.1f,
           "Learning rate for boosting (only used when ensemble_method = 'Boosting').");         
 
-ABSL_FLAG(bool, bootstrap_training_dataset, false,
+ABSL_FLAG(bool, bootstrap_training_dataset, true,
           "Whether to use bootstrap sampling of the training dataset (Bagging only). NOTE: NO BOOTSTRAP USES ~50% MORE MEMORY. POSSIBLE BUG");
-ABSL_FLAG(bool, sampling_with_replacement, true,
+ABSL_FLAG(bool, sampling_with_replacement, false,
           "Bagging only, requires bootstrap_training_dataset=true. true: sample WITH "
           "replacement (classic bootstrap). false: sample WITHOUT replacement a "
           "bootstrap_size_ratio fraction of rows (ratio>=1 => all rows once).");

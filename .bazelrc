@@ -59,6 +59,18 @@ build:offsets_only --define=offsets_only=true
 #   --config=node_id_drsw --config=offsets_only --config=scattered_label_hist
 build:scattered_label_hist --define=scattered_label_hist=true
 
+# NODE_ID_SRDW_PROJ: the SRDW baseline projection kernel (ColumnAddProjectionKernel_
+# SRDW_1_2D: node-sorted gather via d_selected_examples, coalesced writes) on top of
+# node-id/offset example management + the scattered-label histogram. The offsets
+# scatter (ComputeOffsetsOnly) additionally writes d_selected_examples[slot] = row,
+# so the SRDW kernel has its sorted row list without a separate rebuild; split
+# update (NodeIdDRSW_SplitUpdate) and histogram (BuildHistogramSRDWLabelsKernel)
+# are unchanged. Projected layout is identical to the DRSW ProjectionOnly path, so
+# trees match. Isolates the projection kernel (SRDW vs DRSW) in an A/B. Use:
+#   --config=node_id_drsw --config=offsets_only --config=scattered_label_hist \
+#   --config=nid_srdw_proj
+build:nid_srdw_proj --define=nid_srdw_proj=true
+
 # SYMMETRIC_PROJ: make the sampled oblique projections symmetric across nodes
 # per depth. All nodes at a given depth share the SAME set of num_proj
 # projections (identical features + weights) instead of each node independently
@@ -67,6 +79,51 @@ build:scattered_label_hist --define=scattered_label_hist=true
 # both the CPU sampler and --config=gpu_sample_proj (the GPU kernels seed curand
 # by proj_id only instead of by the (node, proj) segment id).
 build:symmetric_proj --define=symmetric_proj=true
+
+# AXIS_ALIGNED: replace the sampled sparse-oblique projections with one
+# axis-aligned projection per numerical feature. num_proj becomes
+# num_numerical_features (every column), and each projection selects a single
+# column with weight 1.0, so every node evaluates an exhaustive axis-aligned
+# split search each depth instead of random oblique directions. Reuses the GPU
+# projection/apply/histogram pipeline, so it requires --config=gpu_sample_proj
+# (on by default); run with --feature_split_type=Oblique so the sparse-oblique
+# config (density/normalization) is still populated.
+build:axis_aligned --define=axis_aligned=true
+
+# PAIR_PROJ: num_proj becomes 2 * num_numerical_features. The first N projections
+# are axis-aligned (one per column, projection p -> feature p, weight 1.0); the
+# next N are random pairs of 2 distinct features (each weight 1.0, times the norm
+# factor). So every node tests all N single-column splits plus N random 2-feature
+# oblique directions each depth. Like AXIS_ALIGNED it rides the GPU projection
+# pipeline (requires --config=gpu_sample_proj, on by default) and is used with
+# --feature_split_type=Oblique. Mutually exclusive with --config=axis_aligned.
+build:pair_proj --define=pair_proj=true
+
+# PAIR_PROJ_GROUPED: same 2N projections as PAIR_PROJ (N axis-aligned + N random
+# 2-feature pairs, identical draws), but REORDERED so each pair is placed right
+# after the axis-aligned projection of its lower feature. Group sizes vary per
+# feature; the GPU sampler rebuilds the per-node grouping and updates the CSR
+# offsets accordingly. Pure layout change (same candidate set / tree as pair_proj)
+# for projection-apply cache locality. Rides the GPU projection pipeline (requires
+# --config=gpu_sample_proj, on by default), used with --feature_split_type=Oblique.
+# Mutually exclusive with --config=axis_aligned and --config=pair_proj.
+build:pair_proj_grouped --define=pair_proj_grouped=true
+
+# PAIR_PROJ_FUSED: on top of PAIR_PROJ_GROUPED, fuse each group's projections in
+# the node-id DRSW projection kernel: one thread per (row, group) loads the row's
+# node id/offset and the shared anchor column x_f once, then computes axis(f) and
+# every (f, hi) pair, instead of one thread per (row, projection) re-reading them.
+# Same sums in the same order -> identical projected values / tree. Requires
+# --config=pair_proj_grouped --config=node_id_drsw (+ offsets_only etc.).
+build:pair_proj_fused --define=pair_proj_fused=true
+
+# PAIR_PROJ_CYCLIC: with --config=pair_proj or --config=pair_proj_grouped, replace
+# the random pairs with fixed cyclic pairs (f, f+1 mod N): columns A,B,C,D give
+# pairs AB, BC, CD, DA. Identical for every node (deterministic, no curand).
+#   pair_proj          -> [A, B, C, D, AB, BC, CD, DA]
+#   pair_proj_grouped  -> [A, AB, B, BC, C, CD, D, DA]  (every group = 2 projections)
+#   + pair_proj_fused  -> one thread per (row, group) computes both
+build:pair_proj_cyclic --define=pair_proj_cyclic=true
 
 # SPLIT_SMEM: NODE_ID_DRSW split-update accumulation of child counts + per-class
 # counts. ON (default) = shared-memory block reduction (flush once per block);

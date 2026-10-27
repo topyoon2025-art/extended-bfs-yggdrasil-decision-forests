@@ -5585,6 +5585,12 @@ absl::Status GrowTreeLocalBFS(
     max_features_per_proj = std::min(max_features_per_proj,
         dt_config.sparse_oblique_split().max_num_features());
   max_features_per_proj = std::max(max_features_per_proj, 1);
+#if defined(PAIR_PROJ) || defined(PAIR_PROJ_GROUPED)
+  // PAIR_PROJ / PAIR_PROJ_GROUPED write up to 2 features per projection (see
+  // SampleProjectionFillKernel); the flat-projection buffers must reserve space
+  // for 2 even if the configured density would round down to 1.
+  max_features_per_proj = std::max(max_features_per_proj, 2);
+#endif
   const size_t max_proj_nnz = static_cast<size_t>(max_nodes) *
       max_num_proj * max_features_per_proj;
 
@@ -5910,6 +5916,43 @@ not rebuild."
 #error "NODE_ID_DRSW_SCATTERED_LABEL_HIST and NODE_ID_DRSW_SRDW_HIST are mutually \
 exclusive (both choose the histogram kernel)."
 #endif
+#if defined(NODE_ID_SRDW_PROJ) && !defined(NODE_ID_DRSW_SCATTERED_LABEL_HIST)
+#error "NODE_ID_SRDW_PROJ requires NODE_ID_DRSW + OFFSETS_ONLY + \
+NODE_ID_DRSW_SCATTERED_LABEL_HIST (--config=node_id_drsw --config=offsets_only \
+--config=scattered_label_hist --config=nid_srdw_proj)."
+#endif
+#if defined(AXIS_ALIGNED) && !defined(GPU_SAMPLE_PROJ)
+#error "AXIS_ALIGNED requires GPU_SAMPLE_PROJ (--config=gpu_sample_proj): the \
+axis-aligned-per-column projections are produced by the GPU sampler kernels; the \
+CPU SampleProjection path still samples random sparse projections."
+#endif
+#if defined(PAIR_PROJ) && !defined(GPU_SAMPLE_PROJ)
+#error "PAIR_PROJ requires GPU_SAMPLE_PROJ (--config=gpu_sample_proj): the \
+2-random-features-per-projection scheme is produced by the GPU sampler kernels; the \
+CPU SampleProjection path still samples random sparse projections."
+#endif
+#if defined(PAIR_PROJ_GROUPED) && !defined(GPU_SAMPLE_PROJ)
+#error "PAIR_PROJ_GROUPED requires GPU_SAMPLE_PROJ (--config=gpu_sample_proj): the \
+grouped 2-feature projection layout is produced by the GPU sampler kernels; the \
+CPU SampleProjection path still samples random sparse projections."
+#endif
+#if defined(PAIR_PROJ_CYCLIC) && !defined(PAIR_PROJ) && !defined(PAIR_PROJ_GROUPED)
+#error "PAIR_PROJ_CYCLIC modifies PAIR_PROJ / PAIR_PROJ_GROUPED: add \
+--config=pair_proj or --config=pair_proj_grouped."
+#endif
+#if defined(PAIR_PROJ_FUSED) && !defined(PAIR_PROJ_GROUPED)
+#error "PAIR_PROJ_FUSED requires PAIR_PROJ_GROUPED (--config=pair_proj_grouped): it \
+fuses the grouped layout's projections."
+#endif
+#if defined(PAIR_PROJ_FUSED) && defined(USE_DRSW) && !defined(NODE_ID_DRSW)
+#error "PAIR_PROJ_FUSED has no fused form of the non-node-id DRSW_1 kernel \
+(--config=drsw); use node_id_drsw (DRSW fused) or the SRDW paths (SRDW fused)."
+#endif
+#if (defined(AXIS_ALIGNED) + defined(PAIR_PROJ) + defined(PAIR_PROJ_GROUPED)) > 1
+#error "AXIS_ALIGNED, PAIR_PROJ and PAIR_PROJ_GROUPED are mutually exclusive (each \
+overrides num_proj and the GPU projection sampler): pick one of \
+--config=axis_aligned / --config=pair_proj / --config=pair_proj_grouped."
+#endif
 #ifdef NODE_ID_DRSW
       if (!node_id_drsw_initialized) {
         NodeIdDRSW_Init_wrap(d_selected_examples, d_node_row_off,
@@ -5932,6 +5975,10 @@ exclusive (both choose the histogram kernel)."
               nullptr,
 #endif
               d_labels_scattered, d_dup_scattered
+#endif
+#ifdef NODE_ID_SRDW_PROJ
+            // Also rebuild the node-sorted row list for SRDW_1_2D projection.
+            , d_selected_examples
 #endif
             );
 #else
@@ -5978,7 +6025,28 @@ exclusive (both choose the histogram kernel)."
       double prefix_sum_ms = ms_between(t_prefix_sum_start, t_prefix_sum_end);
       total_prefix_sum_ms += prefix_sum_ms;
 
-#if defined(NODE_ID_DRSW)
+#if defined(NODE_ID_SRDW_PROJ)
+      // SRDW baseline projection over the d_selected_examples rebuilt by the
+      // offsets scatter; same SRDW projected layout as NodeIdDRSW_ProjectionOnly.
+      
+#ifdef PAIR_PROJ_FUSED
+      ColumnAddProjectionKernel_SRDW_PairFused_wrap(d_flat_data,
+#else
+      ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data,
+#endif
+                                              d_selected_examples,
+                                              d_col_add_projected,
+                                              d_offset,
+                                              d_flat_projection_col_idx,
+                                              d_flat_projection_weights,
+                                              d_node_row_off,
+                                              d_node_block_off,
+                                              num_nodes,
+                                              num_proj,
+                                              num_rows,
+                                              total_rows,
+                                              total_node_blocks);
+#elif defined(NODE_ID_DRSW)
       // --- Compare DRSW vs SRDW at depth 6, preserving node_id/offset arrays ---
       // Diagnostic ONLY; off by default (enable with PROJ_COMPARE_AB=1). It runs
       // warmup+bench iterations of both projection kernels plus a full-buffer D2H
@@ -6070,7 +6138,11 @@ exclusive (both choose the histogram kernel)."
         cudaFree(d_drsw_buf);
       } else {
         // Normal path: use DRSW projection
+#ifdef PAIR_PROJ_FUSED
+        NodeIdDRSW_ProjectionPairFused_wrap(d_flat_data,
+#else
         NodeIdDRSW_ProjectionOnly_wrap(d_flat_data,
+#endif
                                        d_col_add_projected,
                                        d_node_ids,
                                        d_node_offsets,
@@ -6097,7 +6169,12 @@ exclusive (both choose the histogram kernel)."
                                             num_nodes,
                                             total_rows);
 #else
+      
+#ifdef PAIR_PROJ_FUSED
+      ColumnAddProjectionKernel_SRDW_PairFused_wrap(d_flat_data,
+#else
       ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data,
+#endif
                                               d_selected_examples,
                                               d_col_add_projected,
                                               d_offset,

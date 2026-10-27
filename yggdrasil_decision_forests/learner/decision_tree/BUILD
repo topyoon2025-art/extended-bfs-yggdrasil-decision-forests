@@ -27,7 +27,13 @@ config_setting(name = "use_drsw_on", define_values = {"use_drsw": "true"})
 config_setting(name = "node_id_drsw_on", define_values = {"node_id_drsw": "true"})
 config_setting(name = "nid_srdw_hist_on", define_values = {"nid_srdw_hist": "true"})
 config_setting(name = "scattered_label_hist_on", define_values = {"scattered_label_hist": "true"})
+config_setting(name = "nid_srdw_proj_on", define_values = {"nid_srdw_proj": "true"})
 config_setting(name = "symmetric_proj_on", define_values = {"symmetric_proj": "true"})
+config_setting(name = "axis_aligned_on", define_values = {"axis_aligned": "true"})
+config_setting(name = "pair_proj_on", define_values = {"pair_proj": "true"})
+config_setting(name = "pair_proj_grouped_on", define_values = {"pair_proj_grouped": "true"})
+config_setting(name = "pair_proj_fused_on", define_values = {"pair_proj_fused": "true"})
+config_setting(name = "pair_proj_cyclic_on", define_values = {"pair_proj_cyclic": "true"})
 config_setting(name = "offsets_only_on", define_values = {"offsets_only": "true"})
 config_setting(name = "split_smem_on", define_values = {"split_smem": "true"})
 config_setting(name = "verbose_depth_on", define_values = {"verbose_depth": "true"})
@@ -82,7 +88,25 @@ cuda_library(
         ":scattered_label_hist_on": ["-DNODE_ID_DRSW_SCATTERED_LABEL_HIST=1"],
         "//conditions:default": [],
     }) + select({
+        ":nid_srdw_proj_on": ["-DNODE_ID_SRDW_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
         ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":axis_aligned_on": ["-DAXIS_ALIGNED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_on": ["-DPAIR_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_grouped_on": ["-DPAIR_PROJ_GROUPED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_fused_on": ["-DPAIR_PROJ_FUSED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_cyclic_on": ["-DPAIR_PROJ_CYCLIC=1"],
         "//conditions:default": [],
     }) + select({
         ":split_smem_on": ["-DSPLIT_SMEM=1"],
@@ -195,7 +219,25 @@ cc_library_ydf(
         ":scattered_label_hist_on": ["-DNODE_ID_DRSW_SCATTERED_LABEL_HIST=1"],
         "//conditions:default": [],
     }) + select({
+        ":nid_srdw_proj_on": ["-DNODE_ID_SRDW_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
         ":symmetric_proj_on": ["-DSYMMETRIC_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":axis_aligned_on": ["-DAXIS_ALIGNED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_on": ["-DPAIR_PROJ=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_grouped_on": ["-DPAIR_PROJ_GROUPED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_fused_on": ["-DPAIR_PROJ_FUSED=1"],
+        "//conditions:default": [],
+    }) + select({
+        ":pair_proj_cyclic_on": ["-DPAIR_PROJ_CYCLIC=1"],
         "//conditions:default": [],
     }) + select({
         ":offsets_only_on": ["-DOFFSETS_ONLY=1"],

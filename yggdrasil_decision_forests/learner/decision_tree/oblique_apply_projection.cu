@@ -9,6 +9,7 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>  // DEDUP_BOOTSTRAP: for thrust::unique
 #include <cfloat>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -518,6 +519,48 @@ __device__ int sample_binomial(curandStatePhilox4_32_10_t* state, int n, float p
     return count;
 }
 
+#ifdef PAIR_PROJ_GROUPED
+// PAIR_PROJ_GROUPED reuses the exact same random pairs as PAIR_PROJ (so it is a
+// pure reordering that yields the identical candidate set / tree), then lays each
+// pair out right after the axis-aligned projection of its LOWER feature. The pair
+// order is data-dependent, so both the count and fill kernels reconstruct a
+// node's grouping on the fly. These helpers draw a pair deterministically from
+// the same curand stream PAIR_PROJ's fill kernel used for the pair at ungrouped
+// proj_id (num_features + j).
+
+// curand subsequence for pair j of a node, matching PAIR_PROJ's pair-half segment
+// (ungrouped proj_id = num_features + j). Under SYMMETRIC_PROJ all nodes share a
+// pair set, so the stream keys on the proj_id alone.
+__device__ __forceinline__ unsigned long long PairProjGroupedSubseq(
+    int node_id, int num_proj, int num_features, int j) {
+#ifdef SYMMETRIC_PROJ
+    return (unsigned long long)(num_features + j);
+#else
+    return (unsigned long long)node_id * num_proj + (num_features + j);
+#endif
+}
+
+// Draw pair j's two distinct features, returned sorted (f_lo < f_hi). The draw
+// sequence mirrors PAIR_PROJ's fill kernel so the pairs are bit-identical.
+__device__ __forceinline__ void PairProjGroupedDrawPair(
+    unsigned long long seed, int node_id, int num_proj, int num_features, int j,
+    int* f_lo, int* f_hi) {
+    curandStatePhilox4_32_10_t st;
+    curand_init(seed, PairProjGroupedSubseq(node_id, num_proj, num_features, j),
+                0ULL, &st);
+    int f1 = (int)(curand_uniform(&st) * num_features);
+    if (f1 >= num_features) f1 = num_features - 1;
+    int f2 = (int)(curand_uniform(&st) * num_features);
+    if (f2 >= num_features) f2 = num_features - 1;
+    while (f2 == f1) {
+        f2 = (int)(curand_uniform(&st) * num_features);
+        if (f2 >= num_features) f2 = num_features - 1;
+    }
+    *f_lo = f1 < f2 ? f1 : f2;
+    *f_hi = f1 < f2 ? f2 : f1;
+}
+#endif
+
 template <int BLOCK>
 __global__ void SampleProjectionCountKernel(
     int* __restrict__ d_proj_counts,
@@ -530,6 +573,69 @@ __global__ void SampleProjectionCountKernel(
 {
     int seg_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (seg_id >= num_segments) return;
+
+#ifdef AXIS_ALIGNED
+    // AXIS_ALIGNED: every projection is a single axis-aligned column, so the
+    // count is always 1 (no binomial sampling). num_proj == num_features and
+    // SampleProjectionFillKernel maps proj_id -> feature proj_id.
+    d_proj_counts[seg_id] = 1;
+    return;
+#endif
+
+#ifdef PAIR_PROJ
+    // PAIR_PROJ: num_proj == 2 * num_features. The first num_features projections
+    // (proj_id in [0, num_features)) are axis-aligned (1 feature each); the next
+    // num_features (proj_id in [num_features, 2*num_features)) are random
+    // 2-feature pairs. Counts are deterministic either way, so the CSR offsets do
+    // not depend on curand.
+    {
+        const int proj_id = seg_id % num_proj;
+        d_proj_counts[seg_id] =
+            (proj_id < num_features) ? 1 : ((num_features < 2) ? 1 : 2);
+    }
+    return;
+#endif
+
+#if defined(PAIR_PROJ_GROUPED) && defined(PAIR_PROJ_CYCLIC)
+    // PAIR_PROJ_CYCLIC + GROUPED: fixed pairs (f, f+1 mod N), so every group is
+    // exactly [axis(f), pair(f, f+1)]: even slots hold 1 feature, odd slots 2.
+    {
+        const int s = seg_id % num_proj;
+        d_proj_counts[seg_id] = (num_features < 2 || s % 2 == 0) ? 1 : 2;
+    }
+    return;
+#endif
+
+#ifdef PAIR_PROJ_GROUPED
+    // PAIR_PROJ_GROUPED: num_proj == 2 * num_features. Per node the layout is, for
+    // each feature f in ascending order: axis-aligned(f) (count 1) followed by all
+    // pairs whose lower feature is f (count 2 each). This slot's count depends on
+    // where it falls in that grouping, so walk the groups until slot s is covered.
+    {
+        const int N = num_features;
+        if (N < 2) { d_proj_counts[seg_id] = 1; return; }
+        const int node_id = seg_id / num_proj;
+        const int s = seg_id % num_proj;  // output slot within the node
+        int slot_base = 0;
+        int result_count = 2;
+        for (int f = 0; f < N; ++f) {
+            int cntf = 0;  // pairs anchored (lower feature) at f
+            for (int j = 0; j < N; ++j) {
+                int lo, hi;
+                PairProjGroupedDrawPair(seed, node_id, num_proj, N, j, &lo, &hi);
+                if (lo == f) cntf++;
+            }
+            const int group_len = 1 + cntf;
+            if (s < slot_base + group_len) {
+                result_count = (s == slot_base) ? 1 : 2;  // axis slot vs pair slot
+                break;
+            }
+            slot_base += group_len;
+        }
+        d_proj_counts[seg_id] = result_count;
+    }
+    return;
+#endif
 
     // Segments are laid out as seg_id = node_id * num_proj + proj_id. Under
     // SYMMETRIC_PROJ every node shares the same set of projections, so the
@@ -570,6 +676,105 @@ __global__ void SampleProjectionFillKernel(
     int seg_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (seg_id >= num_segments) return;
 
+#ifdef AXIS_ALIGNED
+    // AXIS_ALIGNED: projection p (= seg_id % num_proj) is the axis-aligned split
+    // on feature p with weight 1.0. num_proj == num_features so every column is
+    // covered exactly once per node; no curand / Floyd sampling needed. The norm
+    // factor is applied for parity with the oblique single-feature case (it only
+    // rescales the threshold, not the ordering of a single-column split).
+    {
+        const int proj_id = seg_id % num_proj;
+        const int feat_pos = proj_id;  // one projection per column
+        const int ydf_attr = d_numerical_features[feat_pos];
+        const int flat_col = d_attr_to_flat_col[ydf_attr];
+        const int write_base = d_offset[seg_id];
+        d_flat_projection_col_idx[write_base] = flat_col;
+        d_flat_projection_attr_idx[write_base] = ydf_attr;
+        d_flat_projection_weights[write_base] = 1.0f * d_norm_factors[feat_pos];
+    }
+    return;
+#endif
+
+#if defined(PAIR_PROJ_GROUPED) && defined(PAIR_PROJ_CYCLIC)
+    // PAIR_PROJ_CYCLIC + GROUPED: slot 2f = axis(f), slot 2f+1 = pair
+    // (f, (f+1) mod N), stored anchor-first. Identical for every node.
+    {
+        const int N = num_features;
+        const int write_base = d_offset[seg_id];
+        const int s = seg_id % num_proj;
+        const int f = (N < 2) ? 0 : s / 2;
+        const bool is_pair = (N >= 2) && (s % 2 == 1);
+        const int feats[2] = {f, (f + 1) % (N > 0 ? N : 1)};
+        for (int i = 0; i < (is_pair ? 2 : 1); ++i) {
+            const int ydf_attr = d_numerical_features[feats[i]];
+            d_flat_projection_col_idx[write_base + i] = d_attr_to_flat_col[ydf_attr];
+            d_flat_projection_attr_idx[write_base + i] = ydf_attr;
+            d_flat_projection_weights[write_base + i] = 1.0f * d_norm_factors[feats[i]];
+        }
+    }
+    return;
+#endif
+
+#ifdef PAIR_PROJ_GROUPED
+    // PAIR_PROJ_GROUPED: reorder of PAIR_PROJ's projections. Per node, for each
+    // feature f ascending: axis-aligned(f) then every pair whose lower feature is
+    // f (ascending pair index). All weights 1.0 (* norm). Reconstruct the grouping
+    // to find what this slot holds, matching SampleProjectionCountKernel exactly so
+    // the CSR offsets line up.
+    {
+        const int N = num_features;
+        const int write_base = d_offset[seg_id];
+        if (N < 2) {
+            const int ydf_attr = d_numerical_features[0];
+            d_flat_projection_col_idx[write_base] = d_attr_to_flat_col[ydf_attr];
+            d_flat_projection_attr_idx[write_base] = ydf_attr;
+            d_flat_projection_weights[write_base] = 1.0f * d_norm_factors[0];
+            return;
+        }
+        const int node_id = seg_id / num_proj;
+        const int s = seg_id % num_proj;
+        int slot_base = 0;
+        for (int f = 0; f < N; ++f) {
+            int cntf = 0;
+            for (int j = 0; j < N; ++j) {
+                int lo, hi;
+                PairProjGroupedDrawPair(seed, node_id, num_proj, N, j, &lo, &hi);
+                if (lo == f) cntf++;
+            }
+            const int group_len = 1 + cntf;
+            if (s < slot_base + group_len) {
+                const int within = s - slot_base;
+                if (within == 0) {
+                    // axis-aligned(f)
+                    const int ydf_attr = d_numerical_features[f];
+                    d_flat_projection_col_idx[write_base] = d_attr_to_flat_col[ydf_attr];
+                    d_flat_projection_attr_idx[write_base] = ydf_attr;
+                    d_flat_projection_weights[write_base] = 1.0f * d_norm_factors[f];
+                } else {
+                    // the (within-1)-th pair anchored at f, in ascending pair index
+                    const int target = within - 1;
+                    int k = 0, lo = f, hi = f;
+                    for (int j = 0; j < N; ++j) {
+                        int l, h;
+                        PairProjGroupedDrawPair(seed, node_id, num_proj, N, j, &l, &h);
+                        if (l == f) { if (k == target) { lo = l; hi = h; break; } k++; }
+                    }
+                    const int feats[2] = {lo, hi};
+                    for (int i = 0; i < 2; ++i) {
+                        const int ydf_attr = d_numerical_features[feats[i]];
+                        d_flat_projection_col_idx[write_base + i] = d_attr_to_flat_col[ydf_attr];
+                        d_flat_projection_attr_idx[write_base + i] = ydf_attr;
+                        d_flat_projection_weights[write_base + i] = 1.0f * d_norm_factors[feats[i]];
+                    }
+                }
+                break;
+            }
+            slot_base += group_len;
+        }
+    }
+    return;
+#endif
+
     // Match SampleProjectionCountKernel's stream keying: under SYMMETRIC_PROJ
     // all nodes sharing a proj_id draw the identical feature set + weights.
 #ifdef SYMMETRIC_PROJ
@@ -579,6 +784,72 @@ __global__ void SampleProjectionFillKernel(
 #endif
     curandStatePhilox4_32_10_t state;
     curand_init(seed, subseq, 0ULL, &state);
+
+#ifdef PAIR_PROJ
+    // PAIR_PROJ: num_proj == 2 * num_features, split into two halves by proj_id.
+    //   proj_id in [0, num_features):           axis-aligned on feature proj_id.
+    //   proj_id in [num_features, 2*num_features): 2 distinct random features.
+    // Every selected feature gets weight 1.0 (times the norm factor). The count
+    // is deterministic (SampleProjectionCountKernel), so this segment's CSR slot
+    // holds exactly 1 (axis-aligned) or 2 (pair) entries. The pair half reuses
+    // the curand stream keyed above, so SYMMETRIC_PROJ (shared pairs across a
+    // depth) still composes; the axis-aligned half ignores it.
+    {
+        const int proj_id = seg_id % num_proj;
+        const int write_base = d_offset[seg_id];
+
+        if (proj_id < num_features) {
+            // Axis-aligned half: projection proj_id -> feature proj_id.
+            const int feat_pos = proj_id;
+            const int ydf_attr = d_numerical_features[feat_pos];
+            d_flat_projection_col_idx[write_base] = d_attr_to_flat_col[ydf_attr];
+            d_flat_projection_attr_idx[write_base] = ydf_attr;
+            d_flat_projection_weights[write_base] = 1.0f * d_norm_factors[feat_pos];
+            return;
+        }
+
+#ifdef PAIR_PROJ_CYCLIC
+        // PAIR_PROJ_CYCLIC: pair j = (j, (j+1) mod N), no curand. Same for every
+        // node; layout [A, B, ..., AB, BC, ..., (N-1)A].
+        if (num_features >= 2) {
+            const int j = proj_id - num_features;
+            const int feats[2] = {j, (j + 1) % num_features};
+            for (int i = 0; i < 2; i++) {
+                const int ydf_attr = d_numerical_features[feats[i]];
+                d_flat_projection_col_idx[write_base + i] = d_attr_to_flat_col[ydf_attr];
+                d_flat_projection_attr_idx[write_base + i] = ydf_attr;
+                d_flat_projection_weights[write_base + i] = 1.0f * d_norm_factors[feats[i]];
+            }
+            return;
+        }
+#endif
+        // Pair half: 2 distinct uniformly-random features.
+        int f1 = (int)(curand_uniform(&state) * num_features);
+        if (f1 >= num_features) f1 = num_features - 1;
+        if (num_features < 2) {
+            const int ydf_attr = d_numerical_features[f1];
+            d_flat_projection_col_idx[write_base] = d_attr_to_flat_col[ydf_attr];
+            d_flat_projection_attr_idx[write_base] = ydf_attr;
+            d_flat_projection_weights[write_base] = 1.0f * d_norm_factors[f1];
+            return;
+        }
+        int f2 = (int)(curand_uniform(&state) * num_features);
+        if (f2 >= num_features) f2 = num_features - 1;
+        while (f2 == f1) {
+            f2 = (int)(curand_uniform(&state) * num_features);
+            if (f2 >= num_features) f2 = num_features - 1;
+        }
+        const int feats[2] = {f1, f2};
+        for (int i = 0; i < 2; i++) {
+            const int feat_pos = feats[i];
+            const int ydf_attr = d_numerical_features[feat_pos];
+            d_flat_projection_col_idx[write_base + i] = d_attr_to_flat_col[ydf_attr];
+            d_flat_projection_attr_idx[write_base + i] = ydf_attr;
+            d_flat_projection_weights[write_base + i] = 1.0f * d_norm_factors[feat_pos];
+        }
+    }
+    return;
+#endif
 
     int raw_count = sample_binomial(&state, num_features, projection_density);
     bool forced_single = (raw_count <= 0);
@@ -2232,6 +2503,198 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
     CUDA_CHECK(cudaEventDestroy(e1));
 }
 
+#ifdef PAIR_PROJ_FUSED
+// PAIR_PROJ_FUSED: per node, record where each PAIR_PROJ_GROUPED group starts.
+// A group is axis-aligned(f) (the only 1-entry projections) followed by the
+// pairs anchored at f, so every 1-entry slot opens a new group. One thread per
+// node; group_start[node * (G + 1) + g] = first slot of group g, [.. + G] =
+// num_proj.
+__global__ void PairProjFused_GroupStartKernel(
+        const int* __restrict__ col_offset,
+        int*       __restrict__ group_start,
+        int num_proj,
+        int num_groups,
+        int num_nodes)
+{
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= num_nodes) return;
+    int* gs = group_start + (long long)node * (num_groups + 1);
+    int g = 0;
+    for (int s = 0; s < num_proj && g < num_groups; ++s) {
+        const int seg = node * num_proj + s;
+        if (col_offset[seg + 1] - col_offset[seg] == 1) gs[g++] = s;
+    }
+    for (; g <= num_groups; ++g) gs[g] = num_proj;
+}
+
+// Verification for the fused projection kernels (env PAIR_FUSED_VERIFY=1):
+// after the fused kernel writes `fused`, the caller re-runs the unfused kernel
+// into a scratch buffer; this compares the two bit-for-bit over every used
+// slot (total_rows * num_proj values) and prints the mismatch count.
+static bool PairFusedVerifyEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PAIR_FUSED_VERIFY");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+static void PairFusedVerifyCompare(const char* tag, const float* d_fused,
+                                   const float* d_ref, size_t n, int num_nodes) {
+    std::vector<float> a(n), b(n);
+    CUDA_CHECK(cudaMemcpy(a.data(), d_fused, n * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(b.data(), d_ref, n * sizeof(float), cudaMemcpyDeviceToHost));
+    size_t mismatches = 0, first = n;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+            if (first == n) first = i;
+            ++mismatches;
+        }
+    }
+    std::cerr << "PAIR_FUSED_VERIFY " << tag << " nodes=" << num_nodes
+              << " values=" << n << " mismatches=" << mismatches;
+    if (mismatches) std::cerr << " first_idx=" << first << " fused=" << a[first]
+                              << " ref=" << b[first];
+    std::cerr << "\n";
+}
+static float* PairFusedVerifyScratch(size_t n) {
+    static float* buf = nullptr;
+    static size_t cap = 0;
+    if (n > cap) {
+        if (buf) cudaFree(buf);
+        CUDA_CHECK(cudaMalloc(&buf, n * sizeof(float)));
+        cap = n;
+    }
+    return buf;
+}
+
+// Builds (once per depth) the per-node group-start table used by both fused
+// projection kernels (DRSW and SRDW). Buffer is a grow-once static.
+const int* PairProjFused_BuildGroupStart(const int* d_offset, int num_proj,
+                                         int num_groups, int num_nodes) {
+    static int* d_group_start = nullptr;
+    static size_t group_start_capacity = 0;
+    const size_t need = static_cast<size_t>(num_nodes) * (num_groups + 1);
+    if (need > group_start_capacity) {
+        if (d_group_start) cudaFree(d_group_start);
+        CUDA_CHECK(cudaMalloc(&d_group_start, need * sizeof(int)));
+        group_start_capacity = need;
+    }
+    constexpr int BLOCK = 256;
+    PairProjFused_GroupStartKernel<<<(num_nodes + BLOCK - 1) / BLOCK, BLOCK>>>(
+        d_offset, d_group_start, num_proj, num_groups, num_nodes);
+    CUDA_CHECK(cudaGetLastError());
+    return d_group_start;
+}
+
+// PAIR_PROJ_FUSED, SRDW form: same 2D compacted grid as
+// ColumnAddProjectionKernel_SRDW_1_2D, but blockIdx.y is a group instead of a
+// projection. Each thread walks node-sorted slots, loads the slot's row id
+// (d_selected_examples) and the anchor column x_f once, then evaluates every
+// projection of the group and writes them coalesced in SRDW layout. Terms are
+// summed in the same order as the unfused kernel, so values are bit-identical.
+template <int BLOCK>
+__global__ void ColumnAddProjectionKernel_SRDW_PairFused(
+        const float*        __restrict__ dataset,
+        const int*          __restrict__ d_selected_examples,
+        float*              __restrict__ projected,
+        const int*          __restrict__ col_offset,
+        const int*          __restrict__ flat_col_data,
+        const float*        __restrict__ flat_weights,
+        const int*          __restrict__ node_row_off,
+        const int*          __restrict__ node_block_off,
+        const int*          __restrict__ group_start,
+        int                 num_groups,
+        int                 num_nodes,
+        int                 num_proj,
+        int                 num_rows)
+{
+    const int g = blockIdx.y;
+    const int node_id = cub::UpperBound(node_block_off, num_nodes + 1, (int)blockIdx.x) - 1;
+    const int local_bx = blockIdx.x - node_block_off[node_id];
+    const int blocks_this_node = node_block_off[node_id + 1] - node_block_off[node_id];
+    const int local_row = local_bx * blockDim.x + threadIdx.x;
+    const int row_stride = blocks_this_node * blockDim.x;
+
+    const int row_start = node_row_off[node_id];
+    const int rows_node = node_row_off[node_id + 1] - row_start;
+
+    const int* gs = group_start + (long long)node_id * (num_groups + 1);
+    const int p_begin = gs[g];
+    const int p_end   = gs[g + 1];
+    if (p_begin >= p_end) return;
+    const int anchor_col = flat_col_data[col_offset[node_id * num_proj + p_begin]];
+    const long long node_base = (long long)row_start * num_proj;
+
+    for (int r = local_row; r < rows_node; r += row_stride)
+    {
+        const int ex_idx = d_selected_examples[row_start + r];
+        if (ex_idx < 0 || ex_idx >= num_rows) continue;
+        const float x_anchor =
+            dataset[static_cast<std::size_t>(anchor_col) * num_rows + ex_idx];
+        for (int p = p_begin; p < p_end; ++p) {
+            const int seg = node_id * num_proj + p;
+            const int begin = col_offset[seg];
+            const int end   = col_offset[seg + 1];
+            float sum = 0.0f;
+            for (int idx = begin; idx < end; ++idx) {
+                const int   col = flat_col_data[idx];
+                const float w   = flat_weights[idx];
+                const float x = (col == anchor_col)
+                    ? x_anchor
+                    : dataset[static_cast<std::size_t>(col) * num_rows + ex_idx];
+                sum += w * x;
+            }
+            projected[node_base + (long long)p * rows_node + r] = sum;
+        }
+    }
+}
+
+void ColumnAddProjectionKernel_SRDW_PairFused_wrap(
+    const float* d_flat_data,
+    int* d_selected_examples,
+    float* d_col_add_projected,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    const int* d_node_block_off,
+    int num_nodes,
+    int num_proj,
+    int num_rows,
+    int total_rows,
+    int total_blocks)
+{
+    if (num_proj < 2) {
+        ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data, d_selected_examples,
+            d_col_add_projected, d_offset, d_flat_projection_col_idx,
+            d_flat_projection_weights, d_node_row_off, d_node_block_off,
+            num_nodes, num_proj, num_rows, total_rows, total_blocks);
+        return;
+    }
+    const int num_groups = num_proj / 2;
+    const int* d_group_start =
+        PairProjFused_BuildGroupStart(d_offset, num_proj, num_groups, num_nodes);
+    constexpr int BLOCK = 256;
+    dim3 grid(total_blocks, num_groups);
+    ColumnAddProjectionKernel_SRDW_PairFused<BLOCK><<<grid, BLOCK>>>(
+        d_flat_data, d_selected_examples, d_col_add_projected, d_offset,
+        d_flat_projection_col_idx, d_flat_projection_weights, d_node_row_off,
+        d_node_block_off, d_group_start, num_groups, num_nodes, num_proj, num_rows);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (PairFusedVerifyEnabled()) {
+        const size_t n = static_cast<size_t>(total_rows) * num_proj;
+        float* d_ref = PairFusedVerifyScratch(n);
+        CUDA_CHECK(cudaMemset(d_ref, 0, n * sizeof(float)));
+        ColumnAddProjectionKernel_SRDW_1_2D_wrap(d_flat_data, d_selected_examples,
+            d_ref, d_offset, d_flat_projection_col_idx, d_flat_projection_weights,
+            d_node_row_off, d_node_block_off, num_nodes, num_proj, num_rows,
+            total_rows, total_blocks);
+        PairFusedVerifyCompare("SRDW", d_col_add_projected, d_ref, n, num_nodes);
+    }
+}
+#endif  // PAIR_PROJ_FUSED
+
 template<int BLOCK>
 __global__ void ColumnAddProjectionKernel_SRDW_2(
         const float*        __restrict__ dataset,
@@ -2715,6 +3178,10 @@ void NodeIdDRSW_ComputeOffsetsOnly_wrap(
     int* d_labels_scattered,
     int* d_dup_scattered
 #endif
+#ifdef NODE_ID_SRDW_PROJ
+    ,
+    int* d_selected_examples
+#endif
     )
 {
     NodeIdDRSW_ComputeOffsetsOnly(d_node_offsets, d_node_ids,
@@ -2722,6 +3189,9 @@ void NodeIdDRSW_ComputeOffsetsOnly_wrap(
                                    num_rows, num_nodes
 #ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
                                    , d_labels, d_dup, d_labels_scattered, d_dup_scattered
+#endif
+#ifdef NODE_ID_SRDW_PROJ
+                                   , d_selected_examples
 #endif
                                    );
 }
@@ -2750,6 +3220,123 @@ void NodeIdDRSW_ProjectionOnly_wrap(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+#ifdef PAIR_PROJ_FUSED
+// PAIR_PROJ_FUSED: DRSW projection with one thread per (row, group) instead of
+// per (row, projection). The thread loads the row's node id / offset and the
+// anchor column x_f once, then evaluates every projection of the group (axis(f)
+// and each (f, hi) pair), reusing x_f for the shared column. Entries are summed
+// in the same order as ColumnAddProjectionKernel_DRSW_1, so the output is
+// bit-identical and written to the same SRDW layout.
+__global__ void ColumnAddProjectionKernel_DRSW_PairFused(
+        const float*        __restrict__ dataset,
+        float*              __restrict__ projected,
+        const int*          __restrict__ node_ids,
+        const int*          __restrict__ node_offsets,
+        const int*          __restrict__ col_offset,
+        const int*          __restrict__ flat_col_data,
+        const float*        __restrict__ flat_weights,
+        const int*          __restrict__ node_row_off,
+        const int*          __restrict__ group_start,
+        int                 num_groups,
+        int                 num_proj,
+        int                 num_rows,
+        int                 num_nodes)
+{
+    const int g = blockIdx.y;
+    const int row_stride = gridDim.x * blockDim.x;
+    const int global_row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int r = global_row; r < num_rows; r += row_stride)
+    {
+        const int node_id = node_ids[r];
+        if (node_id < 0 || node_id >= num_nodes) continue;
+
+        const int row_start = node_row_off[node_id];
+        const int rows_node = node_row_off[node_id + 1] - row_start;
+        const int node_offset = node_offsets[r];
+
+        const int* gs = group_start + (long long)node_id * (num_groups + 1);
+        const int p_begin = gs[g];
+        const int p_end   = gs[g + 1];
+        if (p_begin >= p_end) continue;
+
+        const int seg0 = node_id * num_proj + p_begin;
+        const int anchor_col = flat_col_data[col_offset[seg0]];
+        const float x_anchor =
+            dataset[static_cast<std::size_t>(anchor_col) * num_rows + r];
+
+        const long long base = (long long)row_start * num_proj + node_offset;
+        for (int p = p_begin; p < p_end; ++p) {
+            const int seg = node_id * num_proj + p;
+            const int begin = col_offset[seg];
+            const int end   = col_offset[seg + 1];
+            float sum = 0.0f;
+            for (int idx = begin; idx < end; ++idx) {
+                const int   col = flat_col_data[idx];
+                const float w   = flat_weights[idx];
+                const float x = (col == anchor_col)
+                    ? x_anchor
+                    : dataset[static_cast<std::size_t>(col) * num_rows + r];
+                sum += w * x;
+            }
+            projected[base + (long long)p * rows_node] = sum;
+        }
+    }
+}
+
+void NodeIdDRSW_ProjectionPairFused_wrap(
+    const float* d_flat_data,
+    float* d_col_add_projected,
+    const int* d_node_ids,
+    const int* d_node_offsets,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    int num_proj,
+    int num_rows,
+    int num_nodes)
+{
+    // PAIR_PROJ_GROUPED has num_proj == 2 * num_features (one group per
+    // feature). Degenerate single-feature case (num_proj == 1): nothing to fuse.
+    if (num_proj < 2) {
+        NodeIdDRSW_ProjectionOnly_wrap(d_flat_data, d_col_add_projected,
+            d_node_ids, d_node_offsets, d_offset, d_flat_projection_col_idx,
+            d_flat_projection_weights, d_node_row_off, num_proj, num_rows,
+            num_nodes);
+        return;
+    }
+    const int num_groups = num_proj / 2;
+
+    const int* d_group_start =
+        PairProjFused_BuildGroupStart(d_offset, num_proj, num_groups, num_nodes);
+    constexpr int BLOCK = 256;
+
+    const int row_blocks = (num_rows + BLOCK - 1) / BLOCK;
+    dim3 grid(row_blocks, num_groups);
+    ColumnAddProjectionKernel_DRSW_PairFused<<<grid, BLOCK>>>(
+        d_flat_data, d_col_add_projected, d_node_ids, d_node_offsets,
+        d_offset, d_flat_projection_col_idx, d_flat_projection_weights,
+        d_node_row_off, d_group_start, num_groups, num_proj, num_rows,
+        num_nodes);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (PairFusedVerifyEnabled()) {
+        int total_rows = 0;  // used slots = node_row_off[num_nodes]
+        CUDA_CHECK(cudaMemcpy(&total_rows, d_node_row_off + num_nodes, sizeof(int),
+                              cudaMemcpyDeviceToHost));
+        const size_t n = static_cast<size_t>(total_rows) * num_proj;
+        float* d_ref = PairFusedVerifyScratch(n);
+        CUDA_CHECK(cudaMemset(d_ref, 0, n * sizeof(float)));
+        NodeIdDRSW_ProjectionOnly_wrap(d_flat_data, d_ref, d_node_ids,
+            d_node_offsets, d_offset, d_flat_projection_col_idx,
+            d_flat_projection_weights, d_node_row_off, num_proj, num_rows,
+            num_nodes);
+        PairFusedVerifyCompare("DRSW", d_col_add_projected, d_ref, n, num_nodes);
+    }
+}
+#endif  // PAIR_PROJ_FUSED
 
 NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
     int* d_node_ids,

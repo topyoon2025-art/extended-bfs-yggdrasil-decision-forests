@@ -234,6 +234,25 @@ void ColumnAddProjectionKernel_SRDW_1_2D_wrap(
     int total_rows,
     int total_blocks);
 
+#ifdef PAIR_PROJ_FUSED
+// PAIR_PROJ_FUSED, SRDW form: drop-in for ColumnAddProjectionKernel_SRDW_1_2D_wrap
+// under PAIR_PROJ_GROUPED; one thread per (slot, group).
+void ColumnAddProjectionKernel_SRDW_PairFused_wrap(
+    const float* d_flat_data,
+    int* d_selected_examples,
+    float* d_col_add_projected,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    const int* d_node_block_off,
+    int num_nodes,
+    int num_proj,
+    int num_rows,
+    int total_rows,
+    int total_blocks);
+#endif
+
 void ColumnAddProjectionKernel_DRSW_1_wrap(
     const float* d_flat_data,
     const int* d_selected_examples,
@@ -428,6 +447,10 @@ void NodeIdDRSW_ComputeOffsetsOnly_wrap(
     int* d_labels_scattered,
     int* d_dup_scattered
 #endif
+#ifdef NODE_ID_SRDW_PROJ
+    ,
+    int* d_selected_examples
+#endif
     );
 
 #ifdef NODE_ID_DRSW_SCATTERED_LABEL_HIST
@@ -462,6 +485,24 @@ void NodeIdDRSW_ProjectionOnly_wrap(
     int num_proj,
     int num_rows,
     int num_nodes);
+
+#ifdef PAIR_PROJ_FUSED
+// PAIR_PROJ_FUSED: drop-in for NodeIdDRSW_ProjectionOnly_wrap under
+// PAIR_PROJ_GROUPED; one thread per (row, group) evaluates all projections of
+// the group, loading the shared anchor column once.
+void NodeIdDRSW_ProjectionPairFused_wrap(
+    const float* d_flat_data,
+    float* d_col_add_projected,
+    const int* d_node_ids,
+    const int* d_node_offsets,
+    const int* d_offset,
+    const int* d_flat_projection_col_idx,
+    const float* d_flat_projection_weights,
+    const int* d_node_row_off,
+    int num_proj,
+    int num_rows,
+    int num_nodes);
+#endif
 
 NodeIdDRSW_SplitResult_Host NodeIdDRSW_SplitUpdate_wrap(
     int* d_node_ids,

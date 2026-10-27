@@ -1494,7 +1494,6 @@ absl::Status SampleTrainingExamples(
           "set, but bootstrap_size_ratio_factor is provided");
     }
   }
-  std::cout << "Sampling with replacement: " << rf_config.sampling_with_replacement() << std::endl;
   if (!rf_config.sampling_with_replacement() &&
       rf_config.bootstrap_size_ratio() == 1.f) {
     LOG_FIRST_N(WARNING, 1)
